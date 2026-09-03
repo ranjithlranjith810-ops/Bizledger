@@ -435,6 +435,12 @@ export interface PaymentRecord {
   method: PaymentMethod;
   status: PaymentOutcome;
   description: string;
+  // Refund request state (frontend demo). This records a user's refund request
+  // locally; it does NOT process or grant a refund until a production payment
+  // processor exists. 'none' = no request; 'requested' = user requested a
+  // refund within the refund window; grant/deny get a backend in the next phase.
+  refundStatus?: 'none' | 'requested';
+  refundReason?: string;
 }
 
 export interface SubscriptionBilling {
@@ -639,6 +645,7 @@ export interface AppContextType {
   pendingPeriod: 'month' | 'year';
   setPendingPlan: (planId: SubscriptionPlanId | null, period?: 'month' | 'year') => void;
   completePayment: (outcome: PaymentOutcome, method: PaymentMethod) => void;
+  requestRefund: (paymentId: string, reason: string) => boolean;
   changePlan: (planId: SubscriptionPlan["id"]) => void;
   plans: SubscriptionPlan[];
   activePlan: SubscriptionPlan | null;

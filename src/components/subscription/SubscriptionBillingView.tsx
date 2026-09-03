@@ -2,6 +2,7 @@
 
 import React from "react";
 import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { useApp } from "@/context/AppContext";
 import { Download, ArrowRight, AlertTriangle, Zap } from "lucide-react";
 import { formatINR } from "@/lib/billing";
@@ -320,13 +321,18 @@ export const SubscriptionBillingView: React.FC = () => {
       <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs overflow-hidden">
         <div className="p-4 border-b border-[#eceef0] flex items-center justify-between gap-3">
           <h3 className="text-sm font-bold text-[#191c1e]">Tax Invoices & Billing History</h3>
-          <button
-            onClick={() => router.push("/settings/billing/history")}
-            className="text-xs font-semibold text-[#93000b] hover:underline flex items-center gap-1 whitespace-nowrap"
-          >
-            View All
-            <ArrowRight className="w-3 h-3" />
-          </button>
+          <div className="flex items-center gap-4">
+            <Link href="/refund-policy" className="text-xs font-semibold text-gray-500 hover:text-[#93000b] hover:underline whitespace-nowrap">
+              Refund Policy
+            </Link>
+            <button
+              onClick={() => router.push("/settings/billing/history")}
+              className="text-xs font-semibold text-[#93000b] hover:underline flex items-center gap-1 whitespace-nowrap"
+            >
+              View All
+              <ArrowRight className="w-3 h-3" />
+            </button>
+          </div>
         </div>
 
         <div className="overflow-x-auto">

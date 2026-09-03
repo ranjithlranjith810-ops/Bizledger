@@ -1,14 +1,17 @@
 "use client";
 
-import React from "react";
+import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { Check, ArrowLeft, ShieldCheck, Lock, Calendar } from "lucide-react";
 import { computeTotals, formatINR, planLabel, GST_RATE } from "@/lib/billing";
+import Link from "next/link";
 
 export const CheckoutView: React.FC = () => {
   const { plans, pendingPlanId, pendingPeriod, setPendingPlan } = useApp();
   const router = useRouter();
+  const [accepted, setAccepted] = useState(false);
+  const [consentError, setConsentError] = useState(false);
 
   const plan = plans.find((p) => p.id === pendingPlanId);
   const period = pendingPeriod ?? "month";
@@ -151,9 +154,40 @@ export const CheckoutView: React.FC = () => {
               </p>
             </div>
 
+            <label className="mt-5 flex items-start gap-2.5 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={accepted}
+                onChange={(e) => {
+                  setAccepted(e.target.checked);
+                  if (e.target.checked) setConsentError(false);
+                }}
+                className="mt-0.5 h-4 w-4 rounded border-gray-300 text-[#93000b] accent-[#93000b]"
+              />
+              <span className="text-[11px] leading-relaxed text-gray-600">
+                I agree to the{" "}
+                <Link href="/terms" className="font-semibold text-[#93000b] hover:underline">Terms of Service</Link>,{" "}
+                <Link href="/privacy" className="font-semibold text-[#93000b] hover:underline">Privacy Policy</Link>,{" "}
+                and{" "}
+                <Link href="/refund-policy" className="font-semibold text-[#93000b] hover:underline">Refund &amp; Cancellation Policy</Link>{" "}
+                and understand this is a demo checkout.
+              </span>
+            </label>
+            {consentError && (
+              <p className="mt-2 text-[11px] font-medium text-[#93000b]">
+                Please accept the Terms to proceed to payment.
+              </p>
+            )}
+
             <button
-              onClick={() => router.push("/pricing/payment")}
-              className="mt-6 w-full bg-[#93000b] hover:bg-[#770008] text-white py-3 rounded-xl text-xs font-bold transition-colors shadow-xs flex items-center justify-center gap-2"
+              onClick={() => {
+                if (!accepted) {
+                  setConsentError(true);
+                  return;
+                }
+                router.push("/pricing/payment");
+              }}
+              className="mt-4 w-full bg-[#93000b] hover:bg-[#770008] text-white py-3 rounded-xl text-xs font-bold transition-colors shadow-xs flex items-center justify-center gap-2"
             >
               Proceed to Payment
             </button>

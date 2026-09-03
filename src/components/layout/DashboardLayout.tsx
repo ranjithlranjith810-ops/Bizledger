@@ -13,6 +13,7 @@ import { ExpenseDetailsModal } from "@/components/expenses/ExpenseDetailsModal";
 import { AddVehicleModal } from "@/components/vehicles/AddVehicleModal";
 import { AddVehicleExpenseModal } from "@/components/vehicles/AddVehicleExpenseModal";
 import { AddTeamMemberModal } from "@/components/team/AddTeamMemberModal";
+import { AppLegalFooter } from "@/components/legal/AppLegalFooter";
 import { useApp } from "@/context/AppContext";
 
 interface QuickAction {
@@ -53,7 +54,10 @@ export const DashboardLayout: React.FC<{ children: React.ReactNode }> = ({ child
         />
 
         <main className="flex-1 overflow-y-auto p-4 sm:p-6 md:p-8 pb-24 lg:pb-8">
-          <div className="max-w-7xl mx-auto">{children}</div>
+          <div className="max-w-7xl mx-auto">
+            {children}
+            <AppLegalFooter />
+          </div>
         </main>
       </div>
 

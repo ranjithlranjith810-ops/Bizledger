@@ -795,7 +795,35 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   };
 
-  const addInvoice = (invData: Omit<Invoice, "id">) => {
+  // Records a refund REQUEST in the frontend demo. It does NOT grant or move a
+  // refund — that requires a production payment processor. Only successful,
+  // still-refundable (not yet re-requested) payments can be flagged.
+  const requestRefund = (paymentId: string, reason: string): boolean => {
+    let found = false;
+    setPaymentHistory((h) =>
+      h.map((p) => {
+        if (p.id !== paymentId) return p;
+        if (p.status !== "success") return p; // only paid invoices
+        if (p.refundStatus === "requested") {
+          found = true; // already requested -> not a change, kept marked
+          return p;
+        }
+        found = true;
+        return { ...p, refundStatus: "requested", refundReason: reason };
+      })
+    );
+    if (found) {
+      addNotification({
+        type: "success",
+        title: "Refund Request Recorded",
+        message:
+          "Your refund request has been recorded. Processing requires a production payment backend.",
+      });
+    }
+    return found;
+  };
+
+const addInvoice = (invData: Omit<Invoice, "id">) => {
     const used = countCurrentPeriodInvoices(invoices, subscription);
     const gate = checkEntitlement(activePlan, "invoices", used);
     if (!gate.allowed) {
@@ -1605,6 +1633,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     pendingPeriod: subscription?.pendingPeriod ?? "month",
     setPendingPlan,
     completePayment,
+    requestRefund,
     changePlan,
     plans: SUBSCRIPTION_PLANS,
     activePlan,

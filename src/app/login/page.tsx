@@ -8,6 +8,7 @@ import { useApp } from "@/context/AppContext";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
+import { LegalFooter } from "@/components/legal/LegalFooter";
 
 export default function LoginPage() {
   const router = useRouter();
@@ -40,7 +41,8 @@ export default function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background px-4 py-12">
+    <div className="min-h-screen flex flex-col bg-background">
+      <div className="flex-1 flex items-center justify-center px-4 py-12">
       <div className="w-full max-w-md">
         <div className="mb-8 flex flex-col items-center text-center">
           <Link href="/" className="flex items-center gap-2">
@@ -98,6 +100,8 @@ export default function LoginPage() {
           )}
         </form>
       </div>
+      </div>
+      <LegalFooter />
     </div>
   );
 }

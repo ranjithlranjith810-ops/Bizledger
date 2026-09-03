@@ -7,6 +7,7 @@ import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
+import { LegalFooter } from "@/components/legal/LegalFooter";
 
 export default function SignupPage() {
   const router = useRouter();
@@ -15,6 +16,7 @@ export default function SignupPage() {
   const [email, setEmail] = useState("");
   const [businessName, setBusinessName] = useState("");
   const [error, setError] = useState("");
+  const [consent, setConsent] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
@@ -28,6 +30,10 @@ export default function SignupPage() {
       setError("Please enter a valid email address.");
       return;
     }
+    if (!consent) {
+      setError("Please accept the Terms of Service and Privacy Policy to continue.");
+      return;
+    }
     setSubmitting(true);
     createAccount({ name, email, businessName });
     // New accounts enter the business onboarding wizard (never straight to the
@@ -36,7 +42,8 @@ export default function SignupPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-background px-4 py-12">
+    <div className="min-h-screen flex flex-col bg-background">
+      <div className="flex-1 flex items-center justify-center px-4 py-12">
       <div className="w-full max-w-md">
         <div className="mb-8 flex flex-col items-center text-center">
           <Link href="/" className="flex items-center gap-2">
@@ -84,6 +91,22 @@ export default function SignupPage() {
             </p>
           )}
 
+          <label className="mt-4 flex items-start gap-2.5 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={consent}
+              onChange={(e) => setConsent(e.target.checked)}
+              className="mt-0.5 h-4 w-4 rounded border-gray-300 text-[#93000b] accent-[#93000b]"
+            />
+            <span className="text-xs leading-relaxed text-outline">
+              I agree to the{" "}
+              <Link href="/terms" className="font-semibold text-primary hover:underline">Terms of Service</Link>{" "}
+              and{" "}
+              <Link href="/privacy" className="font-semibold text-primary hover:underline">Privacy Policy</Link>{" "}
+              as published.
+            </span>
+          </label>
+
           <Button
             type="submit"
             variant="primary"
@@ -104,6 +127,8 @@ export default function SignupPage() {
           </p>
         </form>
       </div>
+      </div>
+      <LegalFooter />
     </div>
   );
 }

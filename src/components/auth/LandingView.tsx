@@ -3,6 +3,7 @@
 import Link from "next/link";
 import { Button } from "@/components/ui/Button";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
+import { LEGAL_LINKS } from "@/config/legal";
 
 const FEATURES = [
   {
@@ -127,11 +128,14 @@ export function LandingView() {
               <Link href="/pricing" className="block text-xs text-outline hover:text-on-surface transition-colors">Pricing</Link>
             </div>
 
-            {/* Support */}
+            {/* Legal */}
             <div className="space-y-2.5">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-secondary">Support</h4>
-              <a href={`mailto:support@bizledger.io?subject=${encodeURIComponent("BizLedger Support")}`} className="block text-xs text-outline hover:text-on-surface transition-colors">Help &amp; Feedback</a>
-              <a href="mailto:support@bizledger.io" className="block text-xs text-outline hover:text-on-surface transition-colors">Contact Us</a>
+              <h4 className="text-xs font-bold uppercase tracking-wider text-secondary">Legal</h4>
+              {LEGAL_LINKS.map((l) => (
+                <Link key={l.slug} href={l.href} className="block text-xs text-outline hover:text-on-surface transition-colors">
+                  {l.label}
+                </Link>
+              ))}
             </div>
 
             {/* Account */}

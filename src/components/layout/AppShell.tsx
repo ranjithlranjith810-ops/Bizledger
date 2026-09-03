@@ -6,8 +6,17 @@ import { useAuth } from "@/context/AuthContext";
 import { useApp } from "@/context/AppContext";
 import { DashboardLayout } from "@/components/layout/DashboardLayout";
 import { ROUTES, onboardingRouteForStep } from "@/lib/constants";
+import { LEGAL_LINKS } from "@/config/legal";
 
-const PUBLIC_PATHS = new Set(["/", "/login", "/signup"]);
+// Public marketing/auth paths plus the standalone legal / policy documents.
+// Legal pages are intentionally accessible without logging in or completing an
+// onboarding wizard (they are not part of the authenticated dashboard shell).
+const PUBLIC_PATHS = new Set([
+  "/",
+  "/login",
+  "/signup",
+  ...LEGAL_LINKS.map((l) => l.href),
+]);
 
 const ONBOARDING_PATHS = new Set([
   "/onboarding",
