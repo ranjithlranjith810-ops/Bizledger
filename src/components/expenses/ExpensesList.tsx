@@ -4,6 +4,7 @@ import React, { useState, useMemo } from "react";
 import { useApp } from "@/context/AppContext";
 import { ExpenseCategory } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
+import { matchesSearch } from "@/lib/search";
 import {
   Receipt,
   Plus,
@@ -37,12 +38,12 @@ export const ExpensesList: React.FC = () => {
 
   // Filtered expenses
   const filteredExpenses = fyExpenses.filter((exp) => {
-    const matchesSearch =
-      exp.expenseNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      exp.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (exp.vendor || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (exp.referenceNumber &&
-        exp.referenceNumber.toLowerCase().includes(searchQuery.toLowerCase()));
+    const matchesQuery = matchesSearch(searchQuery, [
+      exp.expenseNumber,
+      exp.title,
+      exp.vendor,
+      exp.referenceNumber,
+    ]);
 
     const matchesCategory =
       selectedCategory === "All" || exp.category === selectedCategory;
@@ -50,7 +51,7 @@ export const ExpensesList: React.FC = () => {
       selectedPaymentMethod === "All" ||
       exp.paymentMethod === selectedPaymentMethod;
 
-    return matchesSearch && matchesCategory && matchesPayment;
+    return matchesQuery && matchesCategory && matchesPayment;
   });
 
   // Aggregate metrics

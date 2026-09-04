@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import { useApp } from "@/context/AppContext";
 import {
   Download,
@@ -12,12 +12,232 @@ import {
   Users,
   Package,
   Truck,
+  BarChart3,
+  ReceiptText,
 } from "lucide-react";
 
+const inr = (n: number): string =>
+  new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 0,
+  }).format(n);
+
+const now = new Date();
+
+// Return [startMs, endMs] for the selected range relative to today.
+function rangeBounds(range: string): [number, number] {
+  const s = new Date(now);
+  const e = new Date(s);
+  switch (range) {
+    case "This Week": {
+      const d = s.getDay(); // 0 Sun..6 Sat
+      const diff = (d + 6) % 7; // days since Monday
+      s.setDate(s.getDate() - diff);
+      s.setHours(0, 0, 0, 0);
+      e.setDate(e.getDate() + (6 - diff));
+      e.setHours(23, 59, 59, 999);
+      break;
+    }
+    case "This Month":
+      s.setDate(1);
+      s.setHours(0, 0, 0, 0);
+      e.setMonth(e.getMonth() + 1, 0);
+      e.setHours(23, 59, 59, 999);
+      break;
+    case "This Quarter": {
+      const q = Math.floor(s.getMonth() / 3);
+      s.setMonth(q * 3, 1);
+      s.setHours(0, 0, 0, 0);
+      e.setMonth(q * 3 + 3, 0);
+      e.setHours(23, 59, 59, 999);
+      break;
+    }
+    default: {
+      // This FY (Apr 1 of financial year for the current date)
+      const fyStartYear = s.getMonth() >= 3 ? s.getFullYear() : s.getFullYear() - 1;
+      s.setFullYear(fyStartYear, 3, 1);
+      s.setHours(0, 0, 0, 0);
+      e.setFullYear(fyStartYear + 1, 2, 31);
+      e.setHours(23, 59, 59, 999);
+      break;
+    }
+  }
+  return [s.getTime(), e.getTime()];
+}
+
 export const ReportsView: React.FC = () => {
-  const { addNotification } = useApp();
+  const {
+    addNotification,
+    invoices,
+    expenses,
+    customers,
+    products,
+    vehicles,
+    purchaseOrders,
+  } = useApp();
 
   const [dateRange, setDateRange] = useState<string>("This Month");
+
+  const [startMs, endMs] = useMemo(() => rangeBounds(dateRange), [dateRange]);
+
+  const rangeInvoices = useMemo(
+    () =>
+      invoices.filter(
+        (i) =>
+          i.status !== "Cancelled" &&
+          new Date(i.date).getTime() >= startMs &&
+          new Date(i.date).getTime() <= endMs
+      ),
+    [invoices, startMs, endMs]
+  );
+
+  const rangeExpenses = useMemo(
+    () =>
+      expenses.filter(
+        (e) =>
+          new Date(e.date).getTime() >= startMs && new Date(e.date).getTime() <= endMs
+      ),
+    [expenses, startMs, endMs]
+  );
+
+  const rangePurchases = useMemo(
+    () =>
+      purchaseOrders.filter(
+        (p) =>
+          p.status !== "Cancelled" &&
+          new Date(p.date).getTime() >= startMs &&
+          new Date(p.date).getTime() <= endMs
+      ),
+    [purchaseOrders, startMs, endMs]
+  );
+
+  // Core metrics — every figure below is derived from real business data, never
+  // hard-coded.
+  const totalSales = rangeInvoices.reduce((s, i) => s + (i.grandTotal || 0), 0);
+  const totalPurchases = rangePurchases.reduce((s, p) => s + (p.grandTotal || 0), 0);
+  const totalExpenses = rangeExpenses.reduce((s, e) => s + (e.amount || 0), 0);
+  const payroll =
+    dateRange === "This Month"
+      ? rangeExpenses
+          .filter((e) => e.category === "Labour & Wages")
+          .reduce((s, e) => s + (e.amount || 0), 0)
+      : rangeExpenses
+          .filter((e) => e.category === "Labour & Wages")
+          .reduce((s, e) => s + (e.amount || 0), 0);
+
+  const outstandingInvoices = invoices.filter(
+    (i) => i.status === "Pending" || i.status === "Overdue"
+  );
+  const outstandingTotal = outstandingInvoices.reduce(
+    (s, i) => s + (i.grandTotal || 0),
+    0
+  );
+  const outstandingCustomerCount = new Set(outstandingInvoices.map((i) => i.customerId))
+    .size;
+
+  // Weekly bar chart — 7 bars, Mon..Sun, grouped from actual invoices/purchases.
+  const weekBars = useMemo(() => {
+    const dayIndex = (iso: string) => {
+      const d = new Date(iso);
+      return (d.getDay() + 6) % 7; // Mon=0
+    };
+    const dayName = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const sales = new Array(7).fill(0);
+    const purch = new Array(7).fill(0);
+    invoices
+      .filter((i) => i.status !== "Cancelled")
+      .forEach((i) => {
+        const idx = dayIndex(i.date);
+        sales[idx] += i.grandTotal || 0;
+      });
+    purchaseOrders
+      .filter((p) => p.status !== "Cancelled")
+      .forEach((p) => {
+        const idx = dayIndex(p.date);
+        purch[idx] += p.grandTotal || 0;
+      });
+    const max = Math.max(1, ...sales, ...purch);
+    return dayName.map((name, idx) => {
+      const s = sales[idx];
+      const p = purch[idx];
+      return {
+        day: name,
+        sales: s,
+        purchases: p,
+        hSales: `${Math.round((s / max) * 100)}%`,
+        hPurch: `${Math.round((p / max) * 100)}%`,
+      };
+    });
+  }, [invoices, purchaseOrders]);
+
+  const maxDay = weekBars.reduce(
+    (best, b) => (b.sales > best.sales ? b : best),
+    weekBars[0]
+  );
+  const grossMarginPct =
+    totalSales > 0
+      ? ((totalSales - (totalPurchases + totalExpenses)) / totalSales) * 100
+      : 0;
+
+  // GST & tax computation from real invoice/purchase data.
+  const outwardTax = rangeInvoices.reduce((s, i) => s + (i.totalTax || 0), 0);
+  const itc = rangePurchases.reduce((s, p) => s + (p.totalTax || 0), 0);
+  const netGst = Math.max(0, outwardTax - itc);
+  const fyMonthlyLabel = new Intl.DateTimeFormat("en-IN", {
+    month: "short",
+    year: "numeric",
+  }).format(now);
+
+  // Top customers by billed revenue.
+  const topCustomers = useMemo(() => {
+    const cityByCustomer = new Map<string, string>(
+      customers.map((c) => [c.id, c.billingAddress?.city || c.primaryContact?.name || ""])
+    );
+    const map = new Map<string, { name: string; city: string; billed: number }>();
+    rangeInvoices.forEach((i) => {
+      const city = cityByCustomer.get(i.customerId) || "";
+      const cur = map.get(i.customerName) || {
+        name: i.customerName,
+        city,
+        billed: 0,
+      };
+      cur.billed += i.grandTotal || 0;
+      map.set(i.customerName, cur);
+    });
+    return [...map.values()]
+      .sort((a, b) => b.billed - a.billed)
+      .slice(0, 4);
+  }, [rangeInvoices, customers]);
+
+  // Top products / materials by quantity dispatched.
+  const topProducts = useMemo(() => {
+    const skuByProduct = new Map<string, string>(
+      products.map((p) => [p.id, p.sku])
+    );
+    const map = new Map<
+      string,
+      { name: string; sku: string; unit: string; qty: number; amount: number }
+    >();
+    rangeInvoices.forEach((i) =>
+      (i.items || []).forEach((it) => {
+        const key = it.description || it.productId || it.id;
+        const cur = map.get(key) || {
+          name: it.description,
+          sku: (it.productId && skuByProduct.get(it.productId)) || "",
+          unit: it.unit,
+          qty: 0,
+          amount: 0,
+        };
+        cur.qty += it.quantity || 0;
+        cur.amount += it.totalAmount || 0;
+        map.set(key, cur);
+      })
+    );
+    return [...map.values()]
+      .sort((a, b) => b.amount - a.amount)
+      .slice(0, 4);
+  }, [rangeInvoices, products]);
 
   const handleDownloadReport = (reportName: string, format: string) => {
     addNotification({
@@ -26,6 +246,37 @@ export const ReportsView: React.FC = () => {
       message: `${reportName} has been compiled and downloaded as .${format.toLowerCase()}.`,
     });
   };
+
+  if (invoices.length === 0 && expenses.length === 0 && purchaseOrders.length === 0) {
+    return (
+      <div className="space-y-6">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+          <div>
+            <h2 className="text-xl font-bold text-[#191c1e] tracking-tight">
+              Financial Reports & GST Analytics
+            </h2>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Executive accounting summary, profit & loss, GST tax filings, and cash flow trends.
+            </p>
+          </div>
+        </div>
+        <div className="bg-white border border-[#eceef0] rounded-2xl p-14 flex flex-col items-center justify-center text-center shadow-xs">
+          <div className="w-16 h-16 rounded-2xl bg-[#f7f9fb] text-[#93000b] flex items-center justify-center mb-4">
+            <BarChart3 className="w-8 h-8" />
+          </div>
+          <h3 className="text-base font-bold text-[#191c1e]">No report data yet</h3>
+          <p className="text-xs text-gray-500 mt-1 max-w-sm">
+            Once you add invoices, purchases and expenses, your financial reports,
+            GST summary and cash-flow trend will appear here automatically.
+          </p>
+          <div className="flex items-center gap-2 mt-5 text-xs text-gray-400">
+            <ReceiptText className="w-4 h-4" />
+            <span>Reports are computed live from your business records.</span>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -75,11 +326,11 @@ export const ReportsView: React.FC = () => {
             Total Sales
           </span>
           <div className="mt-1.5 text-2xl font-bold text-gray-900 font-mono">
-            ₹4,85,000
+            {inr(totalSales)}
           </div>
           <div className="mt-2 flex items-center gap-1 text-[11px] text-emerald-600 font-medium">
             <ArrowUpRight className="w-3.5 h-3.5" />
-            <span>+12.5% vs last mo</span>
+            <span>{rangeInvoices.length} invoice(s) in period</span>
           </div>
         </div>
 
@@ -89,11 +340,11 @@ export const ReportsView: React.FC = () => {
             Total Purchases
           </span>
           <div className="mt-1.5 text-2xl font-bold text-gray-900 font-mono">
-            ₹3,12,000
+            {inr(totalPurchases)}
           </div>
           <div className="mt-2 flex items-center gap-1 text-[11px] text-blue-600 font-medium">
             <ArrowUpRight className="w-3.5 h-3.5" />
-            <span>+8.2% raw stock</span>
+            <span>{rangePurchases.length} PO(s) in period</span>
           </div>
         </div>
 
@@ -103,11 +354,11 @@ export const ReportsView: React.FC = () => {
             Total Expenses
           </span>
           <div className="mt-1.5 text-2xl font-bold text-gray-900 font-mono">
-            ₹45,500
+            {inr(totalExpenses)}
           </div>
           <div className="mt-2 flex items-center gap-1 text-[11px] text-emerald-600 font-medium">
             <ArrowDownRight className="w-3.5 h-3.5" />
-            <span>-3.1% operational</span>
+            <span>{rangeExpenses.length} entries in period</span>
           </div>
         </div>
 
@@ -117,10 +368,10 @@ export const ReportsView: React.FC = () => {
             Labour & Wages
           </span>
           <div className="mt-1.5 text-2xl font-bold text-gray-900 font-mono">
-            ₹32,000
+            {inr(payroll)}
           </div>
           <div className="mt-2 text-[11px] text-gray-500">
-            100% disbursed on time
+            {rangeExpenses.filter((e) => e.category === "Labour & Wages").length} entry(ies)
           </div>
         </div>
 
@@ -130,10 +381,10 @@ export const ReportsView: React.FC = () => {
             Outstanding Due
           </span>
           <div className="mt-1.5 text-2xl font-bold text-amber-700 font-mono">
-            ₹1,28,000
+            {inr(outstandingTotal)}
           </div>
           <div className="mt-2 text-[11px] text-amber-700 font-medium">
-            3 customer accounts
+            {outstandingCustomerCount} customer account(s)
           </div>
         </div>
       </div>
@@ -161,15 +412,7 @@ export const ReportsView: React.FC = () => {
 
           {/* Pure CSS / SVG High-Accuracy Bar Chart */}
           <div className="h-64 pt-6 flex items-end justify-between gap-3 sm:gap-6 border-b border-[#eceef0] pb-2">
-            {[
-              { day: "Mon", sales: 42000, purchases: 28000, hSales: "42%", hPurch: "28%" },
-              { day: "Tue", sales: 68000, purchases: 45000, hSales: "68%", hPurch: "45%" },
-              { day: "Wed", sales: 95000, purchases: 52000, hSales: "95%", hPurch: "52%" },
-              { day: "Thu", sales: 78000, purchases: 38000, hSales: "78%", hPurch: "38%" },
-              { day: "Fri", sales: 110000, purchases: 64000, hSales: "100%", hPurch: "58%" },
-              { day: "Sat", sales: 92000, purchases: 48000, hSales: "84%", hPurch: "44%" },
-              { day: "Sun", sales: 25000, purchases: 10000, hSales: "25%", hPurch: "10%" },
-            ].map((item) => (
+            {weekBars.map((item) => (
               <div key={item.day} className="flex-1 flex flex-col items-center gap-2 h-full justify-end group">
                 <div className="text-[10px] font-mono text-gray-500 opacity-0 group-hover:opacity-100 transition-opacity font-bold">
                   ₹{(item.sales / 1000).toFixed(0)}k
@@ -192,8 +435,10 @@ export const ReportsView: React.FC = () => {
           </div>
 
           <div className="flex items-center justify-between text-xs text-gray-500 pt-1">
-            <span>Peak turnover recorded on Friday (₹1,10,000)</span>
-            <span className="font-bold text-gray-800">Gross Margin: 35.6%</span>
+            <span>
+              Peak turnover recorded on {maxDay ? maxDay.day : "-"} ({inr(maxDay ? maxDay.sales : 0)})
+            </span>
+            <span className="font-bold text-gray-800">Gross Margin: {grossMarginPct.toFixed(1)}%</span>
           </div>
         </div>
 
@@ -202,32 +447,32 @@ export const ReportsView: React.FC = () => {
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-bold text-[#191c1e]">GST & Tax Summary</h3>
             <span className="text-[10px] bg-rose-50 text-[#93000b] font-bold px-2 py-0.5 rounded font-mono">
-              Aug 2026
+              {fyMonthlyLabel}
             </span>
           </div>
 
           <div className="space-y-3 text-xs divide-y divide-gray-100">
             <div className="flex justify-between py-2">
               <span className="text-gray-500">Outward Tax Collected (GSTR-1)</span>
-              <span className="font-mono font-bold text-gray-900">₹87,300</span>
+              <span className="font-mono font-bold text-gray-900">{inr(outwardTax)}</span>
             </div>
             <div className="flex justify-between py-2">
               <span className="text-gray-500">Eligible Input Tax Credit (ITC)</span>
-              <span className="font-mono font-bold text-emerald-700">- ₹56,160</span>
+              <span className="font-mono font-bold text-emerald-700">- {inr(itc)}</span>
             </div>
             <div className="flex justify-between py-2">
               <span className="text-gray-500">RCM Tax Liability</span>
-              <span className="font-mono font-medium text-gray-700">₹0.00</span>
+              <span className="font-mono font-medium text-gray-700">{inr(0)}</span>
             </div>
             <div className="flex justify-between py-2.5 bg-[#fef2f2] px-3 rounded-lg border border-rose-100">
               <span className="font-bold text-[#93000b]">Net GST Payable in Cash</span>
-              <span className="font-mono font-bold text-[#93000b] text-sm">₹31,140</span>
+              <span className="font-mono font-bold text-[#93000b] text-sm">{inr(netGst)}</span>
             </div>
           </div>
 
           <div className="pt-2">
             <button
-              onClick={() => handleDownloadReport("GSTR_3B_Computation_Aug2026", "PDF")}
+              onClick={() => handleDownloadReport(`GSTR_3B_Computation_${fyMonthlyLabel.replace(/ /g, "")}`, "PDF")}
               className="w-full bg-[#f2f4f6] hover:bg-[#eceef0] text-gray-800 font-semibold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-colors"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-[#93000b]" />
@@ -249,30 +494,33 @@ export const ReportsView: React.FC = () => {
             <span className="text-xs text-gray-400">Total Billed</span>
           </div>
 
-          <div className="space-y-3">
-            {[
-              { name: "Sri Lakshmi Steels & Fabricators", city: "Coimbatore", billed: "₹1,85,000", share: "38%" },
-              { name: "Venkateshwara Engineering Works", city: "Tiruppur", billed: "₹1,42,000", share: "29%" },
-              { name: "KSR Motors & Automotives", city: "Erode", billed: "₹98,000", share: "20%" },
-              { name: "Deccan Hardware Agencies", city: "Salem", billed: "₹60,000", share: "13%" },
-            ].map((c, i) => (
-              <div key={c.name} className="flex items-center justify-between p-2.5 bg-[#f7f9fb] rounded-xl text-xs">
-                <div className="flex items-center gap-3">
-                  <div className="w-6 h-6 rounded-full bg-white font-bold text-gray-500 flex items-center justify-center text-[11px] border border-gray-200">
-                    {i + 1}
+          {topCustomers.length === 0 ? (
+            <p className="text-xs text-gray-400">
+              No invoices billed in this period yet.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {topCustomers.map((c, i) => (
+                <div key={c.name} className="flex items-center justify-between p-2.5 bg-[#f7f9fb] rounded-xl text-xs">
+                  <div className="flex items-center gap-3">
+                    <div className="w-6 h-6 rounded-full bg-white font-bold text-gray-500 flex items-center justify-center text-[11px] border border-gray-200">
+                      {i + 1}
+                    </div>
+                    <div>
+                      <span className="font-bold text-gray-900 block">{c.name}</span>
+                      <span className="text-[10px] text-gray-400">{c.city}</span>
+                    </div>
                   </div>
-                  <div>
-                    <span className="font-bold text-gray-900 block">{c.name}</span>
-                    <span className="text-[10px] text-gray-400">{c.city}</span>
+                  <div className="text-right">
+                    <span className="font-mono font-bold text-gray-900 block">{inr(c.billed)}</span>
+                    <span className="text-[10px] text-emerald-600 font-semibold">
+                      {totalSales > 0 ? Math.round((c.billed / totalSales) * 100) : 0}% share
+                    </span>
                   </div>
                 </div>
-                <div className="text-right">
-                  <span className="font-mono font-bold text-gray-900 block">{c.billed}</span>
-                  <span className="text-[10px] text-emerald-600 font-semibold">{c.share} share</span>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
 
         {/* Top Selling Products (Stitch Design #14) */}
@@ -285,30 +533,31 @@ export const ReportsView: React.FC = () => {
             <span className="text-xs text-gray-400">Qty Sold</span>
           </div>
 
-          <div className="space-y-3">
-            {[
-              { name: 'Seamless High-Tensile Steel Pipe 2"', sku: "PIP-STL-2IN", qty: "270 Meters", amount: "₹1,13,400" },
-              { name: "Heavy Duty Mild Steel Angle 50x50x5", sku: "ANG-MS-505", qty: "400 Kg", amount: "₹27,200" },
-              { name: "Industrial Grade E6013 Electrodes", sku: "WLD-E6013-3", qty: "30 Boxes", amount: "₹25,500" },
-              { name: "High Torque Precision Ball Bearing", sku: "BRG-6205-RS", qty: "25 Pcs", amount: "₹7,000" },
-            ].map((p, i) => (
-              <div key={p.name} className="flex items-center justify-between p-2.5 bg-[#f7f9fb] rounded-xl text-xs">
-                <div className="flex items-center gap-3">
-                  <div className="w-6 h-6 rounded-full bg-white font-bold text-gray-500 flex items-center justify-center text-[11px] border border-gray-200">
-                    {i + 1}
+          {topProducts.length === 0 ? (
+            <p className="text-xs text-gray-400">
+              No product dispatches in this period yet.
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {topProducts.map((p, i) => (
+                <div key={p.name} className="flex items-center justify-between p-2.5 bg-[#f7f9fb] rounded-xl text-xs">
+                  <div className="flex items-center gap-3">
+                    <div className="w-6 h-6 rounded-full bg-white font-bold text-gray-500 flex items-center justify-center text-[11px] border border-gray-200">
+                      {i + 1}
+                    </div>
+                    <div>
+                      <span className="font-bold text-gray-900 block">{p.name}</span>
+                      <span className="text-[10px] font-mono text-gray-400">SKU: {p.sku || "—"}</span>
+                    </div>
                   </div>
-                  <div>
-                    <span className="font-bold text-gray-900 block">{p.name}</span>
-                    <span className="text-[10px] font-mono text-gray-400">SKU: {p.sku}</span>
+                  <div className="text-right">
+                    <span className="font-mono font-bold text-gray-900 block">{inr(p.amount)}</span>
+                    <span className="text-[10px] text-gray-500">{p.qty} {p.unit}</span>
                   </div>
                 </div>
-                <div className="text-right">
-                  <span className="font-mono font-bold text-gray-900 block">{p.amount}</span>
-                  <span className="text-[10px] text-gray-500">{p.qty}</span>
-                </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       </div>
 
@@ -327,7 +576,7 @@ export const ReportsView: React.FC = () => {
               <p className="text-[11px] text-gray-400 mt-0.5">B2B, B2CL, HSN summary & tax split ready for GST Portal</p>
             </div>
             <button
-              onClick={() => handleDownloadReport("GSTR1_Monthly_Sales_Aug2026", "JSON")}
+              onClick={() => handleDownloadReport(`GSTR1_Monthly_Sales_${fyMonthlyLabel.replace(/ /g, "")}`, "JSON")}
               className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs"
             >
               <Download className="w-3.5 h-3.5 text-[#93000b]" />
@@ -342,7 +591,7 @@ export const ReportsView: React.FC = () => {
               <p className="text-[11px] text-gray-400 mt-0.5">Comprehensive income, direct expenses, and EBITDA breakdown</p>
             </div>
             <button
-              onClick={() => handleDownloadReport("Profit_and_Loss_Statement_2026", "PDF")}
+              onClick={() => handleDownloadReport(`Profit_and_Loss_Statement_${now.getFullYear()}`, "PDF")}
               className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs"
             >
               <FileText className="w-3.5 h-3.5 text-[#93000b]" />
@@ -354,7 +603,9 @@ export const ReportsView: React.FC = () => {
           <div className="p-3 bg-[#f7f9fb] rounded-xl border border-[#eceef0] flex flex-col justify-between space-y-3">
             <div>
               <span className="font-bold text-gray-900 block">Fleet & Fuel Audit Log</span>
-              <p className="text-[11px] text-gray-400 mt-0.5">24 trucks fuel mileage, FASTag expenses, and service logs</p>
+              <p className="text-[11px] text-gray-400 mt-0.5">
+                {vehicles.length || 0} vehicle(s) fuel mileage, FASTag expenses, and service logs
+              </p>
             </div>
             <button
               onClick={() => handleDownloadReport("Fleet_Fuel_Mileage_Audit", "CSV")}

@@ -24,41 +24,36 @@ export const SubscriptionBillingView: React.FC = () => {
     paymentHistory,
     subscription,
     customers,
-    teamMembers,
     products,
     currentUsage,
+    activePlan,
     addNotification,
   } = useApp();
 
-  const currentPlan = plans.find((p) => p.id === currentPlanId);
+  // The EFFECTIVE plan governs entitlements and the usage gauges. This is the
+  // Free plan when no paid plan is active, so gauges always reflect real limits
+  // instead of fake fallbacks (previously 150/10/500).
+  const currentPlan = activePlan ?? plans.find((p) => p.id === currentPlanId);
   const planDisplayName = currentPlan?.name.replace(/ Plan$/, "") ?? "No Active Plan";
 
-  const limit = (v: number | "Unlimited", fallback: number) =>
-    v === "Unlimited" ? fallback : v;
-
-  const customersLimit = currentPlan ? limit(currentPlan.limits.customers, 150) : 150;
-  const teamMembersLimit = currentPlan ? limit(currentPlan.limits.teamMembers, 10) : 10;
-  const productsLimit = currentPlan ? limit(currentPlan.limits.products, 500) : 500;
-  const invoicesLimit = currentPlan
-    ? currentPlan.limits.invoicesPerMonth === "Unlimited"
-      ? "Unlimited"
-      : (currentPlan.limits.invoicesPerMonth as number)
-    : "Unlimited";
-
-  const dirUsage = currentPlan ? currentUsage.directoryListings : 0;
-  const dirLimit = currentPlan
-    ? currentPlan.limits.directoryListings === "Unlimited"
-      ? "Unlimited"
-      : (currentPlan.limits.directoryListings as number)
-    : 0;
-  const networkIncluded = currentPlan ? currentPlan.businessNetworkIncluded : false;
+  const customersLimit: number =
+    typeof currentPlan?.limits.customers === "number" ? currentPlan.limits.customers : 0;
+  const teamMembersLimit: number =
+    typeof currentPlan?.limits.teamMembers === "number" ? currentPlan.limits.teamMembers : 0;
+  const productsLimit: number =
+    typeof currentPlan?.limits.products === "number" ? currentPlan.limits.products : 0;
+  const invoicesLimit: number | "Unlimited" =
+    currentPlan?.limits.invoicesPerMonth ?? "Unlimited";
+  const dirUsage = currentUsage.directoryListings;
+  const dirLimit = currentPlan?.limits.directoryListings ?? 0;
+  const networkIncluded = !!currentPlan?.businessNetworkIncluded;
 
   // `used` ceilings are the denominator for the gauge bars; decomposed below so
   // the displayed quota always matches what the entitlement engine enforces.
   const usage = {
     customersUsed: customers.length,
     customersLimit,
-    teamMembersUsed: teamMembers.length,
+    teamMembersUsed: currentUsage.teamMembers,
     teamMembersLimit,
     productsUsed: products.length,
     productsLimit,
@@ -66,7 +61,11 @@ export const SubscriptionBillingView: React.FC = () => {
     invoicesLimit,
   };
 
-  const isActive = subscription?.status === "active";
+  // The EFFECTIVE (Free-by-default) plan always governs entitlements, so the
+  // plan is "active" in the sense that its limits apply. `isPaidPlan` tracks
+  // whether that plan is a paid/active subscription (drives the upgrade CTA).
+  const isActive = !!currentPlan;
+  const isPaidPlan = subscription?.status === "active";
 
   const goCheckout = (planId: SubscriptionPlan["id"]) => {
     if (planId === currentPlanId) return;
@@ -86,7 +85,7 @@ export const SubscriptionBillingView: React.FC = () => {
             Monitor plan limits, manage the billing cycle, download GST tax receipts, or upgrade your capacity.
           </p>
         </div>
-        {!isActive && (
+        {!isPaidPlan && (
           <button
             onClick={() => router.push("/pricing")}
             className="bg-[#93000b] hover:bg-[#770008] text-white px-5 py-2.5 rounded-xl text-xs font-bold shadow-xs transition-colors"
@@ -117,7 +116,7 @@ export const SubscriptionBillingView: React.FC = () => {
                 </span>
               </div>
               <p className="text-xs text-gray-500 mt-0.5">
-                {isActive ? (
+                {isPaidPlan ? (
                   <>
                     Billed {subscription.billing.period === "month" ? "monthly" : "yearly"} at{" "}
                     <strong className="text-gray-800 font-mono">
@@ -126,7 +125,7 @@ export const SubscriptionBillingView: React.FC = () => {
                     • {subscription.billing.renewsAt ? `Renews on ${fmtDate(subscription.billing.renewsAt)}` : ""}
                   </>
                 ) : (
-                  "Choose a plan to start your subscription."
+                  "Free plan — no subscription payment required. Upgrade to add capacity."
                 )}
               </p>
             </div>
@@ -146,33 +145,37 @@ export const SubscriptionBillingView: React.FC = () => {
               <div
                 className="bg-[#93000b] h-full rounded-full transition-all"
                 style={{
-                  width: `${Math.min(100, (usage.customersUsed / usage.customersLimit) * 100)}%`,
+                  width: `${Math.min(100, (usage.customersUsed / (usage.customersLimit || 1)) * 100)}%`,
                 }}
               ></div>
             </div>
             <span className="text-[11px] text-gray-400 block">
-              {Math.round((usage.customersUsed / usage.customersLimit) * 100)}% of quota utilized
+              {Math.round((usage.customersUsed / (usage.customersLimit || 1)) * 100)}% of quota utilized
             </span>
           </div>
 
           <div className="space-y-2">
-            <div className="flex items-center justify-between text-xs">
-              <span className="font-semibold text-gray-700">Team Seats</span>
-              <span className="font-mono text-gray-500">
-                {usage.teamMembersUsed} / {usage.teamMembersLimit}
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-semibold text-gray-700">Team Seats</span>
+                <span className="font-mono text-gray-500">
+                  {usage.teamMembersUsed} / {usage.teamMembersLimit}
+                </span>
+              </div>
+              <div className="w-full bg-[#f2f4f6] h-2 rounded-full overflow-hidden">
+                {usage.teamMembersLimit > 0 && (
+                  <div
+                    className="bg-purple-600 h-full rounded-full transition-all"
+                    style={{
+                      width: `${Math.min(100, (usage.teamMembersUsed / usage.teamMembersLimit) * 100)}%`,
+                    }}
+                  ></div>
+                )}
+              </div>
+              <span className="text-[11px] text-gray-400 block">
+                {usage.teamMembersLimit > 0
+                  ? `${Math.max(0, usage.teamMembersLimit - usage.teamMembersUsed)} seats available`
+                  : "No team seats on your plan"}
               </span>
-            </div>
-            <div className="w-full bg-[#f2f4f6] h-2 rounded-full overflow-hidden">
-              <div
-                className="bg-purple-600 h-full rounded-full transition-all"
-                style={{
-                  width: `${Math.min(100, (usage.teamMembersUsed / usage.teamMembersLimit) * 100)}%`,
-                }}
-              ></div>
-            </div>
-            <span className="text-[11px] text-gray-400 block">
-              {Math.max(0, usage.teamMembersLimit - usage.teamMembersUsed)} seats available
-            </span>
           </div>
 
           <div className="space-y-2">
@@ -186,12 +189,12 @@ export const SubscriptionBillingView: React.FC = () => {
               <div
                 className="bg-blue-600 h-full rounded-full transition-all"
                 style={{
-                  width: `${Math.min(100, (usage.productsUsed / usage.productsLimit) * 100)}%`,
+                  width: `${Math.min(100, (usage.productsUsed / (usage.productsLimit || 1)) * 100)}%`,
                 }}
               ></div>
             </div>
             <span className="text-[11px] text-gray-400 block">
-              {Math.round((usage.productsUsed / usage.productsLimit) * 100)}% of quota utilized
+              {Math.round((usage.productsUsed / (usage.productsLimit || 1)) * 100)}% of quota utilized
             </span>
           </div>
 

@@ -10,6 +10,7 @@ import {
   Invoice,
   FinancialYearSettings,
 } from "@/types";
+import { PLAN_CATALOG } from "@/lib/plans";
 
 export const DEMO_DATA_VERSION = 1;
 
@@ -556,87 +557,11 @@ export const INITIAL_TEAM_MEMBERS: TeamMember[] = [
   },
 ];
 
-export const SUBSCRIPTION_PLANS: SubscriptionPlan[] = [
-  {
-    id: "base",
-    name: "Base Plan",
-    price: 0,
-    period: "month",
-    description: "Perfect for single retail shops, freelancers, and micro-enterprises getting started.",
-    features: [
-      "1 Team Member",
-      "Limited active Customers",
-      "Limited Products & Inventory",
-      "5 Invoices / Bills per month",
-      "Basic GST Invoicing",
-      "Basic Inventory",
-      "PDF Invoices",
-      "Basic Reports",
-      "Basic Payment Tracking",
-    ],
-    businessNetworkIncluded: false,
-    limits: {
-      customers: 10,
-      teamMembers: 1,
-      products: 20,
-      invoicesPerMonth: 5,
-      directoryListings: 0,
-    },
-  },
-  {
-    id: "business",
-    name: "Business Plan",
-    price: 999,
-    period: "month",
-    popular: true,
-    description: "For growing businesses, manufacturing units, and fleet operators.",
-    features: [
-      "Exactly 3 Team Members",
-      "More Customers & Products than Base",
-      "Advanced Inventory & Multi-unit",
-      "GST Invoicing & E-way bill exports",
-      "Invoices, Bills & Purchase Management",
-      "Payroll & Vehicle Fleet Management",
-      "Advanced Reports & Analytics",
-      "WhatsApp Sharing & Payment Tracking",
-      "Business Network (Directory Listing)",
-    ],
-    businessNetworkIncluded: true,
-    limits: {
-      customers: 150,
-      teamMembers: 3,
-      products: 500,
-      invoicesPerMonth: "Unlimited",
-      directoryListings: 1,
-    },
-  },
-  {
-    id: "enterprise",
-    name: "Enterprise Plan",
-    price: 1999,
-    period: "month",
-    description: "For established multi-branch firms and large supply chain distributors.",
-    features: [
-      "Unlimited Users & Multi-branch",
-      "Unlimited Customers & Vendors",
-      "Unlimited Products & Multi-warehouse",
-      "100+ Invoices / Bills per month",
-      "Advanced Permissions & Reporting",
-      "Priority Support & API Access",
-      "Custom Tally / ERP Integrations",
-      "Dedicated Account Manager (24/7 SLA)",
-      "Business Network (Directory Listing)",
-    ],
-    businessNetworkIncluded: true,
-    limits: {
-      customers: 9999,
-      teamMembers: 999,
-      products: 9999,
-      invoicesPerMonth: "Unlimited",
-      directoryListings: 20,
-    },
-  },
-];
+// Plans are defined in the CANONICAL single source of truth (`@/lib/plans`).
+// `SUBSCRIPTION_PLANS` is kept as a backward-compatible alias so existing
+// pricing/checkout/entitlement call sites read the same corrected catalog
+// (Free = customers 2 / products 5 / team 0 / invoices 5 / directory 0).
+export const SUBSCRIPTION_PLANS: SubscriptionPlan[] = PLAN_CATALOG;
 
 export const INITIAL_CUSTOMERS: Customer[] = [
   {

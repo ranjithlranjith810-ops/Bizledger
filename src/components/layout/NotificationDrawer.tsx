@@ -4,9 +4,20 @@ import React from "react";
 import { useApp } from "@/context/AppContext";
 
 export const NotificationDrawer: React.FC = () => {
-  const { isNotificationOpen, setIsNotificationOpen, notifications, markAllNotificationsRead } = useApp();
+  const {
+    isNotificationOpen,
+    setIsNotificationOpen,
+    notifications,
+    markAllNotificationsRead,
+    markNotificationRead,
+  } = useApp();
 
   if (!isNotificationOpen) return null;
+
+  // Unread-only view. Opening the drawer never auto-marks anything as read; a
+  // notification leaves this list only when its "Mark as Read" action is
+  // explicitly invoked (or all are marked).
+  const unreadNotifications = notifications.filter((n) => !n.read);
 
   return (
     <>
@@ -37,29 +48,19 @@ export const NotificationDrawer: React.FC = () => {
           </div>
         </div>
 
-        {/* Notification List */}
+        {/* Notification List (unread only) */}
         <div className="flex-1 overflow-y-auto bg-surface-bright">
           <div className="flex flex-col">
-            {notifications.map((item) => (
+            {unreadNotifications.map((item) => (
               <div
                 key={item.id}
-                className={`group flex items-start gap-md p-md border-b border-outline-variant/50 cursor-pointer transition-colors relative ${
-                  !item.read
-                    ? 'bg-active-nav-bg/30 hover:bg-active-nav-bg'
-                    : 'hover:bg-surface-container-low pl-6'
-                }`}
+                className="group flex items-start gap-md p-md border-b border-outline-variant/50 relative"
               >
                 {/* Unread Indicator */}
-                {!item.read && (
-                  <div className="absolute left-2 top-1/2 -translate-y-1/2 w-2 h-2 rounded-full bg-primary" />
-                )}
+                <div className="absolute left-2 top-1/2 -translate-y-1/2 w-2 h-2 rounded-full bg-primary" />
 
                 {/* Icon */}
-                <div
-                  className={`w-10 h-10 rounded-full bg-surface-container flex items-center justify-center shrink-0 border border-outline-variant transition-colors ${
-                    !item.read ? 'ml-2 group-hover:border-primary' : 'group-hover:border-secondary'
-                  }`}
-                >
+                <div className="w-10 h-10 rounded-full bg-surface-container flex items-center justify-center shrink-0 border border-outline-variant ml-2 group-hover:border-primary transition-colors">
                   <span className={`material-symbols-outlined text-[20px] ${item.iconColor || 'text-primary'}`}>
                     {item.icon}
                   </span>
@@ -71,16 +72,25 @@ export const NotificationDrawer: React.FC = () => {
                   <p className="font-body-sm text-on-surface-variant line-clamp-2 text-xs leading-relaxed">
                     {item.message}
                   </p>
-                  <p className="font-label-sm text-on-surface-variant/70 mt-2 text-[11px]">{item.timeAgo}</p>
+                  <div className="flex items-center justify-between mt-2">
+                    <p className="font-label-sm text-on-surface-variant/70 text-[11px]">{item.timeAgo}</p>
+                    <button
+                      onClick={() => markNotificationRead(item.id)}
+                      className="text-[11px] text-primary font-semibold hover:bg-surface-container px-2 py-0.5 rounded transition-colors"
+                    >
+                      Mark as Read
+                    </button>
+                  </div>
                 </div>
               </div>
             ))}
-          </div>
 
-          {/* Empty State / End of List */}
-          <div className="p-md text-center mt-6 mb-4">
-            <span className="material-symbols-outlined text-surface-dim text-4xl mb-2">done_all</span>
-            <p className="font-body-sm text-on-surface-variant text-xs">You&apos;ve caught up on older notifications.</p>
+            {unreadNotifications.length === 0 && (
+              <div className="p-md text-center mt-6 mb-4">
+                <span className="material-symbols-outlined text-surface-dim text-4xl mb-2">done_all</span>
+                <p className="font-body-sm text-on-surface-variant text-xs">You&apos;re all caught up — no unread notifications.</p>
+              </div>
+            )}
           </div>
         </div>
 

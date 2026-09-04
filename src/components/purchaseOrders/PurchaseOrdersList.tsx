@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { PurchaseOrder } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
+import { matchesSearch } from "@/lib/search";
 import { Plus, Search, Eye, Pencil } from "lucide-react";
 import { AddPurchaseOrderModal } from "@/components/purchaseOrders/AddPurchaseOrderModal";
 
@@ -36,14 +37,13 @@ export const PurchaseOrdersList: React.FC = () => {
   const totalPo = fyPos.reduce((acc, p) => acc + p.grandTotal, 0);
 
   const filtered = fyPos.filter((p) => {
-    const matchesSearch =
-      p.poNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      p.vendor.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (p.vendor.gstin || "")
-        .toLowerCase()
-        .includes(searchQuery.toLowerCase());
+    const matchesQuery = matchesSearch(searchQuery, [
+      p.poNumber,
+      p.vendor.name,
+      p.vendor.gstin,
+    ]);
     const matchesStatus = statusFilter === "All" || p.status === statusFilter;
-    return matchesSearch && matchesStatus;
+    return matchesQuery && matchesStatus;
   });
 
   const openPo = (p: PurchaseOrder) => {
@@ -163,7 +163,9 @@ export const PurchaseOrdersList: React.FC = () => {
                     <span className="material-symbols-outlined text-[30px] text-gray-300 block mx-auto mb-1.5">
                       shopping_cart
                     </span>
-                    No purchase orders match your filter criteria.
+                    {purchaseOrders.length === 0
+                      ? "No purchase orders yet — create your first."
+                      : "No purchase orders match your filter criteria."}
                   </td>
                 </tr>
               ) : (

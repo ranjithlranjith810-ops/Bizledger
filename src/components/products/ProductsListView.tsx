@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
+import { matchesSearch } from "@/lib/search";
 import { Product } from "@/types";
 import { Search, Plus, Trash2, Pencil } from "lucide-react";
 import { AddProductModal } from "@/components/products/AddProductModal";
@@ -11,11 +12,8 @@ export const ProductsListView: React.FC = () => {
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState<Product | null>(null);
 
-  const filtered = products.filter(
-    (p) =>
-      p.name.toLowerCase().includes(search.toLowerCase()) ||
-      p.sku.toLowerCase().includes(search.toLowerCase()) ||
-      p.hsnSac.toLowerCase().includes(search.toLowerCase())
+  const filtered = products.filter((p) =>
+    matchesSearch(search, [p.name, p.sku, p.hsnSac, p.category])
   );
 
   const inventoryValuation = products.reduce((acc, p) => acc + p.unitPrice * p.stockQuantity, 0);
@@ -92,12 +90,21 @@ export const ProductsListView: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#eceef0]">
-              {filtered.map((p) => (
-                <tr key={p.id} className="hover:bg-[#f7f9fb] transition-colors">
-                  <td className="py-3.5 px-4">
-                    <div className="font-bold text-gray-900">{p.name}</div>
-                    <div className="text-[11px] font-mono text-gray-400 mt-0.5">SKU: {p.sku}</div>
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-8 text-center text-gray-400">
+                    {products.length === 0
+                      ? "No products yet — add your first."
+                      : "No products match your search."}
                   </td>
+                </tr>
+              ) : (
+                filtered.map((p) => (
+                  <tr key={p.id} className="hover:bg-[#f7f9fb] transition-colors">
+                    <td className="py-3.5 px-4">
+                      <div className="font-bold text-gray-900">{p.name}</div>
+                      <div className="text-[11px] font-mono text-gray-400 mt-0.5">SKU: {p.sku}</div>
+                    </td>
                   <td className="py-3.5 px-4 font-mono font-semibold text-gray-700">{p.hsnSac}</td>
                   <td className="py-3.5 px-4">
                     <span className="bg-rose-50 text-[#93000b] font-mono font-bold text-[11px] px-2 py-0.5 rounded">
@@ -136,7 +143,8 @@ export const ProductsListView: React.FC = () => {
                     </div>
                   </td>
                 </tr>
-              ))}
+                ))
+              )}
             </tbody>
           </table>
         </div>

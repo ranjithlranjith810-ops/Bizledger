@@ -38,11 +38,9 @@ export const InvoiceDetailsView: React.FC = () => {
   };
 
   const handleDownloadPdf = () => {
-    addNotification({
-      type: "success",
-      title: "Tax Invoice PDF Ready",
-      message: `Tax Invoice ${invoice.invoiceNumber} has been downloaded.`,
-    });
+    // No PDF library is bundled in this app, so the browser print dialog is
+    // the supported path to "Save as PDF" (choose PDF as the destination).
+    window.print();
   };
 
   const handleShare = () => {
@@ -136,9 +134,10 @@ export const InvoiceDetailsView: React.FC = () => {
           <button
             onClick={handleDownloadPdf}
             className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-semibold shadow-xs transition-colors"
+            title="Print or save this invoice as a PDF"
           >
             <Download className="w-4 h-4" />
-            <span>Download PDF</span>
+            <span>Print / Save as PDF</span>
           </button>
         </div>
       </div>
@@ -357,18 +356,29 @@ export const InvoiceDetailsView: React.FC = () => {
                 ₹{displayedTotals.subtotal.toLocaleString("en-IN")}
               </span>
             </div>
-            <div className="flex justify-between py-1">
-              <span className="text-gray-500">CGST (9%):</span>
-              <span className="font-mono font-semibold">
-                ₹{invoice.cgst.toLocaleString("en-IN")}
-              </span>
-            </div>
-            <div className="flex justify-between py-1">
-              <span className="text-gray-500">SGST (9%):</span>
-              <span className="font-mono font-semibold">
-                ₹{invoice.sgst.toLocaleString("en-IN")}
-              </span>
-            </div>
+            {invoice.igst > 0 ? (
+              <div className="flex justify-between py-1">
+                <span className="text-gray-500">IGST:</span>
+                <span className="font-mono font-semibold">
+                  ₹{invoice.igst.toLocaleString("en-IN")}
+                </span>
+              </div>
+            ) : (
+              <>
+                <div className="flex justify-between py-1">
+                  <span className="text-gray-500">CGST (9%):</span>
+                  <span className="font-mono font-semibold">
+                    ₹{invoice.cgst.toLocaleString("en-IN")}
+                  </span>
+                </div>
+                <div className="flex justify-between py-1">
+                  <span className="text-gray-500">SGST (9%):</span>
+                  <span className="font-mono font-semibold">
+                    ₹{invoice.sgst.toLocaleString("en-IN")}
+                  </span>
+                </div>
+              </>
+            )}
             <div className="flex justify-between py-2 bg-[#fef2f2] px-3 rounded-lg border border-rose-100">
               <span className="font-bold text-[#93000b] text-sm">
                 Grand Total (₹):

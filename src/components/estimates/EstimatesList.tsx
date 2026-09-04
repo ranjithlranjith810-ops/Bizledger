@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { Estimate } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
+import { matchesSearch } from "@/lib/search";
 import { Plus, Search, Eye, Pencil } from "lucide-react";
 import { SalesDocumentModal } from "@/components/shared/SalesDocumentModal";
 
@@ -35,12 +36,13 @@ export const EstimatesList: React.FC = () => {
   const totalEstimated = fyEstimates.reduce((acc, e) => acc + e.grandTotal, 0);
 
   const filtered = fyEstimates.filter((e) => {
-    const matchesSearch =
-      e.estimateNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      e.customerName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (e.customerGstin || "").toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesQuery = matchesSearch(searchQuery, [
+      e.estimateNumber,
+      e.customerName,
+      e.customerGstin,
+    ]);
     const matchesStatus = statusFilter === "All" || e.status === statusFilter;
-    return matchesSearch && matchesStatus;
+    return matchesQuery && matchesStatus;
   });
 
   const openEstimate = (e: Estimate) => {
@@ -154,7 +156,9 @@ export const EstimatesList: React.FC = () => {
                     <span className="material-symbols-outlined text-[30px] text-gray-300 block mx-auto mb-1.5">
                       insights
                     </span>
-                    No estimates match your filter criteria.
+                    {estimates.length === 0
+                      ? "No estimates yet — create your first."
+                      : "No estimates match your filter criteria."}
                   </td>
                 </tr>
               ) : (

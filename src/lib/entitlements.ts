@@ -14,6 +14,7 @@ import {
   SubscriptionPlanId,
   EntitlementLimitKind,
 } from "@/types";
+import { getEffectivePlan, getLimitFor, getPlanById } from "@/lib/plans";
 
 // Canonical limit-resource kind shared with the context/types layer.
 export type LimitKind = EntitlementLimitKind;
@@ -27,32 +28,67 @@ export function isUnlimited(value: number | "Unlimited"): boolean {
   return value === UNLIMITED || value === -1;
 }
 
-// The plan currently in effect. ONLY an `active` subscription with a current
-// plan wins; a `none`/`suspended` state yields null (no entitlements).
+// Backward-compatible guard: whether an ACTIVE (paid) plan is currently in
+// effect. This only reflects a successful paid subscription. For entitlement
+// decisions prefer `getEffectivePlan` (which never yields null for a valid
+// account) — see `plans.ts`.
 export function getActivePlan(
   plans: SubscriptionPlan[],
   state: SubscriptionState | null
 ): SubscriptionPlan | null {
   if (!state || state.status !== "active") return null;
   if (!state.currentPlanId) return null;
-  return plans.find((p) => p.id === state.currentPlanId) ?? null;
+  return getPlanById(plans, state.currentPlanId);
 }
 
 export function getLimit(plan: SubscriptionPlan, kind: LimitKind): number | "Unlimited" {
-  const limits = plan.limits;
+  return getLimitFor(plan, kind);
+}
+
+// Single-reliable usage resolver for every entitlement resource. Callers pass
+// the raw counts they already track (or have AppContext build them); this keeps
+// one shape for customers / products / team / invoices / directory.
+export interface UsageCounts {
+  customers: number;
+  products: number;
+  teamMembers: number;
+  invoicesInPeriod: number;
+  directoryListings: number;
+}
+
+export interface ResourceUsage {
+  customers: number;
+  products: number;
+  teamMembers: number;
+  invoices: number;
+  directoryListings: number;
+}
+
+export function getUsage(counts: UsageCounts): ResourceUsage {
+  return {
+    customers: counts.customers,
+    products: counts.products,
+    teamMembers: counts.teamMembers,
+    invoices: counts.invoicesInPeriod,
+    directoryListings: counts.directoryListings,
+  };
+}
+
+// Resolve the usage a single kind should be checked against, given the raw
+// usage map. Kind names map to the same fields `getLimit`/`checkEntitlement` use.
+export function usageForKind(usage: ResourceUsage, kind: LimitKind): number {
   switch (kind) {
     case "invoices":
-      return limits.invoicesPerMonth;
+      return usage.invoices;
     case "customers":
-      return limits.customers;
+      return usage.customers;
     case "teamMembers":
-      return limits.teamMembers;
+      return usage.teamMembers;
     case "products":
-      return limits.products;
+      return usage.products;
     case "directoryListing":
-      return limits.directoryListings;
+      return usage.directoryListings;
   }
-  return UNLIMITED;
 }
 
 // How many invoices fall inside the current billing period. Usage resets

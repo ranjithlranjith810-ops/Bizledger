@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { Quotation } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
+import { matchesSearch } from "@/lib/search";
 import { Plus, Search, Eye, Pencil } from "lucide-react";
 import { SalesDocumentModal } from "@/components/shared/SalesDocumentModal";
 
@@ -35,13 +36,14 @@ export const QuotationsList: React.FC = () => {
   const totalQuoted = fyQuotations.reduce((acc, q) => acc + q.grandTotal, 0);
 
   const filtered = fyQuotations.filter((q) => {
-    const matchesSearch =
-      q.quotationNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      q.customerName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (q.customerGstin || "").toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesQuery = matchesSearch(searchQuery, [
+      q.quotationNumber,
+      q.customerName,
+      q.customerGstin,
+    ]);
     const matchesStatus =
       statusFilter === "All" || q.status === statusFilter;
-    return matchesSearch && matchesStatus;
+    return matchesQuery && matchesStatus;
   });
 
   const openQuotation = (q: Quotation) => {
@@ -155,7 +157,9 @@ export const QuotationsList: React.FC = () => {
                     <span className="material-symbols-outlined text-[30px] text-gray-300 block mx-auto mb-1.5">
                       request_quote
                     </span>
-                    No quotations match your filter criteria.
+                    {quotations.length === 0
+                      ? "No quotations yet — create your first."
+                      : "No quotations match your filter criteria."}
                   </td>
                 </tr>
               ) : (

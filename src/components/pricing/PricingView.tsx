@@ -63,7 +63,7 @@ export const PricingView: React.FC = () => {
               <div className="space-y-2.5 text-xs text-gray-600 divide-y divide-gray-100 pt-2">
                 <div className="flex items-center gap-2 pt-1">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>1 Team Member</span>
+                  <span>Owner Access Only (no extra team seats)</span>
                 </div>
                 <div className="flex items-center gap-2 pt-1">
                   <Check className="w-4 h-4 text-emerald-600 shrink-0" />

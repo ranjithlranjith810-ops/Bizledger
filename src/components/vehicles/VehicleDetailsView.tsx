@@ -41,6 +41,27 @@ export const VehicleDetailsView: React.FC = () => {
 
   const expensesForVehicle = vehicleExpenses.filter((ve) => ve.vehicleId === vehicle.id);
 
+  // Real share of fuel in this vehicle's total outlay (computed, never seeded).
+  const fuelSharePct =
+    vehicle.totalExpenses > 0
+      ? Math.round((vehicle.fuelExpenses / vehicle.totalExpenses) * 100)
+      : 0;
+
+  // Latest service maintenance log date (most recent vehicle expense of that kind),
+  // falling back to an explicit "—" when no service log exists — no placeholder date.
+  const lastServiceDate = (() => {
+    const serviceLogs = expensesForVehicle
+      .filter(
+        (ve) =>
+          ve.category === "Service & Maintenance" ||
+          ve.category === "Repairs" ||
+          ve.category === "Tyre"
+      )
+      .map((ve) => ve.date)
+      .sort((a, b) => (a < b ? 1 : -1));
+    return serviceLogs.length > 0 ? serviceLogs[0] : "";
+  })();
+
   return (
     <div className="space-y-6 animate-in fade-in">
       {/* Top Breadcrumb & Action Header */}
@@ -95,7 +116,7 @@ export const VehicleDetailsView: React.FC = () => {
             </span>
           </div>
           <div className="mt-2 text-[11px] text-amber-700 font-medium">
-            54% of vehicle outlays
+            {fuelSharePct}% of vehicle outlays
           </div>
         </div>
 
@@ -112,7 +133,7 @@ export const VehicleDetailsView: React.FC = () => {
             </span>
           </div>
           <div className="mt-2 text-[11px] text-gray-500">
-            Last service: {vehicle.lastServiceDate || "28 Jul 2026"}
+            Last service: {lastServiceDate || "No service logged"}
           </div>
         </div>
 
@@ -129,7 +150,7 @@ export const VehicleDetailsView: React.FC = () => {
             </span>
           </div>
           <div className="mt-2 text-[11px] text-blue-700 font-medium">
-            Auto-debit active
+            {expensesForVehicle.filter((ve) => ve.category === "Fastag / Toll").length} toll pass(es) recorded
           </div>
         </div>
 
@@ -183,15 +204,15 @@ export const VehicleDetailsView: React.FC = () => {
             </div>
             <div className="flex justify-between py-1.5">
               <span className="text-gray-500">Chassis Number</span>
-              <span className="font-mono text-gray-700">{vehicle.chassisNumber || "MAT612345N1234567"}</span>
+              <span className="font-mono text-gray-700">{vehicle.chassisNumber || "—"}</span>
             </div>
             <div className="flex justify-between py-1.5">
               <span className="text-gray-500">Engine Number</span>
-              <span className="font-mono text-gray-700">{vehicle.engineNumber || "275ID05XY98124"}</span>
+              <span className="font-mono text-gray-700">{vehicle.engineNumber || "—"}</span>
             </div>
             <div className="flex justify-between py-1.5">
               <span className="text-gray-500">Assigned Transit Route</span>
-              <span className="font-medium text-gray-800 text-right">{vehicle.assignedRoute || "Coimbatore & Tiruppur Hub"}</span>
+              <span className="font-medium text-gray-800 text-right">{vehicle.assignedRoute || "—"}</span>
             </div>
           </div>
         </div>

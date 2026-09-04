@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { ONBOARDING_STEPS } from "@/lib/constants";
+import { validatePan, validateGstin } from "@/lib/validation";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
@@ -65,6 +66,20 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
     financialYears.find((fy) => fy.id === activeFinancialYearId) || financialYears[0];
   const progress = Math.round((stepIndex / 6) * 100);
 
+  // Shared GSTIN/PAN validation (same rules as Settings -> Company Profile via
+  // src/lib/validation.ts). Onboarding must not use different rules than Settings.
+  const [taxErrors, setTaxErrors] = useState<Record<string, string>>({});
+
+  const validateTaxStep = (): boolean => {
+    const gstinErr = validateGstin().validate(form.gstin);
+    const panErr = validatePan().validate(form.pan);
+    const errors: Record<string, string> = {};
+    if (gstinErr) errors.gstin = gstinErr;
+    if (panErr) errors.pan = panErr;
+    setTaxErrors(errors);
+    return Object.keys(errors).length === 0;
+  };
+
   const goNext = () => {
     const next = stepIndex + 1;
     setOnboardingStep(next);
@@ -73,7 +88,9 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
 
   const goBack = () => {
     if (stepIndex <= 1) {
-      router.push("/dashboard");
+      // An account that has NOT finished onboarding has no dashboard to return
+      // to — send the user to the app home instead of a fake dashboard.
+      router.push("/");
       return;
     }
     const prev = stepIndex - 1;
@@ -95,8 +112,8 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
   const saveTax = () => {
     updateCompanyProfile({
       gstRegistered: form.gstRegistered,
-      gstin: form.gstin,
-      pan: form.pan,
+      gstin: form.gstin.trim().toUpperCase(),
+      pan: form.pan.trim().toUpperCase(),
     });
   };
 
@@ -281,17 +298,25 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
                 </div>
                 <Input
                   label="GSTIN"
+                  required
                   icon="receipt_long"
                   placeholder="e.g. 33AAAAA0000A1Z5"
                   value={form.gstin}
-                  onChange={(e) => setForm({ ...form, gstin: e.target.value })}
+                  error={taxErrors.gstin}
+                  onChange={(e) =>
+                    setForm({ ...form, gstin: e.target.value.trim().toUpperCase() })
+                  }
                 />
                 <Input
                   label="PAN"
+                  required
                   icon="badge"
                   placeholder="e.g. ABCDE1234F"
                   value={form.pan}
-                  onChange={(e) => setForm({ ...form, pan: e.target.value })}
+                  error={taxErrors.pan}
+                  onChange={(e) =>
+                    setForm({ ...form, pan: e.target.value.trim().toUpperCase() })
+                  }
                 />
               </React.Fragment>
             )}
@@ -489,7 +514,7 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
               className="inline-flex items-center gap-1.5 text-xs font-bold text-gray-600 hover:bg-[#f7f9fb] px-4 py-2 rounded-lg transition-colors"
             >
               <span className="material-symbols-outlined text-[16px]">arrow_back</span>
-              {stepIndex === 1 ? "Dashboard" : "Back"}
+              {stepIndex === 1 ? "Home" : "Back"}
             </button>
 
             {stepIndex < 6 ? (
@@ -499,6 +524,7 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
                     if (!step1Valid) return;
                     saveBusiness();
                   } else if (stepIndex === 2) {
+                    if (!validateTaxStep()) return;
                     saveTax();
                   } else if (stepIndex === 3) {
                     saveAddress();

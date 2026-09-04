@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
+import { matchesSearch } from "@/lib/search";
 import { Customer } from "@/types";
 import { Search, Plus, Trash2, Pencil } from "lucide-react";
 import { AddCustomerModal } from "@/components/customers/AddCustomerModal";
@@ -11,11 +12,8 @@ export const CustomersListView: React.FC = () => {
   const [search, setSearch] = useState("");
   const [editing, setEditing] = useState<Customer | null>(null);
 
-  const filtered = customers.filter(
-    (c) =>
-      c.name.toLowerCase().includes(search.toLowerCase()) ||
-      (c.gstin || "").toLowerCase().includes(search.toLowerCase()) ||
-      c.billingAddress.city.toLowerCase().includes(search.toLowerCase())
+  const filtered = customers.filter((c) =>
+    matchesSearch(search, [c.name, c.gstin, c.billingAddress?.city])
   );
 
   const totalOutstanding = customers.reduce((acc, c) => acc + c.outstandingBalance, 0);
@@ -94,16 +92,25 @@ export const CustomersListView: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#eceef0]">
-              {filtered.map((c) => (
-                <tr key={c.id} className="hover:bg-[#f7f9fb] transition-colors">
-                  <td className="py-3.5 px-4">
-                    <div className="font-bold text-gray-900">{c.name}</div>
-                    <div className="text-[11px] text-gray-500 flex items-center gap-2 mt-0.5">
-                      <span>{c.primaryContact.mobile}</span>
-                      <span>•</span>
-                      <span>{c.primaryContact.email}</span>
-                    </div>
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="py-8 text-center text-gray-400">
+                    {customers.length === 0
+                      ? "No customers yet — add your first."
+                      : "No customers match your search."}
                   </td>
+                </tr>
+              ) : (
+                filtered.map((c) => (
+                  <tr key={c.id} className="hover:bg-[#f7f9fb] transition-colors">
+                    <td className="py-3.5 px-4">
+                      <div className="font-bold text-gray-900">{c.name}</div>
+                      <div className="text-[11px] text-gray-500 flex items-center gap-2 mt-0.5">
+                        <span>{c.primaryContact.mobile}</span>
+                        <span>•</span>
+                        <span>{c.primaryContact.email}</span>
+                      </div>
+                    </td>
                   <td className="py-3.5 px-4 font-mono font-bold text-gray-800">{c.gstin || "-"}</td>
                   <td className="py-3.5 px-4 text-gray-600">
                     {c.billingAddress.city}, {c.billingAddress.state}
@@ -144,7 +151,8 @@ export const CustomersListView: React.FC = () => {
                     </div>
                   </td>
                 </tr>
-              ))}
+                ))
+              )}
             </tbody>
           </table>
         </div>

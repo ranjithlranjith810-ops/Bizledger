@@ -43,7 +43,13 @@ import {
 } from "@/data/mockData";
 import { dataKey } from "@/lib/storage";
 import { useAuth } from "@/context/AuthContext";
-import { buildInvoiceNumber, buildDocumentNumber } from "@/lib/invoice";
+import {
+  buildInvoiceNumber,
+  buildDocumentNumber,
+  resolveTaxType,
+  splitTaxType,
+} from "@/lib/invoice";
+import { stateWithCode } from "@/lib/india";
 import { InvoiceItem } from "@/types";
 import {
   reconcileFinancialYears,
@@ -57,13 +63,16 @@ import {
   SequenceKind,
 } from "@/lib/financialYear";
 import {
-  getActivePlan,
   countCurrentPeriodInvoices,
   canCreate,
   checkEntitlement,
   EntitlementResult,
   LimitKind,
+  getUsage,
+  usageForKind,
+  ResourceUsage,
 } from "@/lib/entitlements";
+import { getEffectivePlan } from "@/lib/plans";
 import { getMyDirectoryListing } from "@/lib/directory";
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
@@ -98,6 +107,36 @@ function nowIso(): string {
 }
 function plusDaysIso(days: number): string {
   return new Date(Date.now() + days * 86400000).toISOString().split("T")[0];
+}
+
+// Team-seat count for entitlement purposes. The account owner is NOT a paid
+// team-member seat — only ADDITIONAL (non-owner) members count against the
+// plan's teamMember ceiling. This keeps the Free plan's 0 extra seats from
+// consuming the owner (who may always use the app).
+function additionalTeamSeatsUsed(members: TeamMember[]): number {
+  return members.filter((m) => m.role !== "Owner").length;
+}
+
+// Derive a place-of-supply pair from a customer's billing state. This must
+// NEVER fall back to a hard-coded seller state — if we cannot prove the POS we
+// leave it empty and the GST engine resolves to intrastate (CGST+SGST), which
+// is the conservative, correct classification for an unproven destination.
+function placeOfSupplyFromState(customerState: string): {
+  placeOfSupply: string;
+  placeOfSupplyCode: string;
+} {
+  const formatted = stateWithCode(customerState || "");
+  if (!formatted) return { placeOfSupply: "", placeOfSupplyCode: "" };
+  const m = /\((\d+)\)/.exec(formatted);
+  return { placeOfSupply: formatted, placeOfSupplyCode: m ? m[1] : "" };
+}
+
+// Seller state code extracted from the company profile state (canonical code,
+// not display name). Empty when the profile state is not a known state.
+function sellerStateCode(stateName: string): string {
+  const formatted = stateWithCode(stateName || "");
+  const m = /\((\d+)\)/.exec(formatted);
+  return m ? m[1] : "";
 }
 
 export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
@@ -270,24 +309,43 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   // ACTIVE plan derived from subscription state (a failed/cancelled payment keeps
   // the previous plan active; only a successful payment switches it).
-  const activePlan = getActivePlan(SUBSCRIPTION_PLANS, subscription);
+  // `getEffectivePlan` NEVER returns null for a valid account — when there is no
+  // paid plan it resolves to the Free (base) plan, so entitlements like customers
+  // 2 / products 5 / team 0 / invoices 5 correctly govern instead of collapsing
+  // to 0 (which previously surfaced as misleading "allows up to 0 X" messages).
+  const activePlan = getEffectivePlan(subscription);
 
   // Emit a consistent upgrade-prompt notification when an action is blocked by
-  // the active plan's entitlement limits.
+  // the active plan's entitlement limits. The wording is resource-aware so the
+  // message never mislabels one resource (e.g. "team members") for another or
+  // implies a lifetime cap is a billing-period cap (and vice-versa).
   const notifyEntitlementBlocked = (kind: LimitKind, result: EntitlementResult) => {
-    const resource =
-      kind === "invoices"
-        ? "invoices"
-        : kind === "customers"
-        ? "customers"
-        : kind === "teamMembers"
-        ? "team members"
-        : "products";
+    const planName = activePlan?.name ?? "your current plan";
+    let message: string;
+    if (kind === "invoices") {
+      message = `You've used all ${result.limit} invoices allowed by ${planName} this month. Upgrade your plan to create more.`;
+    } else {
+      const label =
+        kind === "customers"
+          ? "customers"
+          : kind === "teamMembers"
+          ? "team members"
+          : kind === "directoryListing"
+          ? "directory listings"
+          : "products";
+      const focus =
+        kind === "teamMembers"
+          ? "You can use this app as an owner; inviting additional team members requires an upgrade."
+          : `You've reached the ${label} limit (${result.limit}) for ${planName}.`;
+      message = `${focus} Upgrade your plan to continue.`;
+    }
     addNotification({
       type: "warning",
-      title: `${capitalize(resource)} limit reached`,
-      message: `Your current plan allows up to ${result.limit} ${resource} in this billing period. Upgrade your plan to continue.`,
-      icon: result.limit === 0 ? "workspace_premium" : "trending_up",
+      title: `${capitalize(
+        kind === "directoryListing" ? "directory listing" : kind === "invoices" ? "invoice" : kind === "teamMembers" ? "team member" : kind
+      )} limit reached`,
+      message,
+      icon: "workspace_premium",
     });
   };
 
@@ -487,6 +545,14 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
   };
 
+  // Mark a SINGLE notification as read (the per-item "Mark as Read" action).
+  // Persisted via the notifications effect so read-state survives a reload.
+  const markNotificationRead = (id: string) => {
+    setNotifications((prev) =>
+      prev.map((n) => (n.id === id ? { ...n, read: true } : n))
+    );
+  };
+
   const confirmDelete = (state: DeleteConfirmState) => {
     setDeleteConfirm(state);
   };
@@ -658,7 +724,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addTeamMember = (memData: Omit<TeamMember, "id" | "lastActive" | "joinedDate">) => {
-    const gate = checkEntitlement(activePlan, "teamMembers", teamMembers.length);
+    // The account owner is NOT a paid team-member seat, so only ADDITIONAL
+    // (non-owner) members count against the plan's teamMember ceiling. This is
+    // what lets the Free plan allow 0 extra seats while the owner still uses
+    // the app. A member being invited with the "Owner" role is still an added
+    // seat (it represents an additional person, not the account owner).
+    const additionalSeatsUsed = additionalTeamSeatsUsed(teamMembers);
+    const gate = checkEntitlement(activePlan, "teamMembers", additionalSeatsUsed);
     if (!gate.allowed) {
       notifyEntitlementBlocked("teamMembers", gate);
       return false;
@@ -718,16 +790,16 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     addNotification({
       type: "success",
       title: "Profile Updated",
-      message: "Company details and invoice tax settings saved.",
+      message: "Company details updated successfully.",
       icon: "check_circle",
     });
   };
 
-  const changePlan = (planId: SubscriptionPlan["id"]) => {
-    setSubscription((prev) =>
-      prev ? { ...prev, currentPlanId: planId, status: "active" } : prev
-    );
-  };
+  // NOTE: No arbitrary `changePlan` mutation is exposed. A plan may only change
+  // via the checkout/payment flow (`setPendingPlan` + `completePayment("success")`)
+  // which the account owner/admin drives — a user cannot silently hand-switch to
+  // a paid plan or override plan limits. (Admin assignment arrives in the
+  // backend phase via `fetchPlanCatalog` / the subscription API.)
 
   // Set a checkout selection. THIS DOES NOT activate the plan — only a successful
   // payment via completePayment("success") may change the active plan.
@@ -970,6 +1042,10 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       taxAmount: it.taxAmount,
       totalAmount: it.totalAmount,
     }));
+    const customer = customers.find((c) => c.id === quotation.customerId);
+    const pos = placeOfSupplyFromState(customer?.billingAddress?.state || "");
+    const taxType = resolveTaxType(sellerStateCode(companyProfile.state), pos.placeOfSupplyCode);
+    const split = splitTaxType(quotation.totalTax || 0, taxType);
     const inv: Invoice = {
       id: makeId("inv"),
       invoiceNumber,
@@ -980,13 +1056,13 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       customerPhone: quotation.customerPhone,
       date: todayIso(),
       dueDate: plusDaysIso(15),
-      placeOfSupply: "Tamil Nadu (33)",
-      placeOfSupplyCode: "33",
+      placeOfSupply: pos.placeOfSupply,
+      placeOfSupplyCode: pos.placeOfSupplyCode,
       items: invoiceItems,
       subtotal: quotation.subtotal,
-      cgst: quotation.cgst,
-      sgst: quotation.sgst,
-      igst: quotation.igst,
+      cgst: split.cgst,
+      sgst: split.sgst,
+      igst: split.igst,
       totalTax: quotation.totalTax,
       grandTotal: quotation.grandTotal,
       status: "Pending",
@@ -1143,6 +1219,10 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       minted.value
     );
     const invoiceItems: InvoiceItem[] = estimate.items.map((it) => ({ ...it }));
+    const customer = customers.find((c) => c.id === estimate.customerId);
+    const pos = placeOfSupplyFromState(customer?.billingAddress?.state || "");
+    const taxType = resolveTaxType(sellerStateCode(companyProfile.state), pos.placeOfSupplyCode);
+    const split = splitTaxType(estimate.totalTax || 0, taxType);
     const inv: Invoice = {
       id: makeId("inv"),
       invoiceNumber,
@@ -1153,13 +1233,13 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       customerPhone: estimate.customerPhone,
       date: todayIso(),
       dueDate: plusDaysIso(15),
-      placeOfSupply: "Tamil Nadu (33)",
-      placeOfSupplyCode: "33",
+      placeOfSupply: pos.placeOfSupply,
+      placeOfSupplyCode: pos.placeOfSupplyCode,
       items: invoiceItems,
       subtotal: estimate.subtotal,
-      cgst: estimate.cgst,
-      sgst: estimate.sgst,
-      igst: estimate.igst,
+      cgst: split.cgst,
+      sgst: split.sgst,
+      igst: split.igst,
       totalTax: estimate.totalTax,
       grandTotal: estimate.grandTotal,
       status: "Pending",
@@ -1592,6 +1672,20 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     });
   };
 
+  // Single-reliable usage snapshot for every entitlement resource, built once
+  // and reused by the usage gauges, canCreateResource, and checkEntitlementFor.
+  const resourceUsage: ResourceUsage = getUsage({
+    customers: customers.length,
+    products: products.length,
+    // Only ADDITIONAL (non-owner) members count as paid team seats. The owner
+    // is not a seat, so the usage gauge reflects how many extra seats are used
+    // against the plan's teamMember ceiling instead of counting the owner.
+    teamMembers: additionalTeamSeatsUsed(teamMembers),
+    invoicesInPeriod: countCurrentPeriodInvoices(invoices, subscription),
+    directoryListings:
+      activeAccountId && getMyDirectoryListing(activeAccountId) ? 1 : 0,
+  });
+
   const value: AppContextType = {
     activeRoute,
     setActiveRoute,
@@ -1607,6 +1701,7 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     isNotificationOpen,
     setIsNotificationOpen,
     markAllNotificationsRead,
+    markNotificationRead,
     deleteConfirm,
     setDeleteConfirm,
     confirmDelete: confirmDelete as (state: DeleteConfirmState) => void,
@@ -1634,48 +1729,13 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     setPendingPlan,
     completePayment,
     requestRefund,
-    changePlan,
     plans: SUBSCRIPTION_PLANS,
     activePlan,
-    currentUsage: {
-      invoices: countCurrentPeriodInvoices(invoices, subscription),
-      customers: customers.length,
-      teamMembers: teamMembers.length,
-      products: products.length,
-      directoryListings: activeAccountId && getMyDirectoryListing(activeAccountId) ? 1 : 0,
-    },
+    currentUsage: resourceUsage,
     canCreateResource: (kind: LimitKind) =>
-      canCreate(
-        activePlan,
-        kind,
-        kind === "invoices"
-          ? countCurrentPeriodInvoices(invoices, subscription)
-          : kind === "customers"
-          ? customers.length
-          : kind === "teamMembers"
-          ? teamMembers.length
-          : kind === "products"
-          ? products.length
-          : activeAccountId && getMyDirectoryListing(activeAccountId)
-          ? 1
-          : 0
-      ),
+      canCreate(activePlan, kind, usageForKind(resourceUsage, kind)),
     checkEntitlementFor: (kind: LimitKind) =>
-      checkEntitlement(
-        activePlan,
-        kind,
-        kind === "invoices"
-          ? countCurrentPeriodInvoices(invoices, subscription)
-          : kind === "customers"
-          ? customers.length
-          : kind === "teamMembers"
-          ? teamMembers.length
-          : kind === "products"
-          ? products.length
-          : activeAccountId && getMyDirectoryListing(activeAccountId)
-          ? 1
-          : 0
-      ),
+      checkEntitlement(activePlan, kind, usageForKind(resourceUsage, kind)),
     paymentHistory,
     expenses,
     vehicles,

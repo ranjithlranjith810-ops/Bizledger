@@ -4,6 +4,7 @@ import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { Product } from "@/types";
 import { PRODUCT_CATEGORIES } from "@/lib/constants";
+import { validateHsnSAC } from "@/lib/validation";
 import { X, PackagePlus, Check, Edit3 } from "lucide-react";
 
 interface AddProductModalProps {
@@ -18,10 +19,19 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
   const { addProduct, updateProduct, setOpenModal, products } = useApp();
   const isEdit = !!product;
 
+  // If an existing product's category is not a built-in category (i.e. it was
+  // saved from the "Other" choice as a custom category), pre-fill the Custom
+  // Category input so the value round-trips on edit instead of being lost.
+  const initialCustom =
+    product?.category &&
+    !(PRODUCT_CATEGORIES as readonly string[]).includes(product.category)
+      ? product.category
+      : "";
+
   const [name, setName] = useState<string>(product?.name || "");
   const [sku, setSku] = useState<string>(product?.sku || "");
   const [category, setCategory] = useState<string>(product?.category || "");
-  const [customCategory, setCustomCategory] = useState<string>("");
+  const [customCategory, setCustomCategory] = useState<string>(initialCustom);
   const [unit, setUnit] = useState<string>(product?.unit || "Pcs");
   const [unitPrice, setUnitPrice] = useState<string>(
     product ? String(product.unitPrice || 0) : ""
@@ -30,6 +40,7 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
     product ? String(product.stockQuantity || 0) : ""
   );
   const [hsnSac, setHsnSac] = useState<string>(product?.hsnSac || "");
+  const [hsnError, setHsnError] = useState<string | null>(null);
   const [gstRate, setGstRate] = useState<number>(product?.gstRate ?? 18);
 
   const close = () => {
@@ -40,10 +51,20 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
   const isOther = category === "Other" || !PRODUCT_CATEGORIES.includes(category as (typeof PRODUCT_CATEGORIES)[number]);
   const resolvedCategory = isOther && customCategory.trim() ? customCategory.trim() : category;
 
+  // HSN/SAC is validated but NEVER guessed/inferred/generated. The business is
+  // responsible for providing the correct code; we only format-validate + store
+  // what the user enters and remind them to verify it.
+  const validateHsn = (): boolean => {
+    const msg = validateHsnSAC().validate(hsnSac);
+    setHsnError(msg);
+    return msg == null;
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
     if (isOther && !customCategory.trim()) return;
+    if (!validateHsn()) return;
 
     const payload: Omit<Product, "id"> = {
       name: name.trim(),
@@ -54,7 +75,7 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
       unit,
       unitPrice: parseFloat(unitPrice) || 0,
       stockQuantity: parseInt(stockQuantity, 10) || 0,
-      hsnSac: hsnSac.trim(),
+      hsnSac: hsnSac.trim().toUpperCase(),
       gstRate,
     };
 
@@ -181,18 +202,30 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
 
             <div>
               <label className="block font-semibold text-gray-700 mb-1">
-                HSN / SAC Code
+                HSN / SAC Code <span className="text-rose-500">*</span>
               </label>
               <input
                 type="text"
+                required
                 value={hsnSac}
-                onChange={(e) => setHsnSac(e.target.value)}
+                onChange={(e) => {
+                  setHsnSac(e.target.value.trim().toUpperCase());
+                  if (hsnError) setHsnError(null);
+                }}
                 placeholder="Enter HSN code"
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-mono"
+                className={`w-full py-2 px-3 bg-white border rounded-lg outline-none font-mono ${
+                  hsnError
+                    ? "border-rose-500"
+                    : "border-[#eceef0] focus:border-[#93000b]"
+                }`}
               />
-              <p className="text-[11px] text-amber-600 mt-1">
-                Please check your HSN code properly before saving.
-              </p>
+              {hsnError ? (
+                <p className="text-[11px] text-rose-600 mt-1">{hsnError}</p>
+              ) : (
+                <p className="text-[11px] text-amber-600 mt-1">
+                  Please check your HSN/SAC properly before saving.
+                </p>
+              )}
             </div>
 
             <div>

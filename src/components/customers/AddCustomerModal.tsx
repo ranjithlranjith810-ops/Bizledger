@@ -91,6 +91,13 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
         country: "India",
       },
       sameAsBilling: true,
+      stateCode: (() => {
+        const st = state.trim() || "Tamil Nadu";
+        const found = INDIAN_STATES.find(
+          (s) => s.name.toLowerCase() === st.toLowerCase()
+        );
+        return found ? found.code : undefined;
+      })(),
       creditLimit: parseFloat(creditLimit) || 0,
       paymentTerms,
       status: customer?.status || ("Active" as const),

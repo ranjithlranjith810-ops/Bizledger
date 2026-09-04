@@ -7,6 +7,7 @@ import { useApp } from "@/context/AppContext";
 import { DashboardLayout } from "@/components/layout/DashboardLayout";
 import { ROUTES, onboardingRouteForStep } from "@/lib/constants";
 import { LEGAL_LINKS } from "@/config/legal";
+import { canAccessRoute, OWNER_PERMISSIONS } from "@/lib/permissions";
 
 // Public marketing/auth paths plus the standalone legal / policy documents.
 // Legal pages are intentionally accessible without logging in or completing an
@@ -60,10 +61,25 @@ export function AppShell({ children }: { children: React.ReactNode }) {
       router.replace("/");
       return;
     }
+    // Role-based route enforcement. In the backend phase this uses the
+    // authenticated member's effective permissions; until then the local
+    // operator is the Owner, who has full access to every route.
+    if (isValidAppRoute(pathname) && !canAccessRoute(OWNER_PERMISSIONS, pathname)) {
+      router.replace("/dashboard");
+      return;
+    }
     // Authenticated users with an incomplete onboarding wizard are directed to
     // the pending step (unless they are already on an onboarding route).
     if (!onboarding.completed && !isOnboardingPath(pathname)) {
       router.replace(onboardingRouteForStep(onboarding.currentStep));
+      return;
+    }
+    // A completed account must never stay on (or be sent back into) an
+    // onboarding step — a stale /onboarding/* route or direct navigation is
+    // redirected to the dashboard. Onboarding is finished; there is nothing to
+    // resume.
+    if (onboarding.completed && isOnboardingPath(pathname)) {
+      router.replace("/dashboard");
       return;
     }
     if (isValidAppRoute(pathname)) {

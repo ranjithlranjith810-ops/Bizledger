@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { useAuth } from "@/context/AuthContext";
@@ -32,6 +32,10 @@ export const CompanyProfileView: React.FC = () => {
   const router = useRouter();
 
   const [formData, setFormData] = useState({ ...companyProfile });
+  // Single source of truth for the save form. Both the top and the bottom Save
+  // buttons submit through the SAME <form> element so there is one handler, one
+  // validation pass, one loading state and one success message (no double write).
+  const formRef = useRef<HTMLFormElement>(null);
   const [logoPreview, setLogoPreview] = useState<string | undefined>(companyProfile.logoUrl);
   const [signaturePreview, setSignaturePreview] = useState<string | undefined>(companyProfile.digitalSignatureUrl);
   const [confirmReset, setConfirmReset] = useState(false);
@@ -138,7 +142,8 @@ export const CompanyProfileView: React.FC = () => {
           </p>
         </div>
         <button
-          onClick={handleSubmit}
+          type="button"
+          onClick={() => formRef.current?.requestSubmit()}
           className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-5 py-2.5 rounded-xl text-xs font-bold shadow-xs transition-colors"
         >
           <Save className="w-4 h-4" />
@@ -147,7 +152,7 @@ export const CompanyProfileView: React.FC = () => {
       </div>
 
       {/* Form (Stitch Design #3) */}
-      <form onSubmit={handleSubmit} className="space-y-6 text-xs">
+      <form ref={formRef} onSubmit={handleSubmit} className="space-y-6 text-xs">
         {Object.keys(validationErrors).length > 0 && (
           <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4">
             <div className="font-semibold">Please correct the following to save your profile:</div>

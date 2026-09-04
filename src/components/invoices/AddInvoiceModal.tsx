@@ -8,6 +8,7 @@ import {
   calculateInvoiceTotals,
   calculateLineTotals,
   buildInvoiceNumber,
+  resolveTaxType,
 } from "@/lib/invoice";
 import { stateWithCode, INDIAN_STATES } from "@/lib/india";
 import { getEWayBillComplianceStatus } from "@/lib/compliance";
@@ -20,7 +21,7 @@ import {
   validateGstRate,
   validateVehicleNumber,
 } from "@/lib/validation";
-import { X, FileText, Plus, Trash2, Check, Truck, ShieldAlert } from "lucide-react";
+import { X, FileText, Trash2, Check, Truck, ShieldAlert } from "lucide-react";
 import { SearchablePicker } from "@/components/invoices/SearchablePicker";
 
 interface LineDraft {
@@ -89,7 +90,16 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     invoice?.placeOfSupply || "Tamil Nadu (33)"
   );
   const [placeOfSupplyCode, setPlaceOfSupplyCode] = useState<string>(
-    invoice?.placeOfSupplyCode || ""
+    () => {
+      // P1-2: keep state + code synchronised. When editing an existing invoice we
+      // preserve the stored values; when creating, the default is "Tamil Nadu (33)",
+      // which must carry its matching code so the pair is always consistent.
+      const init = invoice?.placeOfSupplyCode;
+      if (init && init.trim() !== "") return init;
+      const source = invoice?.placeOfSupply || "Tamil Nadu (33)";
+      const codeMatch = /\((\d+)\)/.exec(source);
+      return codeMatch ? codeMatch[1] : "";
+    }
   );
   const [status, setStatus] = useState<InvoiceStatus>(
     invoice?.status || "Pending"
@@ -173,21 +183,6 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     }
   };
 
-  const addCustomLine = () => {
-    setItems((prev) => [
-      ...prev,
-      {
-        id: `item-${Date.now()}-${prev.length}`,
-        description: "",
-        hsnSac: "",
-        quantity: 1,
-        unit: "Pcs",
-        unitPrice: 0,
-        gstRate: 18,
-      },
-    ]);
-  };
-
   const handleItemChange = (
     index: number,
     field: keyof LineDraft,
@@ -202,14 +197,26 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     setItems((prev) => prev.filter((_, i) => i !== index));
   };
 
-  // Live GST-inclusive calculation using the ONE shared function.
+  // Live GST-inclusive calculation using the ONE shared function. The tax split
+  // (CGST+SGST vs IGST) is derived from the seller's state code vs the place of
+  // supply code so inter-state invoices classify tax correctly.
+  const sellerStateCode = (() => {
+    const m = /\((\d+)\)/.exec(stateWithCode(companyProfile.state));
+    return m ? m[1] : "";
+  })();
+  const taxType = resolveTaxType(sellerStateCode, placeOfSupplyCode);
+  const totalTaxGstRate = items.length
+    ? Math.max(...items.map((it) => Number(it.gstRate) || 0))
+    : 0;
+
   const totals = calculateInvoiceTotals(
     items.map((it) => ({
       quantity: it.quantity,
       unitPrice: it.unitPrice,
       gstRate: it.gstRate,
     })),
-    pricingMode
+    pricingMode,
+    taxType
   );
 
   const compliance = getEWayBillComplianceStatus(totals.grandTotal);
@@ -251,7 +258,8 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
           unitPrice: it.unitPrice,
           gstRate: it.gstRate,
         },
-        pricingMode
+        pricingMode,
+        taxType
       );
       return {
         id: it.id,
@@ -508,17 +516,9 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
               <h4 className="font-bold text-[#191c1e] uppercase tracking-wider text-xs">
                 Line Items &amp; Materials
               </h4>
-              <button
-                type="button"
-                onClick={addCustomLine}
-                className="text-xs text-[#93000b] hover:bg-rose-50 px-2.5 py-1 rounded-lg font-semibold flex items-center gap-1 border border-rose-200 transition-colors"
-              >
-                <Plus className="w-3.5 h-3.5" />
-                <span>Add Item</span>
-              </button>
             </div>
 
-            {/* ONE main product search area */}
+            {/* ONE main product search area (the only line-item mechanism) */}
             <div className="bg-[#f7f9fb] border border-[#eceef0] rounded-xl p-3">
               <label className="block font-semibold text-gray-700 mb-1.5">
                 Search product to add
@@ -549,20 +549,13 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
                     onEmptyAction={() => setOpenModal("add-product")}
                   />
                 </div>
-                <button
-                  type="button"
-                  onClick={addCustomLine}
-                  className="shrink-0 text-xs text-[#93000b] hover:bg-rose-50 px-3 py-2 rounded-lg font-semibold border border-rose-200 transition-colors"
-                >
-                  + Custom Item
-                </button>
               </div>
             </div>
 
             {items.length === 0 ? (
               <div className="border border-dashed border-[#eceef0] rounded-xl p-6 text-center text-gray-400">
                 <FileText className="w-6 h-6 mx-auto mb-1.5 text-gray-300" />
-                No items yet. Add a product or a custom line item above.
+                No items yet. Search and select a product to add it to this invoice.
               </div>
             ) : (
               <div className="border border-[#eceef0] rounded-xl overflow-x-auto">
@@ -812,18 +805,29 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
                   ₹{totals.subtotal.toLocaleString("en-IN")}
                 </span>
               </div>
-              <div className="flex justify-between">
-                <span className="text-gray-500">CGST (9%):</span>
-                <span className="font-mono font-semibold">
-                  ₹{totals.cgst.toLocaleString("en-IN")}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-500">SGST (9%):</span>
-                <span className="font-mono font-semibold">
-                  ₹{totals.sgst.toLocaleString("en-IN")}
-                </span>
-              </div>
+              {taxType === "interstate" ? (
+                <div className="flex justify-between">
+                  <span className="text-gray-500">IGST ({totalTaxGstRate}%):</span>
+                  <span className="font-mono font-semibold">
+                    ₹{totals.igst.toLocaleString("en-IN")}
+                  </span>
+                </div>
+              ) : (
+                <>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">CGST (9%):</span>
+                    <span className="font-mono font-semibold">
+                      ₹{totals.cgst.toLocaleString("en-IN")}
+                    </span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-500">SGST (9%):</span>
+                    <span className="font-mono font-semibold">
+                      ₹{totals.sgst.toLocaleString("en-IN")}
+                    </span>
+                  </div>
+                </>
+              )}
               <div className="flex justify-between pt-2 border-t border-gray-200">
                 <span className="font-bold text-[#93000b]">Total Including GST</span>
                 <span className="font-mono font-bold text-[#93000b] text-base">

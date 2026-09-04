@@ -111,6 +111,7 @@ export interface Customer {
   billingAddress: Address;
   shippingAddress: Address;
   sameAsBilling?: boolean;
+  stateCode?: string; // numeric GST state code derived from billingAddress.state
   creditLimit: number;
   paymentTerms: string;
   notes?: string;
@@ -619,6 +620,7 @@ export interface AppContextType {
   isNotificationOpen: boolean;
   setIsNotificationOpen: (open: boolean) => void;
   markAllNotificationsRead: () => void;
+  markNotificationRead: (id: string) => void;
   deleteConfirm: DeleteConfirmState | null;
   setDeleteConfirm: (state: DeleteConfirmState | null) => void;
   confirmDelete: (state: DeleteConfirmState) => void;
@@ -646,7 +648,6 @@ export interface AppContextType {
   setPendingPlan: (planId: SubscriptionPlanId | null, period?: 'month' | 'year') => void;
   completePayment: (outcome: PaymentOutcome, method: PaymentMethod) => void;
   requestRefund: (paymentId: string, reason: string) => boolean;
-  changePlan: (planId: SubscriptionPlan["id"]) => void;
   plans: SubscriptionPlan[];
   activePlan: SubscriptionPlan | null;
   currentUsage: {

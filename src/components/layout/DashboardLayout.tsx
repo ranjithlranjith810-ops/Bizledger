@@ -37,19 +37,31 @@ const QUICK_ACTIONS: QuickAction[] = [
 
 export const DashboardLayout: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
   const router = useRouter();
   const { setOpenModal, openModal } = useApp();
 
+  // Shared sidebar state: the same hamburger toggles desktop collapse on wide
+  // screens and the mobile drawer on narrow screens. There is ONE set of nav
+  // state so no page duplicates sidebar control.
+  const handleToggleSidebar = () => {
+    if (typeof window !== "undefined" && window.innerWidth < 1024) {
+      setMobileOpen((o) => !o);
+    } else {
+      setCollapsed((c) => !c);
+    }
+  };
+
   return (
     <div className="flex h-screen w-full bg-background text-on-surface overflow-hidden">
-      {/* Side Navigation Bar (desktop) */}
-      <SideNavBar collapsed={collapsed} />
+      {/* Side Navigation Bar (desktop) + Mobile Drawer (same shared component) */}
+      <SideNavBar collapsed={collapsed} mobileOpen={mobileOpen} onMobileClose={() => setMobileOpen(false)} />
 
       {/* Main Content Area */}
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
         <TopNavBar
-          onToggleSidebar={() => setCollapsed(!collapsed)}
+          onToggleSidebar={handleToggleSidebar}
           onQuickAction={() => setQuickOpen((o) => !o)}
         />
 

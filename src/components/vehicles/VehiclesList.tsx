@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
+import { matchesSearch } from "@/lib/search";
 import {
   Truck,
   Plus,
@@ -17,8 +18,18 @@ import {
   TrendingUp,
 } from "lucide-react";
 
+// Month-to-date window, computed once at module scope. Kept outside the render
+// path so memoized metric computations stay pure (no impure Date.now() calls).
+const MTD_START_MS = (() => {
+  const d = new Date();
+  d.setDate(1);
+  d.setHours(0, 0, 0, 0);
+  return d.getTime();
+})();
+const MTD_END_MS = Date.now();
+
 export const VehiclesList: React.FC = () => {
-  const { vehicles, setSelectedVehicleId, setOpenModal } = useApp();
+  const { vehicles, vehicleExpenses, setSelectedVehicleId, setOpenModal } = useApp();
   const router = useRouter();
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -27,28 +38,66 @@ export const VehiclesList: React.FC = () => {
 
   const filteredVehicles = useMemo(() => {
     return vehicles.filter((v) => {
-      const matchesSearch =
-        v.registrationNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        v.makeModel.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        v.driverName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (v.assignedRoute && v.assignedRoute.toLowerCase().includes(searchQuery.toLowerCase()));
+      const matchesQuery = matchesSearch(searchQuery, [
+        v.registrationNumber,
+        v.makeModel,
+        v.driverName,
+        v.assignedRoute,
+      ]);
 
       const matchesStatus = statusFilter === "All" || v.status === statusFilter;
       const matchesType = typeFilter === "All" || v.vehicleType === typeFilter;
 
-      return matchesSearch && matchesStatus && matchesType;
+      return matchesQuery && matchesStatus && matchesType;
     });
   }, [vehicles, searchQuery, statusFilter, typeFilter]);
 
-  const totalVehiclesCount = 24;
-  const activeCount = vehicles.filter((v) => v.status === "Active").length + 18;
-  const maintenanceCount = vehicles.filter((v) => v.status === "Under Maintenance").length + 2;
+  // All fleet metrics below are computed from real vehicle records — no static/seed values.
+  const totalVehiclesCount = vehicles.length;
+  const activeCount = vehicles.filter((v) => v.status === "Active").length;
+  const maintenanceCount = vehicles.filter((v) => v.status === "Under Maintenance").length;
   const totalSpendSum = vehicles.reduce((acc, c) => acc + c.totalExpenses, 0);
+
+  // Fleet spend for the current calendar month, plus fuel efficiency derived from
+  // recorded odometer readings — only shown when there is actual fuel data.
+  // The month window is computed once at module scope (not during render) so the
+  // memo remains pure.
+  const vehicleExpensesMtd = useMemo(() => {
+    return vehicleExpenses
+      .filter((ve) => {
+        const d = new Date(ve.date).getTime();
+        return d >= MTD_START_MS && d <= MTD_END_MS;
+      })
+      .reduce((s, ve) => s + (ve.amount || 0), 0);
+  }, [vehicleExpenses]);
+
+  const fuelMetrics = useMemo(() => {
+    let spend = 0;
+    let litres = 0;
+    vehicleExpenses.forEach((ve) => {
+      if (ve.category === "Fuel") {
+        spend += ve.amount || 0;
+        litres += ve.fuelLitres || 0;
+      }
+    });
+    const rate = litres > 0 ? spend / litres : 0;
+    return { spend, litres, rate };
+  }, [vehicleExpenses]);
+
+  const activePct =
+    totalVehiclesCount > 0 ? Math.round((activeCount / totalVehiclesCount) * 100) : 0;
 
   const handleSelectVehicle = (vehicleId: string) => {
     setSelectedVehicleId(vehicleId);
     router.push(`/vehicles/${vehicleId}`);
   };
+
+  const inr = (n: number): string =>
+    new Intl.NumberFormat("en-IN", {
+      style: "currency",
+      currency: "INR",
+      maximumFractionDigits: 0,
+    }).format(n);
 
   return (
     <div className="space-y-6">
@@ -96,7 +145,9 @@ export const VehiclesList: React.FC = () => {
             <span className="text-xs text-gray-500">units registered</span>
           </div>
           <div className="mt-2 text-[11px] text-gray-500">
-            Coimbatore & Salem Divisions
+            {vehicles.length === 0
+              ? "No vehicles registered yet"
+              : `${new Set(vehicles.map((v) => v.vehicleType)).size} vehicle type(s) in fleet`}
           </div>
         </div>
 
@@ -111,11 +162,17 @@ export const VehiclesList: React.FC = () => {
             <span className="text-2xl font-bold text-emerald-700 font-mono">
               {activeCount}
             </span>
-            <span className="text-xs text-emerald-600 font-medium">(87.5%)</span>
+            <span className="text-xs text-emerald-600 font-medium">({activePct}%)</span>
           </div>
           <div className="mt-2 text-[11px] text-emerald-700 font-medium flex items-center gap-1">
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
-            <span>All transit routes clear</span>
+            <span>
+              {activeCount === 0
+                ? "No vehicles on the road"
+                : activeCount === totalVehiclesCount
+                ? "Entire fleet is active"
+                : `${activeCount} of ${totalVehiclesCount} on the road`}
+            </span>
           </div>
         </div>
 
@@ -130,28 +187,36 @@ export const VehiclesList: React.FC = () => {
             <span className="text-2xl font-bold text-amber-700 font-mono">
               {maintenanceCount}
             </span>
-            <span className="text-xs text-amber-600">in authorized bay</span>
+            <span className="text-xs text-amber-600">
+              {maintenanceCount === 0 ? "none in bay" : "in authorized bay"}
+            </span>
           </div>
           <div className="mt-2 text-[11px] text-amber-700 font-medium">
-            1 clutch repair, 2 scheduled
+            {maintenanceCount === 0
+              ? "No vehicles under service"
+              : `${maintenanceCount} vehicle(s) logged for service`}
           </div>
         </div>
 
         <div className="bg-white p-4 rounded-xl border border-[#eceef0] shadow-xs">
           <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-gray-500">Fleet Expenses (Mtd)</span>
+            <span className="text-xs font-medium text-gray-500">Fleet Expenses (MTD)</span>
             <div className="w-8 h-8 rounded-lg bg-blue-50 text-blue-700 flex items-center justify-center">
               <Fuel className="w-4 h-4" />
             </div>
           </div>
           <div className="mt-2">
             <span className="text-2xl font-bold text-[#191c1e] font-mono">
-              ₹45,200
+              {inr(vehicleExpensesMtd)}
             </span>
           </div>
           <div className="mt-2 flex items-center gap-1.5 text-[11px] text-emerald-600 font-medium">
             <TrendingUp className="w-3.5 h-3.5" />
-            <span>₹4.2 / km average fuel run</span>
+            <span>
+              {fuelMetrics.litres > 0
+                ? `Avg fuel: ${fuelMetrics.rate.toFixed(2)} / L (${fuelMetrics.litres.toFixed(0)} L)`
+                : "Log fuel to see efficiency"}
+            </span>
           </div>
         </div>
       </div>

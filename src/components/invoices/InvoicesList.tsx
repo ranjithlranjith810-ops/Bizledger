@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { Invoice } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
+import { matchesSearch } from "@/lib/search";
 import {
   FileText,
   Plus,
@@ -19,7 +20,7 @@ import {
 import { AddInvoiceModal } from "@/components/invoices/AddInvoiceModal";
 
 export const InvoicesList: React.FC = () => {
-  const { invoices, setOpenModal, addNotification, getActiveFinancialYear } = useApp();
+  const { invoices, setOpenModal, getActiveFinancialYear } = useApp();
   const router = useRouter();
 
   const [searchQuery, setSearchQuery] = useState("");
@@ -48,14 +49,15 @@ export const InvoicesList: React.FC = () => {
   const filteredInvoices = invoices.filter((inv) => {
     const inThisFy = fyStart && fyEnd ? dateInRange(inv.date, fyStart, fyEnd) : true;
     if (!inThisFy) return false;
-    const matchesSearch =
-      inv.invoiceNumber.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      inv.customerName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (inv.customerGstin || "").toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesQuery = matchesSearch(searchQuery, [
+      inv.invoiceNumber,
+      inv.customerName,
+      inv.customerGstin,
+    ]);
 
     const matchesStatus = statusFilter === "All" || inv.status === statusFilter;
 
-    return matchesSearch && matchesStatus;
+    return matchesQuery && matchesStatus;
   });
 
   const openInvoice = (inv: Invoice) => {
@@ -63,11 +65,9 @@ export const InvoicesList: React.FC = () => {
   };
 
   const handleDownload = (inv: Invoice) => {
-    addNotification({
-      type: "success",
-      title: "PDF Downloaded",
-      message: `Invoice ${inv.invoiceNumber} saved to downloads.`,
-    });
+    // No PDF library is bundled. Opening the details view is the supported way
+    // to print / save-as-PDF a single invoice via the browser dialog.
+    router.push(`/invoices/${inv.id}`);
   };
 
   return (
@@ -225,7 +225,9 @@ export const InvoicesList: React.FC = () => {
                 <tr>
                   <td colSpan={9} className="py-8 text-center text-gray-400">
                     <FileText className="w-6 h-6 mx-auto mb-1.5 text-gray-300" />
-                    No invoices match your filter criteria.
+                    {invoices.length === 0
+                      ? "No invoices yet — create your first."
+                      : "No invoices match your filter criteria."}
                   </td>
                 </tr>
               ) : (
@@ -301,7 +303,7 @@ export const InvoicesList: React.FC = () => {
                         <button
                           onClick={() => handleDownload(inv)}
                           className="p-1.5 text-gray-500 hover:text-[#93000b] hover:bg-rose-50 rounded-lg transition-colors"
-                          title="Download PDF"
+                          title="Print / Save as PDF"
                         >
                           <Download className="w-4 h-4" />
                         </button>

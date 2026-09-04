@@ -2,6 +2,7 @@
 
 import React, { useState, useMemo } from "react";
 import { useApp } from "@/context/AppContext";
+import { matchesSearch } from "@/lib/search";
 import { TeamMember, TeamRole } from "@/types";
 import {
   Users,
@@ -22,14 +23,15 @@ export const TeamMembersList: React.FC = () => {
 
   const filteredMembers = useMemo(() => {
     return teamMembers.filter((m) => {
-      const matchesSearch =
-        m.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        m.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        m.designation.toLowerCase().includes(searchQuery.toLowerCase());
+      const matchesQuery = matchesSearch(searchQuery, [
+        m.name,
+        m.email,
+        m.designation,
+      ]);
 
       const matchesRole = roleFilter === "All" || m.role === roleFilter;
 
-      return matchesSearch && matchesRole;
+      return matchesQuery && matchesRole;
     });
   }, [teamMembers, searchQuery, roleFilter]);
 
@@ -176,21 +178,30 @@ export const TeamMembersList: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#eceef0]">
-              {filteredMembers.map((member) => (
-                <tr key={member.id} className="hover:bg-[#f7f9fb] transition-colors">
-                  <td className="py-3.5 px-4">
-                    <div className="flex items-center gap-3">
-                      {member.avatar ? (
-                        <img
-                          src={member.avatar}
-                          alt={member.name}
-                          className="w-9 h-9 rounded-full object-cover border border-gray-200"
-                        />
-                      ) : (
-                        <div className="w-9 h-9 rounded-full bg-rose-100 text-[#93000b] flex items-center justify-center font-bold text-xs">
-                          {member.name.split(" ").map((n) => n[0]).join("")}
-                        </div>
-                      )}
+              {filteredMembers.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="py-8 text-center text-gray-400">
+                    {teamMembers.length === 0
+                      ? "No team members yet — invite your first."
+                      : "No team members match your filter criteria."}
+                  </td>
+                </tr>
+              ) : (
+                filteredMembers.map((member) => (
+                  <tr key={member.id} className="hover:bg-[#f7f9fb] transition-colors">
+                    <td className="py-3.5 px-4">
+                      <div className="flex items-center gap-3">
+                        {member.avatar ? (
+                          <img
+                            src={member.avatar}
+                            alt={member.name}
+                            className="w-9 h-9 rounded-full object-cover border border-gray-200"
+                          />
+                        ) : (
+                          <div className="w-9 h-9 rounded-full bg-rose-100 text-[#93000b] flex items-center justify-center font-bold text-xs">
+                            {member.name.split(" ").map((n) => n[0]).join("")}
+                          </div>
+                        )}
                       <div>
                         <div className="font-bold text-gray-900 flex items-center gap-1.5">
                           <span>{member.name}</span>
@@ -293,7 +304,8 @@ export const TeamMembersList: React.FC = () => {
                     </div>
                   </td>
                 </tr>
-              ))}
+                ))
+              )}
             </tbody>
           </table>
         </div>

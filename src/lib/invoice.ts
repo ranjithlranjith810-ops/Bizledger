@@ -14,6 +14,14 @@ export function round2(value: number): number {
 }
 
 // ---------------------------------------------------------------------- GST
+// Tax treatment of a transaction is derived from the seller's state code vs the
+// place of supply state code:
+//   - intrastate (same state)  -> CGST + SGST, IGST = 0
+//   - interstate (different)   -> IGST, CGST = 0, SGST = 0
+// This is canonical GST behaviour. It must never be inferred from a customer's
+// display name — only the numeric state codes drive the decision.
+export type TaxType = "intrastate" | "interstate";
+
 export interface InvoiceLineInput {
   quantity: number;
   unitPrice: number; // per-unit price ENTERED by the user (see pricingMode)
@@ -24,10 +32,37 @@ export interface InvoiceLineInput {
 export interface InvoiceLineTotals {
   inclusive: number; // qty x unitPrice (the amount entered)
   taxable: number; // inclusive mode: inclusive / (1 + gst/100); exclusive: qty x rate
-  cgst: number; // taxable x gst/200
-  sgst: number; // taxAmount - cgst (absorbs the rounding remainder)
-  taxAmount: number; // cgst + sgst
+  cgst: number; // taxable x gst/200 (intrastate split)
+  sgst: number; // taxAmount - cgst (absorbs the rounding remainder; intrastate)
+  igst: number; // full taxAmount (interstate)
+  taxAmount: number; // cgst + sgst + igst
   totalAmount: number; // taxable + taxAmount (inclusive mode: reconciles to inclusive)
+}
+
+// Compare canonical seller + place-of-supply state codes to determine GST type.
+// When either code is missing the transaction cannot be proven interstate, so it
+// falls back to intrastate (CGST+SGST). Only numeric canonical codes are used —
+// never display names.
+export function resolveTaxType(
+  sellerStateCode: string,
+  placeOfSupplyCode: string
+): TaxType {
+  const a = (sellerStateCode || "").trim();
+  const b = (placeOfSupplyCode || "").trim();
+  return a && b && a !== b ? "interstate" : "intrastate";
+}
+
+// Re-derive a CGST/SGST/IGST split from an already-computed total tax figure
+// (used to reclassify a converted document without disturbing its grand total).
+export function splitTaxType(
+  totalTax: number,
+  taxType: TaxType
+): { cgst: number; sgst: number; igst: number } {
+  if (taxType === "interstate") {
+    return { cgst: 0, sgst: 0, igst: round2(totalTax) };
+  }
+  const cgst = round2(totalTax / 2);
+  return { cgst, sgst: round2(totalTax - cgst), igst: 0 };
 }
 
 // Compute per-line totals in the requested pricing mode. In "inclusive" mode
@@ -43,9 +78,12 @@ export interface InvoiceLineTotals {
 // In "exclusive" mode the rate is the taxable base so GST is layered on top:
 //   taxAmount = round2(taxable * gst / 100)   (e.g. ₹5,000 @ 18% -> +₹900)
 // The same SGST remainder policy keeps taxable + cgst + sgst == totalAmount.
+// If `taxType` is "interstate", the whole line tax is IGST (cgst = sgst = 0).
+// Defaults to "intrastate" so existing intrastate documents remain unchanged.
 export function calculateLineTotals(
   line: InvoiceLineInput,
-  pricingMode?: PricingMode
+  pricingMode?: PricingMode,
+  taxType: TaxType = "intrastate"
 ): InvoiceLineTotals {
   const qty = Number(line.quantity) || 0;
   const rate = Number(line.unitPrice) || 0;
@@ -59,11 +97,16 @@ export function calculateLineTotals(
     mode === "exclusive"
       ? round2(taxable * (gst / 100))
       : round2(gross - taxable);
+
+  if (taxType === "interstate") {
+    return { inclusive: gross, taxable, cgst: 0, sgst: 0, igst: taxAmount, taxAmount, totalAmount: round2(taxable + taxAmount) };
+  }
+
   const cgst = round2(taxable * (gst / 200));
   const sgst = round2(taxAmount - cgst);
   const totalAmount = round2(taxable + taxAmount);
 
-  return { inclusive: gross, taxable, cgst, sgst, taxAmount, totalAmount };
+  return { inclusive: gross, taxable, cgst, sgst, igst: 0, taxAmount, totalAmount };
 }
 
 export interface InvoiceTotals {
@@ -76,16 +119,19 @@ export interface InvoiceTotals {
   grandTotal: number;
 }
 
-// Summarise line inputs into store-ready document figures.
+// Summarise line inputs into store-ready document figures. The tax split
+// respects `taxType` (intrastate -> CGST+SGST; interstate -> IGST). The shared
+// per-line engine is the ONLY source of GST arithmetic.
 export function calculateInvoiceTotals(
   lines: InvoiceLineInput[],
-  pricingMode?: PricingMode
+  pricingMode?: PricingMode,
+  taxType: TaxType = "intrastate"
 ): InvoiceTotals {
-  const lineTotals = lines.map((l) => calculateLineTotals(l, pricingMode));
+  const lineTotals = lines.map((l) => calculateLineTotals(l, pricingMode, taxType));
   const subtotal = round2(lineTotals.reduce((acc, l) => acc + l.taxable, 0));
   const cgst = round2(lineTotals.reduce((acc, l) => acc + l.cgst, 0));
   const sgst = round2(lineTotals.reduce((acc, l) => acc + l.sgst, 0));
-  const igst = 0;
+  const igst = round2(lineTotals.reduce((acc, l) => acc + l.igst, 0));
   const totalTax = round2(cgst + sgst + igst);
   const grandTotal = round2(subtotal + totalTax);
 
