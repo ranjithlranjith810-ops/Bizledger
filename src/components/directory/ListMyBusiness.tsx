@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   BadgeCheck,
@@ -11,19 +11,15 @@ import {
   ChevronLeft,
   ShieldAlert,
 } from "lucide-react";
-import { useAuth } from "@/context/AuthContext";
 import { useApp } from "@/context/AppContext";
 import {
   DIRECTORY_BUSINESS_TYPES,
   DIRECTORY_CATEGORIES,
-  getMyDirectoryListing,
-  submitDirectoryListing,
-  unlistMyBusiness,
-  saveDirectoryListing,
   directoryEntitlement,
   gstStatusFromGstin,
 } from "@/lib/directory";
 import type { DirectoryDraft } from "@/lib/directory";
+import { directoryApi, fromMineJson } from "@/lib/api/directory";
 import type { DirectoryBusiness } from "@/types";
 import { INDIAN_STATES } from "@/lib/india";
 import { Input } from "@/components/ui/Input";
@@ -58,42 +54,61 @@ const emptyDraft: DirectoryDraft = {
   gstin: "",
 };
 
+const draftFromListing = (e: DirectoryBusiness): DirectoryDraft => ({
+  companyName: e.companyName,
+  businessType: e.businessType,
+  categories: e.categories,
+  description: e.description,
+  streetAddress: e.streetAddress,
+  city: e.city,
+  state: e.state,
+  pincode: e.pincode,
+  landmark: e.landmark ?? "",
+  ownerName: e.ownerName,
+  primaryPhone: e.primaryPhone,
+  alternatePhone: e.alternatePhone ?? "",
+  email: e.email ?? "",
+  website: e.website ?? "",
+  gstin: e.gstin ?? "",
+});
+
 const categoryToggled = (categories: string[], c: string) =>
   categories.includes(c) ? categories.filter((x) => x !== c) : [...categories, c];
 
 export const ListMyBusiness: React.FC = () => {
-  const { account } = useAuth();
-  const { activePlan } = useApp();
+  const { activePlan, activeBusinessId } = useApp();
   const router = useRouter();
 
-  const accountId = account?.id ?? "";
-  const [existing, setExisting] = useState<DirectoryBusiness | null>(() =>
-    getMyDirectoryListing(accountId)
-  );
-  const [draft, setDraft] = useState<DirectoryDraft>(() => {
-    const e = getMyDirectoryListing(accountId);
-    return e
-      ? {
-          companyName: e.companyName,
-          businessType: e.businessType,
-          categories: e.categories,
-          description: e.description,
-          streetAddress: e.streetAddress,
-          city: e.city,
-          state: e.state,
-          pincode: e.pincode,
-          landmark: e.landmark ?? "",
-          ownerName: e.ownerName,
-          primaryPhone: e.primaryPhone,
-          alternatePhone: e.alternatePhone ?? "",
-          email: e.email ?? "",
-          website: e.website ?? "",
-          gstin: e.gstin ?? "",
-        }
-      : emptyDraft;
-  });
+  const [existing, setExisting] = useState<DirectoryBusiness | null>(null);
+  const [draft, setDraft] = useState<DirectoryDraft>(emptyDraft);
   const [error, setError] = useState<string | null>(null);
   const [confirmUnlist, setConfirmUnlist] = useState(false);
+  const [loadingListing, setLoadingListing] = useState(true);
+  const [busy, setBusy] = useState<"save" | "submit" | "unlist" | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      if (!activeBusinessId) {
+        if (!cancelled) setLoadingListing(false);
+        return;
+      }
+      try {
+        const res = await directoryApi.getMine(activeBusinessId);
+        if (cancelled) return;
+        const listing = res.business ? fromMineJson(res.business) : null;
+        setExisting(listing);
+        setDraft(listing ? draftFromListing(listing) : emptyDraft);
+      } catch {
+        if (!cancelled) setExisting(null);
+      } finally {
+        if (!cancelled) setLoadingListing(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeBusinessId]);
 
   const entitlement = useMemo(() => directoryEntitlement(activePlan), [activePlan]);
   const status = existing?.status ?? "Not Listed";
@@ -102,7 +117,7 @@ export const ListMyBusiness: React.FC = () => {
   const set = <K extends keyof DirectoryDraft>(k: K, v: DirectoryDraft[K]) =>
     setDraft((d) => ({ ...d, [k]: v }));
 
-  const validate = (): string | null => {
+  const validate = useCallback((): string | null => {
     if (draft.categories.length === 0) return "Select at least one category.";
     const fieldErrs = validateBusinessListingForm({
       companyName: draft.companyName,
@@ -119,44 +134,73 @@ export const ListMyBusiness: React.FC = () => {
     if (draft.website && !/^https?:\/\//.test(draft.website.trim()) && !draft.website.includes("."))
       return "Enter a valid website URL.";
     return null;
+  }, [draft]);
+
+  const applyResult = (listing: DirectoryBusiness) => {
+    setExisting(listing);
+    setDraft(draftFromListing(listing));
   };
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!entitlement.allowed) {
       setError("You need an active paid plan (Business or Enterprise) to list your business.");
       return;
     }
-    const v = validate();
-    if (v) return setError(v);
-    setError(null);
-    try {
-      saveDirectoryListing(accountId, draft, existing, entitlement);
-      setExisting(getMyDirectoryListing(accountId));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to save your listing.");
-    }
-  };
-
-  const handleSubmit = () => {
-    if (!entitlement.allowed) {
-      setError("You need an active paid plan (Business or Enterprise) to publish a listing.");
+    if (!activeBusinessId) {
+      setError("No active business selected. Create a business first.");
       return;
     }
     const v = validate();
     if (v) return setError(v);
     setError(null);
+    setBusy("save");
     try {
-      submitDirectoryListing(accountId, draft, entitlement);
-      setExisting(getMyDirectoryListing(accountId));
+      const res = await directoryApi.saveMine(activeBusinessId, draft);
+      applyResult(fromMineJson(res.business));
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Unable to submit your listing.");
+      setError(err instanceof Error ? err.message : "Unable to save your listing.");
+    } finally {
+      setBusy(null);
     }
   };
 
-  const handleUnlist = () => {
-    unlistMyBusiness(accountId);
-    setExisting(getMyDirectoryListing(accountId));
-    setConfirmUnlist(false);
+  const handleSubmit = async () => {
+    if (!entitlement.allowed) {
+      setError("You need an active paid plan (Business or Enterprise) to publish a listing.");
+      return;
+    }
+    if (!activeBusinessId) {
+      setError("No active business selected. Create a business first.");
+      return;
+    }
+    const v = validate();
+    if (v) return setError(v);
+    setError(null);
+    setBusy("submit");
+    try {
+      // The backend submit endpoint transitions the SAVED draft, so save first.
+      await directoryApi.saveMine(activeBusinessId, draft);
+      const res = await directoryApi.submitMine(activeBusinessId);
+      applyResult(fromMineJson(res.business));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to submit your listing.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleUnlist = async () => {
+    if (!activeBusinessId) return;
+    setBusy("unlist");
+    try {
+      const res = await directoryApi.unlistMine(activeBusinessId);
+      applyResult(fromMineJson(res.business));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Unable to unlist your business.");
+    } finally {
+      setBusy(null);
+      setConfirmUnlist(false);
+    }
   };
 
   return (
@@ -182,7 +226,7 @@ export const ListMyBusiness: React.FC = () => {
           className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-semibold border ${statusMeta.cls}`}
         >
           {statusMeta.icon}
-          {statusMeta.label}
+          {loadingListing ? "Loading" : statusMeta.label}
         </span>
       </div>
 
@@ -387,11 +431,23 @@ export const ListMyBusiness: React.FC = () => {
         </p>
 
         <div className="flex flex-wrap items-center gap-2.5 pt-2 border-t border-[#eceef0]">
-          <Button variant="primary" icon="save" onClick={handleSave} disabled={!entitlement.allowed}>
-            Save Draft
+          <Button
+            variant="primary"
+            icon="save"
+            onClick={() => void handleSave()}
+            disabled={!entitlement.allowed || busy !== null}
+          >
+            {busy === "save" ? "Saving…" : "Save Draft"}
           </Button>
-          <Button variant="secondary" icon="send" onClick={handleSubmit} disabled={!entitlement.allowed}>
-            {existing && (status === "Published" || status === "Pending Review")
+          <Button
+            variant="secondary"
+            icon="send"
+            onClick={() => void handleSubmit()}
+            disabled={!entitlement.allowed || busy !== null}
+          >
+            {busy === "submit"
+              ? "Submitting…"
+              : existing && (status === "Published" || status === "Pending Review")
               ? "Resubmit for Review"
               : "Submit for Review"}
           </Button>
@@ -432,8 +488,8 @@ export const ListMyBusiness: React.FC = () => {
               <Button variant="ghost" onClick={() => setConfirmUnlist(false)}>
                 Cancel
               </Button>
-              <Button variant="danger" onClick={handleUnlist}>
-                Yes, unlist
+              <Button variant="danger" onClick={() => void handleUnlist()} disabled={busy === "unlist"}>
+                {busy === "unlist" ? "Unlisting…" : "Yes, unlist"}
               </Button>
             </div>
           </div>

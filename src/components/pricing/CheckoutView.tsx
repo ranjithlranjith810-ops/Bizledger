@@ -1,20 +1,57 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { Check, ArrowLeft, ShieldCheck, Lock, Calendar } from "lucide-react";
-import { computeTotals, formatINR, planLabel, GST_RATE } from "@/lib/billing";
+import { computeTotals, formatINR, formatINRString, planLabel, GST_RATE } from "@/lib/billing";
+import { billingApi } from "@/lib/api/billing";
+import { serverOrderAmounts } from "@/lib/razorpay-checkout";
 import Link from "next/link";
 
 export const CheckoutView: React.FC = () => {
-  const { plans, pendingPlanId, pendingPeriod, setPendingPlan } = useApp();
+  const { plans, pendingPlanId, pendingPeriod, setPendingPlan, activeBusinessId } = useApp();
   const router = useRouter();
   const [accepted, setAccepted] = useState(false);
   const [consentError, setConsentError] = useState(false);
+  const [serverTotals, setServerTotals] = useState<{
+    base: string;
+    gst: string;
+    total: string;
+  } | null>(null);
+  const [serverFor, setServerFor] = useState<{
+    planId: string;
+    period: "month" | "year";
+  } | null>(null);
+  const [amountsError, setAmountsError] = useState(false);
 
   const plan = plans.find((p) => p.id === pendingPlanId);
   const period = pendingPeriod ?? "month";
+
+  // The displayed amounts come from the server's Phase 4D checkout response
+  // where possible — never independently recomputed against a possibly stale
+  // local plan copy (§26). Loaded asynchronously so the review page and the
+  // payment page agree with the exact order/amount the backend created. All
+  // state writes happen only in the async path (react-hooks/set-state-in-effect).
+  useEffect(() => {
+    let active = true;
+    if (!plan || plan.id === "base" || !activeBusinessId) return;
+    billingApi
+      .createCheckout(activeBusinessId, plan.id, period)
+      .then((res) => {
+        if (!active) return;
+        const amounts = serverOrderAmounts(res.checkout);
+        setServerTotals(amounts);
+        setServerFor({ planId: plan.id, period });
+        setAmountsError(false);
+      })
+      .catch(() => {
+        if (active) setAmountsError(true);
+      });
+    return () => {
+      active = false;
+    };
+  }, [plan, period, activeBusinessId]);
 
   if (!plan) {
     return (
@@ -37,6 +74,23 @@ export const CheckoutView: React.FC = () => {
 
   const totals = computeTotals(plan, period);
   const periodLabel = period === "month" ? "1 Month" : "1 Year (2 months free)";
+  const currentServerTotals =
+    serverTotals && serverFor?.planId === plan.id && serverFor?.period === period
+      ? serverTotals
+      : null;
+  const disp = currentServerTotals
+    ? {
+        base: formatINRString(currentServerTotals.base),
+        gst: formatINRString(currentServerTotals.gst),
+        total: formatINRString(currentServerTotals.total),
+      }
+    : amountsError
+    ? { base: "—", gst: "—", total: "—" }
+    : {
+        base: formatINR(totals.base),
+        gst: formatINR(totals.gstAmount),
+        total: formatINR(totals.total),
+      };
 
   const changePeriod = (p: "month" | "year") => setPendingPlan(plan.id, p);
 
@@ -134,11 +188,11 @@ export const CheckoutView: React.FC = () => {
             <div className="space-y-2.5 text-sm">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-500">{planLabel(plan.name)} subscription ({periodLabel})</span>
-                <span className="text-xs font-mono font-bold text-gray-900">{formatINR(totals.base)}</span>
+                <span className="text-xs font-mono font-bold text-gray-900">{disp.base}</span>
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-500">GST @ {GST_RATE}%</span>
-                <span className="text-xs font-mono font-bold text-gray-900">{formatINR(totals.gstAmount)}</span>
+                <span className="text-xs font-mono font-bold text-gray-900">{disp.gst}</span>
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-500">Billing</span>
@@ -146,8 +200,13 @@ export const CheckoutView: React.FC = () => {
               </div>
               <div className="pt-3 border-t border-[#eceef0] flex items-center justify-between">
                 <span className="text-xs font-bold text-gray-900">Total to pay</span>
-                <span className="text-lg font-bold font-mono text-[#93000b]">{formatINR(totals.total)}</span>
+                <span className="text-lg font-bold font-mono text-[#93000b]">{disp.total}</span>
               </div>
+              {amountsError && (
+                <p className="text-[11px] font-medium text-amber-600">
+                  Could not fetch confirmed amounts — payment will re-confirm them securely.
+                </p>
+              )}
               <p className="text-[11px] text-gray-500 flex items-center gap-1">
                 <Calendar className="w-3.5 h-3.5" />
                 {period === "month" ? "Renews monthly" : "Renews yearly"} · inclusive of 18% GST

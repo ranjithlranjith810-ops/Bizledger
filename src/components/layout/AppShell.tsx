@@ -52,11 +52,12 @@ export { isValidAppRoute };
 export function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
-  const { isAuthenticated, setLastRoute } = useAuth();
+  const { isAuthenticated, authPending, setLastRoute } = useAuth();
   const { onboarding } = useApp();
 
   useEffect(() => {
     if (isPublicPath(pathname)) return;
+    if (authPending) return;
     if (!isAuthenticated) {
       router.replace("/");
       return;
@@ -85,13 +86,13 @@ export function AppShell({ children }: { children: React.ReactNode }) {
     if (isValidAppRoute(pathname)) {
       setLastRoute(pathname);
     }
-  }, [pathname, router, setLastRoute, isAuthenticated, onboarding.completed, onboarding.currentStep]);
+  }, [pathname, router, setLastRoute, isAuthenticated, authPending, onboarding.completed, onboarding.currentStep]);
 
   if (isPublicPath(pathname)) {
     return <>{children}</>;
   }
 
-  if (!isAuthenticated) {
+  if (authPending || !isAuthenticated) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background text-on-surface">
         <span className="material-symbols-outlined animate-spin">

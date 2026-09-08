@@ -21,6 +21,14 @@ export const computeTotals = (
 export const formatINR = (n: number) =>
   `₹${n.toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 
+// Formats a server-returned monetary string (e.g. "1178.82") for display without
+// ever recomputing the amount — the backend response is authoritative.
+export const formatINRString = (value: string) =>
+  `₹${Number(value).toLocaleString("en-IN", {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })}`;
+
 export const PAYMENT_METHODS: {
   id: PaymentMethod;
   label: string;

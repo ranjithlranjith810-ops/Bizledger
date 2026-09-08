@@ -4,8 +4,9 @@ import React from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { useApp } from "@/context/AppContext";
-import { Download, ArrowRight, AlertTriangle, Zap } from "lucide-react";
+import { ArrowRight, AlertTriangle, Zap, RotateCw } from "lucide-react";
 import { formatINR } from "@/lib/billing";
+import { useBillingHistory } from "@/lib/api/billing";
 import { SubscriptionPlan } from "@/types";
 
 const fmtDate = (iso: string) =>
@@ -15,24 +16,131 @@ const fmtDate = (iso: string) =>
     year: "numeric",
   });
 
+/* -------------------------------------------------------------------------- */
+/*  Skeleton — rendered while the backend subscription is being fetched.      */
+/*  Never shows "Free" or any plan-specific content.                          */
+/* -------------------------------------------------------------------------- */
+const SubscriptionSkeleton: React.FC = () => (
+  <div className="space-y-6 animate-pulse">
+    {/* Header */}
+    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      <div className="space-y-2">
+        <div className="h-5 w-64 bg-gray-200 rounded-lg" />
+        <div className="h-3 w-80 bg-gray-100 rounded" />
+      </div>
+      <div className="h-10 w-32 bg-gray-200 rounded-xl" />
+    </div>
+
+    {/* Active plan card */}
+    <div className="bg-white p-6 rounded-2xl border border-[#eceef0] shadow-xs space-y-6">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-[#eceef0]">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 rounded-2xl bg-gray-100" />
+          <div className="space-y-2">
+            <div className="flex items-center gap-2.5">
+              <div className="h-5 w-28 bg-gray-200 rounded" />
+              <div className="h-5 w-16 bg-gray-100 rounded-full" />
+            </div>
+            <div className="h-3 w-60 bg-gray-100 rounded" />
+          </div>
+        </div>
+      </div>
+
+      {/* Usage gauges */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-5">
+        {[1, 2, 3, 4].map((i) => (
+          <div key={i} className="space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="h-3 w-24 bg-gray-200 rounded" />
+              <div className="h-3 w-12 bg-gray-100 rounded" />
+            </div>
+            <div className="w-full bg-[#f2f4f6] h-2 rounded-full overflow-hidden">
+              <div className="bg-gray-200 h-full rounded-full w-0" />
+            </div>
+            <div className="h-2.5 w-20 bg-gray-100 rounded" />
+          </div>
+        ))}
+      </div>
+
+      {/* Network row */}
+      <div className="pt-4 border-t border-[#eceef0]">
+        <div className="flex items-center justify-between">
+          <div className="space-y-1">
+            <div className="h-3 w-48 bg-gray-200 rounded" />
+            <div className="h-2.5 w-36 bg-gray-100 rounded" />
+          </div>
+          <div className="h-3 w-28 bg-gray-100 rounded" />
+        </div>
+      </div>
+    </div>
+  </div>
+);
+
+/* -------------------------------------------------------------------------- */
+/*  Error panel — shown when the backend subscription request fails.          */
+/*  Never falls back to "Free".                                               */
+/* -------------------------------------------------------------------------- */
+const SubscriptionError: React.FC<{ onRetry: () => void }> = ({ onRetry }) => (
+  <div className="space-y-6">
+    <div>
+      <h2 className="text-xl font-bold text-[#191c1e] tracking-tight">
+        Subscription &amp; Billing Management
+      </h2>
+      <p className="text-xs text-gray-500 mt-0.5">
+        Monitor plan limits, manage the billing cycle, download GST tax receipts, or upgrade your capacity.
+      </p>
+    </div>
+
+    <div className="bg-white p-8 rounded-2xl border border-[#eceef0] shadow-xs text-center space-y-4">
+      <div className="w-12 h-12 rounded-2xl bg-rose-50 text-[#93000b] flex items-center justify-center mx-auto">
+        <AlertTriangle className="w-6 h-6" />
+      </div>
+      <div>
+        <p className="text-sm font-semibold text-gray-800">
+          Unable to load subscription
+        </p>
+        <p className="text-xs text-gray-500 mt-1">
+          We could not reach the server. Please try again — your plan may still be active.
+        </p>
+      </div>
+      <button
+        onClick={onRetry}
+        className="inline-flex items-center gap-2 bg-[#f2f4f6] hover:bg-gray-200 text-gray-800 px-5 py-2.5 rounded-xl text-xs font-bold shadow-xs transition-colors"
+      >
+        <RotateCw className="w-3.5 h-3.5" />
+        Retry
+      </button>
+    </div>
+  </div>
+);
+
 export const SubscriptionBillingView: React.FC = () => {
   const router = useRouter();
   const {
     currentPlanId,
     plans,
     setPendingPlan,
-    paymentHistory,
     subscription,
     customers,
     products,
     currentUsage,
     activePlan,
-    addNotification,
+    subscriptionStatus,
+    retrySubscription,
+    activeBusinessId,
   } = useApp();
 
-  // The EFFECTIVE plan governs entitlements and the usage gauges. This is the
-  // Free plan when no paid plan is active, so gauges always reflect real limits
-  // instead of fake fallbacks (previously 150/10/500).
+  const billingHistory = useBillingHistory(activeBusinessId);
+
+  /* ---- Loading / Error gates — never render Free during these states ---- */
+  if (subscriptionStatus === "loading") {
+    return <SubscriptionSkeleton />;
+  }
+  if (subscriptionStatus === "error") {
+    return <SubscriptionError onRetry={retrySubscription} />;
+  }
+
+  /* ---- Ready: render the real server-resolved subscription ---- */
   const currentPlan = activePlan ?? plans.find((p) => p.id === currentPlanId);
   const planDisplayName = currentPlan?.name.replace(/ Plan$/, "") ?? "No Active Plan";
 
@@ -48,8 +156,6 @@ export const SubscriptionBillingView: React.FC = () => {
   const dirLimit = currentPlan?.limits.directoryListings ?? 0;
   const networkIncluded = !!currentPlan?.businessNetworkIncluded;
 
-  // `used` ceilings are the denominator for the gauge bars; decomposed below so
-  // the displayed quota always matches what the entitlement engine enforces.
   const usage = {
     customersUsed: customers.length,
     customersLimit,
@@ -61,9 +167,6 @@ export const SubscriptionBillingView: React.FC = () => {
     invoicesLimit,
   };
 
-  // The EFFECTIVE (Free-by-default) plan always governs entitlements, so the
-  // plan is "active" in the sense that its limits apply. `isPaidPlan` tracks
-  // whether that plan is a paid/active subscription (drives the upgrade CTA).
   const isActive = !!currentPlan;
   const isPaidPlan = subscription?.status === "active";
 
@@ -73,7 +176,7 @@ export const SubscriptionBillingView: React.FC = () => {
     router.push("/pricing/checkout");
   };
 
-  const historyRows = paymentHistory.slice(0, 4);
+  const historyRows = billingHistory.payments.slice(0, 4);
 
   return (
     <div className="space-y-6">
@@ -351,7 +454,27 @@ export const SubscriptionBillingView: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-[#eceef0]">
-              {historyRows.length === 0 ? (
+              {billingHistory.status === "loading" || billingHistory.status === "idle" ? (
+                <tr>
+                  <td colSpan={6} className="py-6 px-4 text-center text-gray-400">
+                    Loading billing history…
+                  </td>
+                </tr>
+              ) : billingHistory.status === "error" ? (
+                <tr>
+                  <td colSpan={6} className="py-6 px-4 text-center text-gray-500">
+                    <span className="flex items-center justify-center gap-2">
+                      Unable to load billing history
+                      <button
+                        onClick={billingHistory.reload}
+                        className="text-[#93000b] hover:underline font-semibold"
+                      >
+                        Retry
+                      </button>
+                    </span>
+                  </td>
+                </tr>
+              ) : historyRows.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="py-6 px-4 text-center text-gray-400">
                     No billing history yet. Complete a checkout to record your first payment.
@@ -359,13 +482,17 @@ export const SubscriptionBillingView: React.FC = () => {
                 </tr>
               ) : (
                 historyRows.map((inv) => {
-                  const paid = inv.status === "success";
+                  const paid = inv.status === "VERIFIED";
                   return (
                     <tr key={inv.id} className="hover:bg-[#f7f9fb] transition-colors">
-                      <td className="py-3 px-4 font-mono font-bold text-gray-900">{inv.id}</td>
+                      <td className="py-3 px-4 font-mono font-bold text-gray-900">
+                        {inv.invoice?.invoiceNumber ?? "—"}
+                      </td>
                       <td className="py-3 px-4 text-gray-700">{fmtDate(inv.date)}</td>
-                      <td className="py-3 px-4 text-gray-800 font-medium">{inv.description}</td>
-                      <td className="py-3 px-4 font-mono font-bold text-gray-900">{formatINR(inv.totalAmount)}</td>
+                      <td className="py-3 px-4 text-gray-800 font-medium">
+                        {inv.planName} • {inv.billingPeriod === "year" ? "Yearly" : "Monthly"}
+                      </td>
+                      <td className="py-3 px-4 font-mono font-bold text-gray-900">{formatINR(Number(inv.totalAmount))}</td>
                       <td className="py-3 px-4">
                         {paid ? (
                           <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
@@ -374,7 +501,7 @@ export const SubscriptionBillingView: React.FC = () => {
                         ) : (
                           <span className="inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-semibold bg-rose-50 text-[#93000b] border border-rose-200">
                             <AlertTriangle className="w-3 h-3 mr-1" />
-                            Declined
+                            {inv.status === "FAILED" ? "Declined" : inv.status}
                           </span>
                         )}
                       </td>
@@ -382,16 +509,12 @@ export const SubscriptionBillingView: React.FC = () => {
                         {paid ? (
                           <button
                             onClick={() =>
-                              addNotification({
-                                type: "success",
-                                title: "GST Tax Invoice Downloaded",
-                                message: `Tax Invoice ${inv.id} saved as PDF.`,
-                              })
+                              router.push(`/settings/billing/invoice?paymentId=${encodeURIComponent(inv.id)}`)
                             }
                             className="text-[#93000b] hover:underline font-semibold flex items-center gap-1 ml-auto"
                           >
-                            <Download className="w-3.5 h-3.5" />
-                            <span>PDF</span>
+                            <ArrowRight className="w-3 h-3" />
+                            <span>View Receipt</span>
                           </button>
                         ) : (
                           <button

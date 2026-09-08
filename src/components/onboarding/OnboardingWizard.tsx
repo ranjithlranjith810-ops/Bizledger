@@ -28,6 +28,7 @@ function formatInvoiceNumber(prefix: string, startingNumber: number): string {
 
 export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
   const router = useRouter();
+  const [finishing, setFinishing] = useState(false);
   const {
     companyProfile,
     updateCompanyProfile,
@@ -544,14 +545,17 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
               </button>
             ) : (
               <button
-                onClick={() => {
-                  completeOnboarding();
+                onClick={async () => {
+                  if (finishing) return;
+                  setFinishing(true);
+                  await completeOnboarding();
                   router.replace("/dashboard");
                 }}
-                className="inline-flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-6 py-2.5 rounded-lg text-xs font-bold shadow-sm transition-colors"
+                disabled={finishing}
+                className="inline-flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-6 py-2.5 rounded-lg text-xs font-bold shadow-sm transition-colors disabled:opacity-40"
               >
                 <span className="material-symbols-outlined text-[16px]">check</span>
-                Finish &amp; Open Dashboard
+                {finishing ? "Creating business…" : "Finish &amp; Open Dashboard"}
               </button>
             )}
           </div>

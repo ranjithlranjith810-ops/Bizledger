@@ -606,6 +606,7 @@ export interface DeleteConfirmState {
 }
 
 export interface AppContextType {
+  activeBusinessId: string | null;
   activeRoute: string;
   setActiveRoute: (route: string) => void;
   openModal: string | null;
@@ -640,7 +641,7 @@ export interface AppContextType {
   mintDocumentNumber: (prefix: string, kind: SequenceKind) => string;
   onboarding: OnboardingState;
   setOnboardingStep: (step: number) => void;
-  completeOnboarding: () => void;
+  completeOnboarding: () => Promise<void>;
   currentPlanId: SubscriptionPlanId | null;
   subscription: SubscriptionState;
   pendingPlanId: SubscriptionPlanId | null;
@@ -650,6 +651,8 @@ export interface AppContextType {
   requestRefund: (paymentId: string, reason: string) => boolean;
   plans: SubscriptionPlan[];
   activePlan: SubscriptionPlan | null;
+  subscriptionStatus: "loading" | "ready" | "error";
+  retrySubscription: () => void;
   currentUsage: {
     invoices: number;
     customers: number;
@@ -727,12 +730,22 @@ export interface LocalAccount {
   createdAt: string;
 }
 
+export type AuthResult =
+  | { ok: true }
+  | { ok: false; error: string };
+
 export interface AuthContextType {
   account: LocalAccount | null;
   isAuthenticated: boolean;
+  authPending: boolean;
   lastRoute: string | null;
-  createAccount: (input: { name: string; email: string; businessName?: string }) => LocalAccount;
-  login: (email: string) => boolean;
-  logout: () => void;
+  createAccount: (input: {
+    name: string;
+    email: string;
+    password: string;
+    businessName?: string;
+  }) => Promise<AuthResult>;
+  login: (input: { email: string; password: string }) => Promise<AuthResult>;
+  logout: () => Promise<void>;
   setLastRoute: (route: string) => void;
 }

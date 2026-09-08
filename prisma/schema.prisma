@@ -12,6 +12,60 @@ datasource db {
   provider = "postgresql"
 }
 
+enum BusinessStatus {
+  ACTIVE
+  SUSPENDED
+}
+
+enum BusinessMemberRole {
+  OWNER
+  ADMIN
+  MANAGER
+  STAFF
+}
+
+enum BusinessMemberStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+}
+
+// Directory listing lifecycle for a BusinessDirectoryProfile. Mirrors the
+// frontend `DirectoryListingStatus` labels exactly:
+//   NOT_LISTED     -> "Not Listed"      (no listing; default OFF)
+//   PENDING_REVIEW -> "Pending Review"  (owner submitted, awaiting moderator)
+//   PUBLISHED      -> "Published"       (the ONLY publicly visible state)
+//   SUSPENDED      -> "Suspended"       (moderator action; needs resubmit)
+//   REJECTED       -> "Rejected"        (moderator action; needs resubmit)
+// Values are stored WITHOUT spaces (Prisma enums cannot contain them); the
+// service layer maps to/from the frontend labels.
+enum DirectoryStatus {
+  NOT_LISTED
+  PENDING_REVIEW
+  PUBLISHED
+  SUSPENDED
+  REJECTED
+}
+
+enum CustomerType {
+  business
+  individual
+}
+
+enum CustomerGstStatus {
+  registered
+  composite
+  unregistered
+  consumer
+}
+
+enum CustomerStatus {
+  Active
+  Pending
+  Overdue
+  Inactive
+}
+
 model User {
   id            String    @id
   name          String
@@ -22,9 +76,36 @@ model User {
   updatedAt     DateTime  @updatedAt
   sessions      Session[]
   accounts      Account[]
+  memberships   BusinessMember[]
+  notifications Notification[]
+  platformAdmin PlatformAdmin?
 
   @@unique([email])
   @@map("user")
+}
+
+// ---------------------------------------------------------------------------
+// PLATFORM ADMIN — a platform-level moderator identity for the Business
+// Directory moderation API (Phase 3H).
+//
+// Deliberately a SEPARATE table from the Better Auth `User`: we do NOT pollute
+// the auth model with a `role` column. The presence of a row here (userId)
+// grants directory-moderation powers; absence means the user has no admin
+// rights even if they are a member of many businesses. Real server-side
+// authorization — never client-supplied, always resolved from the session.
+// NOTE: the existing `bizledger-admin` demo app has NO backend (mock/localStorage
+// data). It must not fake moderation auth; the real moderation UI that we may
+// add later consumes these authenticated server APIs via `requirePlatformAdmin`.
+// ---------------------------------------------------------------------------
+model PlatformAdmin {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("platform_admin")
 }
 
 model Session {
@@ -74,4 +155,1068 @@ model Verification {
 
   @@index([identifier])
   @@map("verification")
+}
+
+model Business {
+  id            String         @id @default(cuid())
+  name          String
+  legalName     String?
+  email         String?
+  phone         String?
+  gstin         String?
+  gstRegistered Boolean        @default(false)
+  addressLine1  String?
+  addressLine2  String?
+  city          String?
+  state         String?
+  stateCode     String?
+  pincode       String?
+  country       String?
+  status        BusinessStatus @default(ACTIVE)
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  memberships       BusinessMember[]
+  branches          Branch[]
+  customers         Customer[]
+  products          Product[]
+  financialYears    FinancialYear[]
+  documentSequences DocumentSequence[]
+  invoices          Invoice[]
+  quotations        Quotation[]
+  estimates         Estimate[]
+  purchaseOrders    PurchaseOrder[]
+  vehicles          Vehicle[]
+  expenses          Expense[]
+  notifications     Notification[]
+  directoryProfile  BusinessDirectoryProfile?
+  subscriptions     BusinessSubscription[]
+  payments          PaymentRecord[]
+  billingInvoices   BillingInvoice[]
+
+  @@index([status])
+  @@map("business")
+}
+
+// A user's membership in a business (multi-tenant access). THE canonical
+// "team member" record — the Team module REUSES this table, it does not create
+// a duplicate TeamMember table.
+//
+// Phase 3F additions (team module backend):
+//   designation/phone/permissions mirror the frontend TeamMember fields
+//   (AddTeamMemberModal). `permissions` is a FIXED-SHAPE map (ModulePermissions
+//   keys -> booleans) validated server-side against an allowlist — never an
+//   arbitrary JSON blob. `lastActiveAt` powers the frontend "Last Activity".
+//   Role display mapping (frontend labels): OWNER->Owner, MANAGER->Manager,
+//   ADMIN->Accountant, STAFF->Staff (the UI calls the ADMIN tier "Accountant").
+model BusinessMember {
+  id         String               @id @default(cuid())
+  userId     String
+  businessId String
+  role       BusinessMemberRole
+  status     BusinessMemberStatus @default(ACTIVE)
+  designation String?
+  phone      String?
+  permissions Json?
+  lastActiveAt DateTime?
+  createdAt  DateTime             @default(now())
+  updatedAt  DateTime             @updatedAt
+
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+  @@map("business_member")
+}
+
+model Branch {
+  id           String   @id @default(cuid())
+  businessId   String
+  name         String
+  code         String
+  addressLine1 String?
+  addressLine2 String?
+  city         String?
+  state        String?
+  stateCode    String?
+  pincode      String?
+  phone        String?
+  email        String?
+  isActive     Boolean  @default(true)
+  isDefault    Boolean  @default(false)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, code])
+  @@index([isDefault])
+  @@map("branch")
+}
+
+// Customer master data. Every customer belongs to exactly ONE business —
+// there are no global/shared customers between tenants. All reads/writes are
+// scoped by `businessId` derived from the authenticated user's membership, and
+// names/emails/phones are intentionally NOT globally unique (allowed to repeat
+// across businesses).
+model Customer {
+  id                  String           @id @default(cuid())
+  businessId          String
+  code                String
+  type                CustomerType
+  name                String
+  avatarInitials      String
+  businessType        String?
+  gstStatus           CustomerGstStatus
+  gstin               String?
+  panNumber           String?
+  website             String?
+  contactName         String?
+  contactDesignation  String?
+  contactMobile       String?
+  contactEmail        String?
+  billingAddressLine1 String?
+  billingAddressLine2 String?
+  billingCity         String?
+  billingState        String?
+  billingPincode      String?
+  billingCountry      String?
+  shippingAddressLine1 String?
+  shippingAddressLine2 String?
+  shippingCity        String?
+  shippingState       String?
+  shippingPincode     String?
+  shippingCountry     String?
+  sameAsBilling       Boolean          @default(true)
+  stateCode           String?
+  creditLimit         Decimal          @default(0)
+  paymentTerms        String?
+  notes               String?
+  status              CustomerStatus   @default(Active)
+  outstandingBalance  Decimal          @default(0)
+  totalSales          Decimal          @default(0)
+  totalInvoices       Int              @default(0)
+  lastPaymentAmount   Decimal?
+  lastPaymentDate     DateTime?
+  lastPaymentMethod   String?
+  createdDate         DateTime         @default(now())
+  sinceDate           DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invoices Invoice[]
+  quotations Quotation[]
+  estimates Estimate[]
+
+  @@index([businessId])
+  @@index([businessId, name])
+  @@index([businessId, gstin])
+  @@index([businessId, status])
+  @@map("customer")
+}
+
+// Product master data. Every product belongs to exactly ONE business. The
+// single `category` field stores the resolved category — custom categories
+// entered via the "Other" choice are stored directly in `category` (the
+// frontend collapses them at save time). HSN/SAC is optional and only
+// format-validated (never guessed/generated). Product names are intentionally
+// NOT globally unique.
+model Product {
+  id            String  @id @default(cuid())
+  businessId    String
+  name          String
+  sku           String
+  category      String  @default("General")
+  unit          String  @default("Pcs")
+  unitPrice     Decimal @default(0)
+  stockQuantity Decimal @default(0)
+  hsnSac        String?
+  gstRate       Decimal @default(18)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invoiceItems InvoiceItem[]
+  quotationItems QuotationItem[]
+  estimateItems EstimateItem[]
+  purchaseOrderItems PurchaseOrderItem[]
+
+  @@index([businessId])
+  @@index([businessId, name])
+  @@index([businessId, category])
+  @@index([businessId, hsnSac])
+  @@map("product")
+}
+
+// The document types that carry a per-fiscal-year sequence. Mirrors the
+// frontend `SequenceKind` (invoice | quotation | estimate | purchaseOrder).
+enum DocumentKind {
+  invoice
+  quotation
+  estimate
+  purchaseOrder
+}
+
+// Sales-document pricing mode. "inclusive" (DEFAULT / canonical): the unit
+// price entered includes GST; "exclusive": the unit price is the taxable base
+// and GST is added on top. Mirrors the frontend `PricingMode`.
+enum PricingMode {
+  inclusive
+  exclusive
+}
+
+// GST tax-treatment classification of a stored sale. Under India GST:
+// intrastate (seller + place-of-supply in same state) -> CGST + SGST split;
+// interstate (different states) -> single IGST. Derived at creation time from
+// the seller's state code vs the customer's place of supply and stored so
+// historical documents render identically to when they were issued.
+enum TaxType {
+  intrastate
+  interstate
+}
+
+// Invoice lifecycle. Mirrors the frontend `InvoiceStatus`. The current creation
+// flow issues `Pending`/`Paid`; `Draft`/`Overdue`/`Cancelled` are
+// forward-compatible statuses used by the wider app.
+enum InvoiceStatus {
+  Paid
+  Pending
+  Overdue
+  Draft
+  Cancelled
+}
+
+// A fiscal/accounting year for a business. India FY = 1 April YYYY -> 31 March
+// YYYY+1. `name` matches the frontend `FinancialYearSettings.name` format
+// ("Financial Year 2026-27") so the legacy `fySlug` and numbering logic stays
+// aligned. Each financial year is business-scoped; names are NOT globally
+// unique. At most one FY may be active per business (enforced transactionally
+// in the service layer and by a partial unique index).
+model FinancialYear {
+  id        String   @id @default(cuid())
+  businessId String
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  isActive  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business  Business           @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  sequences DocumentSequence[]
+  invoices  Invoice[]
+  quotations Quotation[]
+  estimates Estimate[]
+  purchaseOrders PurchaseOrder[]
+
+  @@unique([businessId, name])
+  @@index([businessId])
+  @@map("financial_year")
+}
+
+// Per-fiscal-year document numbering counter. Holds the NEXT number to issue
+// for a given document kind within a given financial year of a business.
+// `nextNumber` is the pre-increment value (allocation reads it, returns it,
+// and atomically increments) — exactly like frontend `nextSequence`.
+// Allocation must be atomic (row lock / RETURNING), never SELECT-then-increment.
+model DocumentSequence {
+  id             String       @id @default(cuid())
+  businessId     String
+  financialYearId String
+  kind           DocumentKind
+  prefix         String       @default("INV")
+  nextNumber     Int          @default(1)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  business      Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  financialYear FinancialYear @relation(fields: [financialYearId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, financialYearId, kind])
+  @@index([businessId, financialYearId])
+  @@map("document_sequence")
+}
+
+// Sales invoice (historical, immutable). Every invoice belongs to exactly ONE
+// business and is pinned to the FinancialYear in which its number was
+// allocated. The invoice NUMBER is stored on the row and is never re-derived:
+// changing the prefix, FY, business settings, customer or product later must
+// NOT change a stored invoice. Monetary totals are stored as Prisma Decimal
+// (never float). The customer/company/vehicle tables are mutable master data, so
+// the invoice captures snapshot copies (customerSnapshot, companySnapshot,
+// vehicleSnapshot) of exactly what was invoiced at creation time for faithful
+// historical rendering. An invoice MAY intentionally reference a deleted
+// customer/product — the FK is SetNull and the snapshot preserves history.
+model Invoice {
+  id              String        @id @default(cuid())
+  businessId      String
+  financialYearId String
+  invoiceNumber   String
+  invoiceDate     DateTime
+  customerId      String?
+  placeOfSupply   String?
+  placeOfSupplyCode String?
+  taxType         TaxType       @default(intrastate)
+  status          InvoiceStatus @default(Draft)
+  pricingMode     PricingMode   @default(inclusive)
+  subtotal        Decimal       @default(0)
+  totalDiscount   Decimal       @default(0)
+  taxableAmount   Decimal       @default(0)
+  cgst            Decimal       @default(0)
+  sgst            Decimal       @default(0)
+  igst            Decimal       @default(0)
+  totalTax        Decimal       @default(0)
+  grandTotal      Decimal       @default(0)
+  notes           String?
+  terms           String?
+  dueDate         DateTime?
+  ewayBillNumber  String?
+  ewayBillDate    DateTime?
+  customerSnapshot   Json?
+  companySnapshot    Json?
+  vehicleSnapshot    Json?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  business      Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  financialYear FinancialYear  @relation(fields: [financialYearId], references: [id], onDelete: Cascade)
+  customer      Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  items         InvoiceItem[]
+  conversionsFromQuotations Quotation[] @relation("QuotationToInvoice")
+  conversionsFromEstimates  Estimate[] @relation("EstimateToInvoice")
+
+  @@unique([businessId, invoiceNumber])
+  @@index([businessId, financialYearId])
+  @@index([invoiceDate])
+  @@index([status])
+  @@map("invoice")
+}
+
+// A single invoiced line. Stores the PRODUCT SNAPSHOT at invoicing time
+// (productName/sku/hsnSac/unit/rate/gstRate) so an invoice renders identically
+// even if the Product master is edited or deleted later. `productId` is a soft
+// reference (SetNull on delete) — the snapshot is the source of truth for
+// historical rendering. All GST split values (cgst/sgst/igst) are computed by
+// the shared GST engine in src/lib/invoice.ts and preserved per line.
+model InvoiceItem {
+  id            String      @id @default(cuid())
+  invoiceId     String
+  productId     String?
+  productName   String
+  sku           String?
+  hsnSac        String?
+  unit          String?
+  quantity      Decimal     @default(1)
+  rate          Decimal     @default(0)
+  pricingMode   PricingMode @default(inclusive)
+  gstRate       Decimal     @default(0)
+  taxableAmount Decimal     @default(0)
+  cgst          Decimal     @default(0)
+  sgst          Decimal     @default(0)
+  igst          Decimal     @default(0)
+  taxAmount     Decimal     @default(0)
+  totalAmount   Decimal     @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@index([productId])
+  @@map("invoice_item")
+}
+
+// Quotation lifecycle. Mirrors the frontend `QuotationStatus` exactly.
+enum QuotationStatus {
+  Draft
+  Sent
+  Accepted
+  Rejected
+  Expired
+}
+
+// Estimate lifecycle. Mirrors the frontend `EstimateStatus` exactly.
+enum EstimateStatus {
+  Draft
+  Sent
+  Accepted
+  Rejected
+  Expired
+}
+
+// Purchase-order lifecycle. Mirrors the frontend `PurchaseOrderStatus` exactly:
+// Draft | Sent | Accepted | Partially Received | Received | Cancelled. Stored as
+// a validated String (NOT a DB enum) because "Partially Received" contains a
+// space which Prisma enums cannot represent; the service layer enforces the
+// allowlist so the persisted value is always one of the six.
+
+// Quotation (sales offer to a buyer). Historical + immutable like an invoice:
+// number minted from the FY-scoped DocumentSequence, amounts recomputed
+// server-side with the shared GST engine, customer + seller snapshots captured
+// at creation time. An optional `sourceEstimateId` records provenance when the
+// quotation was created by converting an Estimate (the estimate is preserved and
+// stores the back-reference `convertedQuotation*`). Conversion to an Invoice is
+// recorded on the quotation (`convertedInvoice*`) without ever mutating the
+// rest of the document.
+model Quotation {
+  id                 String          @id @default(cuid())
+  businessId         String
+  financialYearId    String
+  quotationNumber    String
+  quotationDate      DateTime
+  validUntil         DateTime?
+  customerId         String?
+  placeOfSupply      String?
+  placeOfSupplyCode  String?
+  taxType            TaxType         @default(intrastate)
+  status             QuotationStatus @default(Draft)
+  pricingMode        PricingMode     @default(inclusive)
+  subtotal           Decimal         @default(0)
+  totalDiscount      Decimal         @default(0)
+  taxableAmount      Decimal         @default(0)
+  cgst               Decimal         @default(0)
+  sgst               Decimal         @default(0)
+  igst               Decimal         @default(0)
+  totalTax           Decimal         @default(0)
+  grandTotal         Decimal         @default(0)
+  notes              String?
+  terms              String?
+  sourceEstimateId   String?
+  convertedInvoiceId String?
+  convertedInvoiceNumber String?
+  convertedAt        DateTime?
+  customerSnapshot   Json?
+  companySnapshot    Json?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+
+  business              Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  financialYear         FinancialYear  @relation(fields: [financialYearId], references: [id], onDelete: Cascade)
+  customer              Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  sourceEstimate        Estimate?      @relation("QuotationSourceEstimate", fields: [sourceEstimateId], references: [id], onDelete: SetNull)
+  convertedInvoice      Invoice?       @relation("QuotationToInvoice", fields: [convertedInvoiceId], references: [id], onDelete: SetNull)
+  convertedFromEstimates Estimate[]    @relation("EstimateToQuotation")
+  items                 QuotationItem[]
+
+  @@unique([businessId, quotationNumber])
+  @@index([businessId, financialYearId])
+  @@index([quotationDate])
+  @@index([status])
+  @@map("quotation")
+}
+
+model QuotationItem {
+  id            String      @id @default(cuid())
+  quotationId   String
+  productId     String?
+  productName   String
+  sku           String?
+  hsnSac        String?
+  unit          String?
+  quantity      Decimal     @default(1)
+  rate          Decimal     @default(0)
+  pricingMode   PricingMode @default(inclusive)
+  gstRate       Decimal     @default(0)
+  taxableAmount Decimal     @default(0)
+  cgst          Decimal     @default(0)
+  sgst          Decimal     @default(0)
+  igst          Decimal     @default(0)
+  taxAmount     Decimal     @default(0)
+  totalAmount   Decimal     @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  product   Product?  @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([quotationId])
+  @@index([productId])
+  @@map("quotation_item")
+}
+
+// Estimate (approximate expected cost; NOT a fixed price or final invoice).
+// Historical + immutable in the same way as quotation/invoice. Optional
+// explicit conversions are recorded on the estimate and preserved: to a new
+// Quotation (`convertedQuotation*`) and/or a new Invoice (`convertedInvoice*`).
+model Estimate {
+  id                   String         @id @default(cuid())
+  businessId           String
+  financialYearId      String
+  estimateNumber       String
+  estimateDate         DateTime
+  validUntil           DateTime?
+  scope                String?
+  customerId           String?
+  placeOfSupply        String?
+  placeOfSupplyCode    String?
+  taxType              TaxType        @default(intrastate)
+  status               EstimateStatus @default(Draft)
+  pricingMode          PricingMode    @default(inclusive)
+  subtotal             Decimal        @default(0)
+  totalDiscount        Decimal        @default(0)
+  taxableAmount        Decimal        @default(0)
+  cgst                 Decimal        @default(0)
+  sgst                 Decimal        @default(0)
+  igst                 Decimal        @default(0)
+  totalTax             Decimal        @default(0)
+  grandTotal           Decimal        @default(0)
+  notes                String?
+  terms                String?
+  convertedQuotationId String?
+  convertedQuotationNumber String?
+  convertedInvoiceId   String?
+  convertedInvoiceNumber String?
+  convertedAt          DateTime?
+  customerSnapshot     Json?
+  companySnapshot      Json?
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  business           Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  financialYear      FinancialYear  @relation(fields: [financialYearId], references: [id], onDelete: Cascade)
+  customer           Customer?      @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  convertedQuotation Quotation?     @relation("EstimateToQuotation", fields: [convertedQuotationId], references: [id], onDelete: SetNull)
+  sourceOfQuotations Quotation[]    @relation("QuotationSourceEstimate")
+  convertedInvoice   Invoice?       @relation("EstimateToInvoice", fields: [convertedInvoiceId], references: [id], onDelete: SetNull)
+  items              EstimateItem[]
+
+  @@unique([businessId, estimateNumber])
+  @@index([businessId, financialYearId])
+  @@index([estimateDate])
+  @@index([status])
+  @@map("estimate")
+}
+
+model EstimateItem {
+  id            String      @id @default(cuid())
+  estimateId    String
+  productId     String?
+  productName   String
+  sku           String?
+  hsnSac        String?
+  unit          String?
+  quantity      Decimal     @default(1)
+  rate          Decimal     @default(0)
+  pricingMode   PricingMode @default(inclusive)
+  gstRate       Decimal     @default(0)
+  taxableAmount Decimal     @default(0)
+  cgst          Decimal     @default(0)
+  sgst          Decimal     @default(0)
+  igst          Decimal     @default(0)
+  taxAmount     Decimal     @default(0)
+  totalAmount   Decimal     @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  estimate Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  product  Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([estimateId])
+  @@index([productId])
+  @@map("estimate_item")
+}
+
+// Purchase order (official order issued by the buyer to a supplier). Direction
+// is buyer -> seller, so instead of a Customer there is a vendor SNAPSHOT (the
+// app has no vendor master yet). Items still reference the buyer's Product
+// master and capture product snapshots; GST uses the shared engine. Historical
+// + immutable like the other sales documents.
+model PurchaseOrder {
+  id               String             @id @default(cuid())
+  businessId       String
+  financialYearId  String
+  poNumber         String
+  poDate           DateTime
+  deliveryDate     DateTime?
+  deliveryAddress  String?
+  deliveryMode     String?
+  placeOfSupply    String?
+  placeOfSupplyCode String?
+  taxType          TaxType            @default(intrastate)
+  status           String             @default("Draft")
+  pricingMode      PricingMode        @default(inclusive)
+  subtotal         Decimal            @default(0)
+  totalDiscount    Decimal            @default(0)
+  taxableAmount    Decimal            @default(0)
+  cgst             Decimal            @default(0)
+  sgst             Decimal            @default(0)
+  igst             Decimal            @default(0)
+  totalTax         Decimal            @default(0)
+  grandTotal       Decimal            @default(0)
+  notes            String?
+  terms            String?
+  vendorSnapshot   Json?
+  createdAt        DateTime           @default(now())
+  updatedAt        DateTime           @updatedAt
+
+  business      Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  financialYear FinancialYear  @relation(fields: [financialYearId], references: [id], onDelete: Cascade)
+  items         PurchaseOrderItem[]
+
+  @@unique([businessId, poNumber])
+  @@index([businessId, financialYearId])
+  @@index([poDate])
+  @@index([status])
+  @@map("purchase_order")
+}
+
+model PurchaseOrderItem {
+  id            String      @id @default(cuid())
+  purchaseOrderId String
+  productId     String?
+  productName   String
+  sku           String?
+  hsnSac        String?
+  unit          String?
+  quantity      Decimal     @default(1)
+  rate          Decimal     @default(0)
+  pricingMode   PricingMode @default(inclusive)
+  gstRate       Decimal     @default(0)
+  taxableAmount Decimal     @default(0)
+  cgst          Decimal     @default(0)
+  sgst          Decimal     @default(0)
+  igst          Decimal     @default(0)
+  taxAmount     Decimal     @default(0)
+  totalAmount   Decimal     @default(0)
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  purchaseOrder PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  product       Product?      @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([purchaseOrderId])
+  @@index([productId])
+  @@map("purchase_order_item")
+}
+
+// ---------------------------------------------------------------------------
+// VEHICLE — fleet master data owned by a Business.
+//
+// Field names/behaviour mirror the existing frontend (AddVehicleModal /
+// VehiclesList / VehicleDetailsView). `registrationNumber` is normalized to
+// trim + uppercase on create/update (the frontend uppercases on submit) and is
+// unique WITHIN a business (`@@unique([businessId, registrationNumber])`), so
+// two tenants may independently register "TN 01 AB 1234".
+//
+// Status/type/fuel values have spaces ("Under Maintenance", "Mini Truck"), so
+// they are stored as validated Strings and validated at the service layer
+// against the exact frontend value sets (Phase 3D precedent).
+//
+// The Invoice `vehicleSnapshot` (JSONB) is INDEPENDENT of this table and is not
+// affected by vehicle edits/deletes — historical invoices keep whatever was
+// captured at creation time.
+//
+// onDelete: deleting a Vehicle leaves linked Expense rows (SetNull) because an
+// expense is a financial record; deleting a Business cascades everything.
+// ---------------------------------------------------------------------------
+model Vehicle {
+  id                   String   @id @default(cuid())
+  businessId           String
+  registrationNumber   String
+  makeModel            String
+  vehicleType          String
+  fuelType             String
+  manufacturingYear    Int
+  chassisNumber        String?
+  engineNumber         String?
+  assignedRoute        String?
+  driverName           String
+  driverPhone          String
+  driverLicense        String?
+  driverLicenseExpiry  DateTime?
+  insurancePolicyNumber String?
+  insuranceExpiry      DateTime?
+  fcExpiry             DateTime?
+  pucExpiry            DateTime?
+  currentOdometer      Int      @default(0)
+  status               String   @default("Active")
+  lastServiceDate      DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  expenses Expense[]
+
+  @@unique([businessId, registrationNumber])
+  @@index([businessId, status])
+  @@index([status])
+  @@map("vehicle")
+}
+
+// ---------------------------------------------------------------------------
+// EXPENSE — a business outlay record matching the current frontend Expense
+// type (AddExpenseModal / ExpensesList / ExpenseDetailsModal) plus the
+// auto-created linked expense produced by AddVehicleExpenseModal.
+//
+// `category`, `paymentMethod`, `expenseType` and `status` are validated
+// Strings validated at the service layer against the exact frontend value sets
+// (they contain spaces / are plain text in the UI). `paymentMethod` likewise.
+//
+// Money is `Decimal`; amount is validated server-side (> 0, finite, two max
+// decimals). `date` is the expense date (frontend YYYY-MM-DD).
+//
+// Optional `vehicleId` links to a Vehicle of the SAME business (validated
+// server-side). `vehicleRegistration` is a historical snapshot stored with the
+// expense so re-rendering never depends on mutable Vehicle master data.
+//
+// onDelete: Expense -> Vehicle is SetNull (deleting a vehicle must never delete
+// or orphan a financial record). Business cascade handles tenant cleanup.
+// ---------------------------------------------------------------------------
+model Expense {
+  id                 String   @id @default(cuid())
+  businessId         String
+  expenseNumber      String
+  title              String
+  category           String
+  amount             Decimal
+  date               DateTime
+  paymentMethod      String
+  paidFromAccount    String?
+  referenceNumber    String?
+  vendor             String
+  expenseType        String
+  status             String   @default("Paid")
+  notes              String?
+  receiptUrl         String?
+  receiptName        String?
+  receiptSize        String?
+  vehicleId          String?
+  vehicleRegistration String?
+  createdBy          String?
+  approvedBy         String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  vehicle  Vehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+
+  @@index([businessId, date])
+  @@index([businessId, category])
+  @@index([businessId, status])
+  @@index([businessId, vehicleId])
+  @@map("expense")
+}
+
+// ---------------------------------------------------------------------------
+// NOTIFICATION — an in-app notification addressed to a single user.
+//
+// Deliberately mirrors the frontend `NotificationItem` essentials (type, title,
+// message, read state) while keeping presentation details (icon/timeAgo) as
+// client-side derivations. `userId` = the OWNER of the notification (server-
+// determined from the session; never client-supplied). `businessId` is OPTIONAL
+// so platform-level notices (subscription renewal, pending invites) can exist
+// for a user with zero businesses. `entityType`/`entityId` support future
+// "tap-to-navigate" actions (e.g. invoice/order).
+//
+// Private: reads/writes ONLY the authenticated user's own rows; a notification
+// of another user is a cross-tenant 404, never a disclosure.
+// ---------------------------------------------------------------------------
+model Notification {
+  id         String   @id @default(cuid())
+  userId     String
+  businessId String?
+  type       String
+  title      String
+  message    String?
+  isRead     Boolean  @default(false)
+  readAt     DateTime?
+  entityType String?
+  entityId   String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  user     User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  business Business? @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([userId, isRead])
+  @@index([userId, businessId, isRead])
+  @@map("notification")
+}
+
+// ---------------------------------------------------------------------------
+// BUSINESS DIRECTORY PROFILE — the OPT-IN public listing for a Business.
+//
+// Deliberately SEPARATE from the Business record (which holds private master
+// data): only this profile's intentionally public fields are ever exposed.
+// One profile per business (`businessId` unique). `isListed` is false by
+// default — publication is explicit, never implicit. The lifecycle `status`
+// mirrors the frontend labels (see DirectoryStatus enum).
+//
+// `categories` is a Postgres text[] validated against the frontend category
+// allowlist. `businessType`/`state`/`stateCode` are validated against the
+// frontend vocabularies (stateCode derived from the canonical state list).
+//
+// PUBLIC boundary: only status=PUBLISHED && isListed=true profiles are served
+// by the public GET endpoints; every other state is a 404 to visitors.
+// ---------------------------------------------------------------------------
+model BusinessDirectoryProfile {
+  id             String          @id @default(cuid())
+  businessId     String          @unique
+  status         DirectoryStatus @default(NOT_LISTED)
+  isListed       Boolean         @default(false)
+  companyName    String
+  businessType   String
+  categories     String[]
+  description    String?
+  streetAddress  String?
+  city           String?
+  state          String?
+  stateCode      String?
+  pincode        String?
+  landmark       String?
+  ownerName      String
+  primaryPhone   String?
+  alternatePhone String?
+  email          String?
+  website        String?
+  gstin          String?
+  gstVerified    Boolean         @default(false)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([status, isListed])
+  @@index([businessType])
+  @@index([state])
+  @@map("business_directory_profile")
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 4A — BILLING DATABASE FOUNDATION + PLAN CATALOG.
+//
+// These tables prepare the backend for Razorpay (later Phase 4 stages) WITHOUT
+// any payment-processing code. Servers read the authoritative plan catalog from
+// `plan_catalog` (mirroring the frontend PLAN_CATALOG in src/lib/plans.ts); the
+// subscription/payment/event tables are the persistent runtime foundation.
+//
+// DELETE SEMANTICS (historical financial records must not be casually cascaded):
+//   * BusinessSubscription -> Business: Cascade (subscriptions end with tenant
+//     cleanup; they are not financial records themselves).
+//   * PaymentRecord -> Business: Restrict — a business with payment history
+//     cannot be deleted silently; financial history is preserved.
+//   * PaymentRecord -> BusinessSubscription: SetNull — deleting a subscription
+//     keeps the payment attempt history.
+//   * PaymentRecord -> PlanCatalog: Restrict — plans are application-controlled
+//     and never deleted.
+//   * SubscriptionEvent -> BusinessSubscription: SetNull — audit events are
+//     append-only and survive subscription cleanup.
+// ---------------------------------------------------------------------------
+
+enum SubscriptionStatus {
+  NONE
+  PENDING
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  CREATED
+  VERIFIED
+  FAILED
+  CANCELLED
+}
+
+// Authoritative persistent mirror of the frontend PLAN_CATALOG
+// (src/lib/plans.ts). Plan IDs are the stable keys (base | business |
+// enterprise); the catalog is application-controlled — there is NO public
+// mutation API for it (Phase 4A: read-only via GET /api/billing/plans).
+model PlanCatalog {
+  id                      String                @id
+  name                    String
+  description             String?
+  price                   Decimal               @db.Decimal(12, 2)
+  period                  String                @default("month")
+  businessNetworkIncluded Boolean               @default(false)
+  limits                  Json
+  active                  Boolean               @default(true)
+  createdAt               DateTime              @default(now())
+  updatedAt               DateTime              @updatedAt
+
+  subscriptions BusinessSubscription[]
+  payments      PaymentRecord[]
+
+  @@map("plan_catalog")
+}
+
+// A business's subscription contract. `planSnapshot` will preserve the
+// entitlements in force at activation time (Phase 4C+); `razorpaySubscriptionId`
+// is RESERVED for future compatibility and must NOT be used in Phase 4A.
+//
+// One-and-only-one PENDING or ACTIVE subscription per business is enforced by
+// the PostgreSQL partial unique index `business_subscription_one_active_pending`
+// (declared in the migration SQL — Prisma cannot express partial predicates).
+// CANCELLED/EXPIRED/SUSPENDED history may coexist.
+model BusinessSubscription {
+  id                     String             @id @default(cuid())
+  businessId             String
+  planId                 String
+  status                 SubscriptionStatus
+  period                 String             @default("month")
+  startedAt              DateTime?
+  renewsAt               DateTime?
+  endedAt                DateTime?
+  planSnapshot           Json?
+  razorpaySubscriptionId String?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  business Business             @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  plan     PlanCatalog          @relation(fields: [planId], references: [id], onDelete: Restrict)
+  payments PaymentRecord[]
+  events   SubscriptionEvent[]
+  billingInvoices BillingInvoice[]
+
+  @@index([businessId, status])
+  @@map("business_subscription")
+}
+
+// One PaymentRecord = one payment attempt. Historical attempts must remain, so
+// there is deliberately NO uniqueness on (businessId, planId) and `paymentId`
+// is a non-unique indexed reference. `razorpayEventId` IS unique — it backs
+// webhook idempotency (Phase 4F). Money is stored as Prisma Decimal (never
+// float). billing-period GST (GST_RATE=18) is distinct from sales-invoice tax.
+model PaymentRecord {
+  id              String        @id @default(cuid())
+  businessId      String
+  subscriptionId  String?
+  planId          String
+  planName        String
+  billingPeriod   String
+  baseAmount      Decimal       @db.Decimal(12, 2)
+  gstRate         Decimal       @db.Decimal(5, 2)
+  gstAmount       Decimal       @db.Decimal(12, 2)
+  totalAmount     Decimal       @db.Decimal(12, 2)
+  currency        String        @default("INR")
+  status          PaymentStatus
+  method          String?
+  orderId         String?
+  paymentId       String?
+  razorpayEventId String?       @unique
+  description     String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  business     Business              @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  subscription BusinessSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  plan         PlanCatalog           @relation(fields: [planId], references: [id], onDelete: Restrict)
+  billingInvoice BillingInvoice?
+
+  @@index([businessId, createdAt])
+  @@index([businessId, status])
+  @@index([orderId])
+  @@index([paymentId])
+  @@map("payment_record")
+}
+
+// Append-only audit trail for a subscription. NEVER update historical rows.
+// Events without a subscription link are preserved via SetNull (orphanable).
+model SubscriptionEvent {
+  id             String    @id @default(cuid())
+  subscriptionId String?
+  type           String
+  payload        Json
+  createdAt      DateTime  @default(now())
+
+  subscription BusinessSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@index([subscriptionId, createdAt])
+  @@map("subscription_event")
+}
+
+// Inbox for webhook deliveries (Razorpay). `eventId` = `x-razorpay-event-id`
+// and is UNIQUE for provider idempotency (Phase 4F). Only the storage
+// foundation exists in Phase 4A — the webhook route comes in a later stage.
+model WebhookEvent {
+  id             String   @id @default(cuid())
+  eventId        String   @unique
+  eventType      String
+  payload        Json
+  signatureValid Boolean
+  processed      Boolean  @default(false)
+  error          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([eventType, createdAt])
+  @@index([processed, createdAt])
+  @@map("webhook_event")
+}
+
+// ---------------------------------------------------------------------------
+// PHASE 6A — SAAS BILLING DOCUMENTS (Billing Invoice / Payment Receipt).
+//
+// DELIBERATELY SEPARATE DOMAIN from the customer sales-document system: SaaS
+// billing receipts use their OWN platform-global sequence (`BillingSequence`),
+// NOT the business-scoped FinancialYear/DocumentSequence used by customer sales
+// invoices/quotations/estimates/purchase-orders. PaymentRecord remains the
+// payment ledger (untouched); BillingInvoice is the immutable billing DOCUMENT
+// minted exactly once per verified/successful payment (mirrors the webhook's
+// activation transaction so a failure rolls everything back safely).
+//
+// NUMBERING: platform-global counter keyed by India fiscal-year label
+// ("2026-27"); number format BL-2026-000001 (prefix, FY start year, 6-digit
+// zero-padded). Allocation uses the same atomic INSERT ... ON CONFLICT DO
+// NOTHING + UPDATE ... RETURNING row-lock pattern as `allocateDocumentNumber`,
+// but is intentionally NOT that function — the billing sequence is global
+// (no business scope) and mints inside the webhook transaction which has no
+// user session.
+//
+// DOCUMENT SEMANTICS: immutable. Customer + supplier identity are captured as
+// snapshots at mint time; amounts are COPIED verbatim from the subscribed
+// PaymentRecord (never recalculated, never re-derived from plan catalog).
+// Money is Prisma Decimal. FAILED/CREATED/CANCELLED payments never get an
+// invoice. Idempotency is guaranteed by `paymentId @@unique` (one invoice per
+// PaymentRecord row = one per minted successful attempt) plus `invoiceNumber
+// @@unique`. Deleting a business FAILS while billing invoices exist (Restrict)
+// exactly like PaymentRecord — billing history is preserved financial evidence.
+// ---------------------------------------------------------------------------
+
+model BillingSequence {
+  id         String   @id @default(cuid())
+  fiscalYear String
+  prefix     String   @default("BL")
+  nextNumber Int      @default(1)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([fiscalYear])
+  @@map("billing_sequence")
+}
+
+model BillingInvoice {
+  id               String   @id @default(cuid())
+  businessId       String
+  paymentId        String
+  subscriptionId   String?
+  invoiceNumber    String
+  invoiceDate      DateTime
+  paymentDate      DateTime
+  billingPeriod    String
+  planId           String
+  planName         String
+  baseAmount       Decimal  @db.Decimal(12, 2)
+  gstRate          Decimal  @db.Decimal(5, 2)
+  gstAmount        Decimal  @db.Decimal(12, 2)
+  totalAmount      Decimal  @db.Decimal(12, 2)
+  currency         String   @default("INR")
+  orderId          String
+  paymentMethod    String?
+  supplierSnapshot Json
+  customerSnapshot Json
+  createdAt        DateTime @default(now())
+
+  business     Business              @relation(fields: [businessId], references: [id], onDelete: Restrict)
+  payment      PaymentRecord         @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+  subscription BusinessSubscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+
+  @@unique([paymentId])
+  @@unique([invoiceNumber])
+  @@index([businessId, createdAt])
+  @@map("billing_invoice")
 }

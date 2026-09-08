@@ -13,6 +13,7 @@ export default defineConfig({
   schema: "prisma/schema.prisma",
   migrations: {
     path: "prisma/migrations",
+    seed: "tsx prisma/seed.ts",
   },
   datasource: {
     // Migrations must use the direct connection (DIRECT_URL) — Supabase's

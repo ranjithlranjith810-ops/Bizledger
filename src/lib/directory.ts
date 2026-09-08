@@ -2,23 +2,17 @@
 //
 // The directory is a public, read-only "Discover → View → Call" module. It
 // holds OPT-IN listings that are separate from the private CompanyProfile and
-// are scoped per account (`dataKey(accountId, "directory")`). Visitors can
-// search/filter PUBLISHED businesses and call them via a tel: link; the owner
-// manages only their own listing (default OFF), and an admin moderator handles
-// approval.
+// are scoped per business. Visitors can search/filter PUBLISHED businesses and
+// call them via a tel: link; the owner manages only their own listing.
 //
-// Supabase/backend-ready: every read/write goes through storage helpers so the
-// future backend can swap `localStorage` for real tables without touching call
-// sites. No fake cross-origin sync exists between the customer and admin apps;
-// the admin moderates its own seeded catalog (a Step-3 backend concern).
-import {
-  DirectoryBusiness,
-  DirectoryBusinessType,
-  DirectoryListingStatus,
-} from "@/types";
-import { dataKey, safeGet, safeSet, safeRemove } from "@/lib/storage";
-import { generateId } from "@/lib/utils";
-import { isUnlimited } from "@/lib/entitlements";
+// Backend-authoritative: reads and writes flow through the HTTP API in
+// `src/lib/api/directory.ts`, backed by the `business_directory_profile` table.
+// This module keeps the pure helpers (vocabularies, validation-ish utilities,
+// filtering, entitlements) plus the read-only seed catalog used ONLY as a demo
+// fallback when the backend has no published listings yet. A tiny in-memory
+// cache of the caller's own listing powers synchronous plan-usage lookups; it
+// is never the source of truth.
+import { DirectoryBusiness, DirectoryListingStatus } from "@/types";
 import { INDIAN_STATES } from "@/lib/india";
 
 // Derive the numeric GST state code from the canonical state name.
@@ -30,11 +24,8 @@ export function stateCodeFromName(stateName?: string): string | undefined {
   return match?.code;
 }
 
-// Only listings in the PUBLISHED state are discoverable by visitors.
-export const DIRECTORY_ENTITY = "directory";
-
 // Centralized business-type vocabulary (no free typing).
-export const DIRECTORY_BUSINESS_TYPES: DirectoryBusinessType[] = [
+export const DIRECTORY_BUSINESS_TYPES: DirectoryBusiness["businessType"][] = [
   "Manufacturer",
   "Dealer",
   "Wholesaler",
@@ -73,8 +64,8 @@ export function isDirectoryStatus(value: string): value is DirectoryListingStatu
 }
 
 // Normalize the GST status: only "GSTIN Provided" (owner-supplied) is set from
-// a string; "GST Verified" is reserved for a future backend step and never
-// guessed by the client.
+// a string; "GST Verified" is reserved for the backend moderation step and
+// never guessed by the client.
 export function gstStatusFromGstin(gstin?: string): DirectoryBusiness["gstStatus"] {
   const v = (gstin ?? "").trim();
   return v ? "GSTIN Provided" : "Not Provided";
@@ -84,7 +75,7 @@ export function gstStatusFromGstin(gstin?: string): DirectoryBusiness["gstStatus
 export interface DirectoryCard {
   id: string;
   companyName: string;
-  businessType: DirectoryBusinessType;
+  businessType: DirectoryBusiness["businessType"];
   categories: string[];
   city: string;
   state: string;
@@ -108,30 +99,12 @@ export function toDirectoryCard(b: DirectoryBusiness): DirectoryCard {
 }
 
 // ---------------------------------------------------------------------------
-// Catalog I/O (account-scoped chip for the owner listing + seed data)
+// Seed catalog (read-only demo fallback)
 // ---------------------------------------------------------------------------
 
-function catalogKey(): string {
-  return "bizledger:directory:catalog";
-}
-
-export function readCatalog(): DirectoryBusiness[] {
-  const raw = safeGet(catalogKey());
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as DirectoryBusiness[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-export function writeCatalog(list: DirectoryBusiness[]): void {
-  safeSet(catalogKey(), JSON.stringify(list));
-}
-
-// Seed catalog: a small read-only set of sample published businesses so a brand
-// new account's directory is populated/searchable without depending on admin.
+// A small read-only set of sample published businesses used ONLY when the
+// backend serves zero published listings, so a brand-new account's directory
+// is still populated without depending on the admin app.
 export function getSeedBusinesses(): DirectoryBusiness[] {
   const now = "2026-01-05T00:00:00.000Z";
   const seed: DirectoryBusiness[] = [
@@ -272,56 +245,22 @@ export function getSeedBusinesses(): DirectoryBusiness[] {
   return seed;
 }
 
-// Ensure the catalog is seeded exactly once (idempotent).
-export function ensureCatalogSeeded(): DirectoryBusiness[] {
-  const existing = readCatalog();
-  if (existing.length > 0) return existing;
-  const seeded = getSeedBusinesses();
-  writeCatalog(seeded);
-  return seeded;
-}
-
-// Merged discovery view: catalog (seeded + admin-managed where present) plus
-// any locally PUBLISHED owner listings.
-function readDiscoveryPool(): DirectoryBusiness[] {
-  const catalog = readCatalog();
-  const pool = catalog.length > 0 ? catalog : getSeedBusinesses();
-  return pool;
+// Resolve a seed listing by id — returns a PUBLISHED seed or null.
+export function getSeedBusiness(id: string): DirectoryBusiness | null {
+  return (
+    getSeedBusinesses().find((b) => b.id === id && b.status === "Published") ?? null
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Visitor-facing read API (searchable/filterable, PUBLISHED only)
+// Visitor-facing pure helpers (searchable/filterable, PUBLISHED input only)
 // ---------------------------------------------------------------------------
 
 export interface DirectoryFilters {
   query?: string;
-  businessType?: DirectoryBusinessType | "All";
+  businessType?: DirectoryBusiness["businessType"] | "All";
   category?: string;
   state?: string;
-}
-
-export function getPublishedDirectoryBusinesses(): DirectoryBusiness[] {
-  return readDiscoveryPool()
-    .filter((b) => b.status === "Published" && !!b.companyName?.trim())
-    .map(toPublicBusiness);
-}
-
-export function getDirectoryBusiness(id: string): DirectoryBusiness | null {
-  const found = readDiscoveryPool().find((b) => b.id === id);
-  // Unpublished listings are not exposed to visitors at all.
-  if (!found || found.status !== "Published") return null;
-  return toPublicBusiness(found);
-}
-
-// Strip internal-only fields before anything is handed to visitors. Only
-// intentionally-public fields reach publish/discovery surfaces; accountId (the
-// owning tenant) and other internal metadata are never exposed.
-export function toPublicBusiness(b: DirectoryBusiness): DirectoryBusiness {
-  const { accountId: _accountId, logoUrl, ...rest } = b;
-  return {
-    ...rest,
-    logoUrl,
-  } as DirectoryBusiness;
 }
 
 function normalizeQuery(q: string): string {
@@ -383,24 +322,12 @@ export function getDirectoryStates(businesses: DirectoryBusiness[]): string[] {
 }
 
 // ---------------------------------------------------------------------------
-// Owner I/O (account-scoped; the owner manages ONLY their own listing)
+// Owner I/O (business-scoped on the backend at /api/directory/mine)
 // ---------------------------------------------------------------------------
-
-export function getMyDirectoryListing(accountId: string): DirectoryBusiness | null {
-  if (!accountId) return null;
-  const raw = safeGet(dataKey(accountId, DIRECTORY_ENTITY));
-  if (!raw) return null;
-  try {
-    const parsed = JSON.parse(raw);
-    return parsed && parsed.accountId === accountId ? (parsed as DirectoryBusiness) : null;
-  } catch {
-    return null;
-  }
-}
 
 export interface DirectoryDraft {
   companyName: string;
-  businessType: DirectoryBusinessType;
+  businessType: DirectoryBusiness["businessType"];
   categories: string[];
   description: string;
   streetAddress: string;
@@ -417,117 +344,21 @@ export interface DirectoryDraft {
   gstin?: string;
 }
 
-function applyDraft(base: DirectoryBusiness, draft: DirectoryDraft): DirectoryBusiness {
-  return {
-    ...base,
-    companyName: draft.companyName.trim(),
-    businessType: draft.businessType,
-    categories: draft.categories,
-    description: draft.description.trim(),
-    streetAddress: draft.streetAddress.trim(),
-    city: draft.city.trim(),
-    state: draft.state,
-    stateCode: draft.stateCode || stateCodeFromName(draft.state),
-    pincode: draft.pincode.trim(),
-    landmark: draft.landmark?.trim() || undefined,
-    ownerName: draft.ownerName.trim(),
-    primaryPhone: draft.primaryPhone.trim(),
-    alternatePhone: draft.alternatePhone?.trim() || undefined,
-    email: draft.email?.trim() || undefined,
-    website: draft.website?.trim() || undefined,
-    gstin: draft.gstin?.trim() || undefined,
-    gstStatus: gstStatusFromGstin(draft.gstin),
-    updatedAt: new Date().toISOString(),
-  };
+// In-memory mirror of the caller's own listing, populated by the API layer
+// (src/lib/api/directory.ts). Used ONLY for synchronous plan-usage lookups
+// (the directoryListings gauge); never as the source of truth.
+const mineCache = new Map<string, DirectoryBusiness>();
+
+export function setMyDirectoryListingCache(
+  businessId: string,
+  listing: DirectoryBusiness | null
+): void {
+  if (listing) mineCache.set(businessId, listing);
+  else mineCache.delete(businessId);
 }
 
-// Save a draft WITHOUT publishing. Owner listing remains private until the
-// owner explicitly submits for review/publishing.
-//
-// `enforcement` carries the plan-entitlement decision from the caller. When it
-// is provided and NOT allowed, the write is REJECTED (throws) and no record is
-// created — enforcing the paid "Business Network" gate at the service layer,
-// not just in the UI. Passing null keeps the pre-gate behaviour (used by
-// legacy call sites and unit tests that exercise the pure layer directly).
-export function saveDirectoryListing(
-  accountId: string,
-  draft: DirectoryDraft,
-  existing?: DirectoryBusiness | null,
-  enforcement?: DirectoryEntitlement | null
-): DirectoryBusiness {
-  if (enforcement && !enforcement.allowed) {
-    throw new Error(
-      "Business Network is not included in your current plan. Upgrade to create a directory listing."
-    );
-  }
-  const now = new Date().toISOString();
-  const base: DirectoryBusiness =
-    existing && existing.accountId === accountId
-      ? existing
-      : {
-          id: `dir-${generateId("")}`,
-          accountId,
-          status: "Not Listed",
-          createdAt: now,
-          updatedAt: now,
-          logoUrl: undefined,
-          gstStatus: "Not Provided",
-          businessType: "Dealer",
-          categories: [],
-          companyName: "",
-          description: "",
-          streetAddress: "",
-          city: "",
-          state: "",
-          stateCode: undefined,
-          pincode: "",
-          ownerName: "",
-          primaryPhone: "",
-        };
-  const updated = applyDraft(base, draft);
-  safeSet(dataKey(accountId, DIRECTORY_ENTITY), JSON.stringify(updated));
-  return updated;
-}
-
-// Owner submits their listing for publishing → admin moderation flow.
-export function submitDirectoryListing(
-  accountId: string,
-  draft: DirectoryDraft,
-  enforcement?: DirectoryEntitlement | null
-): DirectoryBusiness {
-  if (enforcement && !enforcement.allowed) {
-    throw new Error(
-      "Business Network is not included in your current plan. Upgrade to publish a directory listing."
-    );
-  }
-  const existing = getMyDirectoryListing(accountId);
-  const saved = saveDirectoryListing(accountId, draft, existing, enforcement);
-  // A previously approved listing that is edited stays Published; brand-new or
-  // previously Rejected/Unlisted submissions enter moderation.
-  const next =
-    saved.status === "Published"
-      ? saved
-      : { ...saved, status: "Pending Review" as DirectoryListingStatus };
-  next.updatedAt = new Date().toISOString();
-  safeSet(dataKey(accountId, DIRECTORY_ENTITY), JSON.stringify(next));
-  return next;
-}
-
-// Owner hides their listing from the directory (opt-out). No destructive
-// delete — the authored content is retained locally for a future re-list.
-export function unlistMyBusiness(accountId: string): void {
-  const existing = getMyDirectoryListing(accountId);
-  if (!existing) return;
-  const updated: DirectoryBusiness = {
-    ...existing,
-    status: "Not Listed",
-    updatedAt: new Date().toISOString(),
-  };
-  safeSet(dataKey(accountId, DIRECTORY_ENTITY), JSON.stringify(updated));
-}
-
-export function removeMyDirectoryListing(accountId: string): void {
-  safeRemove(dataKey(accountId, DIRECTORY_ENTITY));
+export function getMyDirectoryListingCache(businessId: string): DirectoryBusiness | null {
+  return mineCache.get(businessId) ?? null;
 }
 
 // Compose a tel: link for a listing, only when a phone is present. The number
@@ -567,4 +398,8 @@ export function directoryEntitlement(
     limit: owned,
     reason: allowed ? "ok" : "limit",
   };
+}
+
+function isUnlimited(value: number | "Unlimited"): value is "Unlimited" {
+  return value === "Unlimited";
 }

@@ -63,9 +63,9 @@ export const TopNavBar: React.FC<TopNavBarProps> = ({
     return () => document.removeEventListener("mousedown", onClickOutside);
   }, []);
 
-  const handleLogout = () => {
+  const handleLogout = async () => {
     setMenuOpen(false);
-    logout();
+    await logout();
     router.replace("/");
   };
 

@@ -15,21 +15,22 @@ export default function LoginPage() {
   const { login, account } = useAuth();
   const { onboarding } = useApp();
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
-    if (!email.trim()) {
-      setError("Please enter the email you signed up with.");
+    if (!email.trim() || !password) {
+      setError("Please enter your email address and password.");
       return;
     }
     setSubmitting(true);
-    const ok = login(email);
-    if (!ok) {
+    const result = await login({ email, password });
+    if (!result.ok) {
       setSubmitting(false);
-      setError("No account found with this email. Please create an account first.");
+      setError(result.error);
       return;
     }
     // Resume the onboarding wizard if the account never finished setup.
@@ -66,6 +67,16 @@ export default function LoginPage() {
             icon="mail"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
+          />
+
+          <Input
+            label="Password"
+            type="password"
+            placeholder="••••••••"
+            icon="lock"
+            className="mt-4"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
           />
 
           {error && (

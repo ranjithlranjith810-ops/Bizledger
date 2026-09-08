@@ -42,6 +42,21 @@ import {
   EMPTY_COMPANY_PROFILE,
 } from "@/data/mockData";
 import { dataKey } from "@/lib/storage";
+import { resolveInitialOnboardingState } from "@/lib/constants";
+import { http, ApiError } from "@/lib/api-client";
+import { billingApi } from "@/lib/api/billing";
+import { customersApi, toBackendInput as customerToBackendInput } from "@/lib/api/customers";
+import { productsApi } from "@/lib/api/products";
+import { financialYearsApi, toFrontend as fyToFrontend, FinancialYearBackend } from "@/lib/api/financialYears";
+import { invoicesApi, toBackendInput as invoiceToBackendInput, fromBackendInvoice } from "@/lib/api/invoices";
+import { quotationsApi, toBackendInput as quotationToBackendInput, fromBackendQuotation } from "@/lib/api/quotations";
+import { estimatesApi, toBackendInput as estimateToBackendInput, fromBackendEstimate } from "@/lib/api/estimates";
+import { purchaseOrdersApi, toBackendInput as poToBackendInput, fromBackendPurchaseOrder } from "@/lib/api/purchaseOrders";
+import { expensesApi, toBackendInput as expenseToBackendInput, fromBackendExpense } from "@/lib/api/expenses";
+import { vehiclesApi, toBackendInput as vehicleToBackendInput, fromBackendVehicle } from "@/lib/api/vehicles";
+import { teamApi, toBackendInput as teamToBackendInput, fromBackendMember } from "@/lib/api/team";
+import { notificationsApi, fromBackendNotification } from "@/lib/api/notifications";
+import { notifyBusinessScopeChanged } from "@/lib/business-scope";
 import { useAuth } from "@/context/AuthContext";
 import {
   buildInvoiceNumber,
@@ -73,21 +88,21 @@ import {
   ResourceUsage,
 } from "@/lib/entitlements";
 import { getEffectivePlan } from "@/lib/plans";
-import { getMyDirectoryListing } from "@/lib/directory";
+import { getMyDirectoryListingCache } from "@/lib/directory";
+import {
+  defaultSubscriptionState,
+  deriveSubscriptionStatus,
+  resolveServerSubscription,
+  SubscriptionLifecycle,
+} from "@/lib/billing/subscription-loader";
 
 const AppContext = createContext<AppContextType | undefined>(undefined);
 
-// Safe localStorage read (guarded for SSR)
+// localStorage-backed hydration is retired: the backend (PostgreSQL) is now the
+// source of truth for all per-domain entity state. readStorage therefore always
+// returns the fallback so ignored stale keyed data can never re-enter state.
 function readStorage<T>(key: string, fallback: T): () => T {
-  return () => {
-    if (typeof window === "undefined") return fallback;
-    try {
-      const saved = localStorage.getItem(key);
-      return saved ? (JSON.parse(saved) as T) : fallback;
-    } catch {
-      return fallback;
-    }
-  };
+  return () => fallback;
 }
 
 // Module-scope impure helpers. Kept OUTSIDE the provider component so the
@@ -139,7 +154,10 @@ function sellerStateCode(stateName: string): string {
   return m ? m[1] : "";
 }
 
-export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+export const AppProvider: React.FC<{
+  children: React.ReactNode;
+  activeBusinessId?: string | null;
+}> = ({ children, activeBusinessId: businessId = null }) => {
   const { account } = useAuth();
   const activeAccountId = account?.id ?? null;
   const [activeRoute, setActiveRoute] = useState<string>("dashboard");
@@ -158,12 +176,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   // Onboarding wizard progress (per account). New accounts start incomplete so
-  // they are routed through /onboarding before reaching the dashboard.
+  // they are routed through /onboarding before reaching the dashboard. The
+  // initial value is derived from the resolved backend business: a returning
+  // account that already created its tenant resumes onboarded (full page loads,
+  // refreshes, and native back navigation all restore completion correctly,
+  // instead of the retired localStorage hydration that reset to incomplete).
   const [onboarding, setOnboarding] = useState<OnboardingState>(() =>
-    readStorage<OnboardingState>(
-      activeAccountId ? dataKey(activeAccountId, "onboarding") : "",
-      { completed: false, currentStep: 0 }
-    )()
+    resolveInitialOnboardingState({ activeAccountId, businessId })
   );
 
   // Financial years (per account) + which one is currently active. Seeded with
@@ -186,6 +205,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return saved || null;
   });
 
+  // Backend-known financial year ids (null = backend not consulted yet for this
+  // business scope). Drives the sync of locally-created years to the backend.
+  const [backendFyIds, setBackendFyIds] = useState<string[] | null>(null);
+
   const getActiveFinancialYear = (): FinancialYearSettings | undefined => {
     if (activeFinancialYearId) {
       const found = financialYears.find((fy) => fy.id === activeFinancialYearId);
@@ -198,8 +221,100 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setOnboarding((prev) => ({ ...prev, currentStep: step }));
   };
 
-  const completeOnboarding = () => {
+  const completeOnboarding = async () => {
     setOnboarding((prev) => ({ ...prev, completed: true, currentStep: 6 }));
+    // The backend business is the tenant scope for every API request. Create it
+    // from the onboarding company profile when this is the user's first business
+    // (a fresh auth user has none yet). The scope provider re-resolves and
+    // updates activeBusinessId so later requests are correctly tenanted.
+    if (activeAccountId && businessId === null && companyProfile.companyName.trim()) {
+      try {
+        const created = await http.post<{ id: string }>("/api/businesses", {
+          name: companyProfile.companyName.trim(),
+          legalName: companyProfile.companyName.trim(),
+        });
+        if (created?.id) {
+          // Backfill the onboarding-created financial years (they were saved
+          // locally while no business existed yet) and activate the active one.
+          for (const fy of financialYears) {
+            await financialYearsApi
+              .create(created.id, { name: fy.name, startDate: fy.startDate, endDate: fy.endDate })
+              .then((res) => {
+                if (res?.financialYear?.id && activeFinancialYearId === fy.id) {
+                  void financialYearsApi.activate(created.id, res.financialYear.id).catch(() => {});
+                }
+              })
+              .catch(() => {});
+          }
+          notifyBusinessScopeChanged();
+        }
+      } catch {
+        // The wizard still completes locally; the next reload re-attempts via
+        // the scope provider's GET /api/businesses when the backend is up.
+      }
+    }
+  };
+
+  // Domain 5: financial years are backend-authoritative once the scope resolves.
+  // When the backend has years they REPLACE the local cache (server decides name
+  // and the single active year). An empty backend (pre-onboarding) leaves the
+  // local default years in place so the wizard stays usable.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    financialYearsApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const list: FinancialYearBackend[] = Array.isArray(data.financialYears)
+          ? data.financialYears
+          : [];
+        if (list.length > 0) {
+          const mapped = list.map(fyToFrontend);
+          setFinancialYears(mapped);
+          const activeFy = list.find((f) => f.isActive) ?? list[0];
+          if (activeFy) setActiveFinancialYearId(activeFy.id);
+          setBackendFyIds(mapped.map((m) => m.id));
+        } else {
+          setBackendFyIds([]);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Sync a financial year to the backend inside the given business scope.
+  const syncFy = (bizId: string, fy: FinancialYearSettings) => {
+    void (async () => {
+      try {
+        const { financialYear } = await financialYearsApi.create(bizId, {
+          name: fy.name,
+          startDate: fy.startDate,
+          endDate: fy.endDate,
+        });
+        if (financialYear?.id) {
+          const mapped = fyToFrontend(financialYear);
+          setFinancialYears((prev) =>
+            prev.map((y) => (y.id === fy.id ? mapped : y)),
+          );
+          if (activeFinancialYearId === fy.id) {
+            setActiveFinancialYearId(mapped.id);
+            if (financialYear.isActive !== true) {
+              await financialYearsApi.activate(bizId, mapped.id).catch(() => {});
+            }
+          }
+          setBackendFyIds((prev) =>
+            prev ? [...prev, mapped.id] : [mapped.id],
+          );
+        }
+      } catch {
+        // Backend not ready (e.g. offline): the local years remain usable and
+        // the next successful scope load reconciles them.
+      }
+    })();
   };
 
   const addFinancialYear = (fy: Omit<FinancialYearSettings, "id">): FinancialYearSettings => {
@@ -214,6 +329,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       [next.id]: { invoice: 1, quotation: 1, estimate: 1, purchaseOrder: 1 },
     }));
     if (!activeFinancialYearId) setActiveFinancialYearId(next.id);
+    if (businessId) syncFy(businessId, next);
     return next;
   };
 
@@ -240,6 +356,17 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       prev[id] ? prev : { ...prev, [id]: { invoice: 1, quotation: 1, estimate: 1, purchaseOrder: 1 } }
     );
     setActiveFinancialYearId(id);
+    if (businessId && id) {
+      financialYearsApi.activate(businessId, id).catch(() => {
+        addNotification({
+          type: "error",
+          title: "Could Not Switch Year",
+          message:
+            "The active financial year could not be saved to the server. Reload the app to revert.",
+          icon: "error",
+        });
+      });
+    }
   };
 
   const [expenses, setExpenses] = useState<Expense[]>(() =>
@@ -258,13 +385,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     readStorage<TeamMember[]>(activeAccountId ? dataKey(activeAccountId, "team") : "", [])()
   );
 
-  const defaultSubscription = (): SubscriptionState => ({
-    currentPlanId: null,
-    status: "none",
-    billing: { period: "month", startedAt: null, renewsAt: null, amount: 0, gstRate: 18 },
-    pendingPlanId: null,
-    pendingPeriod: "month",
-  });
+  const defaultSubscription = (): SubscriptionState => defaultSubscriptionState();
 
   // SINGLE source of truth for subscription state (active plan, status, billing dates,
   // pending checkout selection). Persisted as one account-scoped key.
@@ -307,6 +428,23 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     return defaultSubscription();
   });
 
+  // Explicit subscription lifecycle: loading → ready | error. This is distinct
+  // from status "none" — it represents "server answer pending" vs "server
+  // confirmed no paid subscription". The billing page uses this to render
+  // skeleton during loading and an error panel on failure, never falsely Free.
+  //
+  // `ready`/`error` are stored alongside the businessId they belong to; the
+  // exposed `subscriptionStatus` is DERIVED in render so a business change shows
+  // "loading" without a synchronous setState (which would trigger cascading
+  // renders per the compiler lint rule).
+  const [subscriptionLifecycle, setSubscriptionLifecycle] = useState<SubscriptionLifecycle>({
+    businessId: null,
+    status: "ready",
+  });
+  const subscriptionStatus = deriveSubscriptionStatus(businessId, subscriptionLifecycle);
+  const [subscriptionReloadKey, setSubscriptionReloadKey] = useState(0);
+  const retrySubscription = () => setSubscriptionReloadKey((k) => k + 1);
+
   // ACTIVE plan derived from subscription state (a failed/cancelled payment keeps
   // the previous plan active; only a successful payment switches it).
   // `getEffectivePlan` NEVER returns null for a valid account — when there is no
@@ -314,6 +452,34 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   // 2 / products 5 / team 0 / invoices 5 correctly govern instead of collapsing
   // to 0 (which previously surfaced as misleading "allows up to 0 X" messages).
   const activePlan = getEffectivePlan(subscription);
+
+  // Backend subscription sync: once the webhook activates a paid subscription,
+  // the server is authoritative. `billingApi.getSubscription` returns the ACTIVE
+  // subscription (or null when the business has none), and only activation is
+  // applied here — a paid plan never reverts below the Free plan, and a missing
+  // answer (backend down / still PENDING) leaves the current state untouched.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    billingApi
+      .getSubscription(businessId)
+      .then((data) => {
+        if (!active) return;
+        setSubscription((prev) =>
+          resolveServerSubscription(prev, data?.subscription),
+        );
+        setSubscriptionLifecycle({ businessId, status: "ready" });
+      })
+      .catch(() => {
+        if (!active) return;
+        setSubscriptionLifecycle({ businessId, status: "error" });
+        // Do NOT touch subscription state — keep whatever we had.
+      });
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId, subscriptionReloadKey]);
 
   // Emit a consistent upgrade-prompt notification when an action is blocked by
   // the active plan's entitlement limits. The wording is resource-aware so the
@@ -430,98 +596,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     item: Customer | Product | Invoice | Quotation | Estimate | PurchaseOrder;
   } | null>(null);
 
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "company"), JSON.stringify(companyProfile));
-  }, [activeAccountId, companyProfile]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "onboarding"), JSON.stringify(onboarding));
-  }, [activeAccountId, onboarding]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "financial_years"), JSON.stringify(financialYears));
-  }, [activeAccountId, financialYears]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(
-      dataKey(activeAccountId, "active_financial_year"),
-      JSON.stringify(activeFinancialYearId)
-    );
-  }, [activeAccountId, activeFinancialYearId]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "expenses"), JSON.stringify(expenses));
-  }, [activeAccountId, expenses]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "vehicles"), JSON.stringify(vehicles));
-  }, [activeAccountId, vehicles]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "vehicle_expenses"), JSON.stringify(vehicleExpenses));
-  }, [activeAccountId, vehicleExpenses]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "team"), JSON.stringify(teamMembers));
-  }, [activeAccountId, teamMembers]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "subscription"), JSON.stringify(subscription));
-  }, [activeAccountId, subscription]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "payments"), JSON.stringify(paymentHistory));
-  }, [activeAccountId, paymentHistory]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "invoices"), JSON.stringify(invoices));
-  }, [activeAccountId, invoices]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "quotations"), JSON.stringify(quotations));
-  }, [activeAccountId, quotations]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "estimates"), JSON.stringify(estimates));
-  }, [activeAccountId, estimates]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "purchaseOrders"), JSON.stringify(purchaseOrders));
-  }, [activeAccountId, purchaseOrders]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, SEQUENCES_KEY), JSON.stringify(docSequences));
-  }, [activeAccountId, docSequences]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "notifications"), JSON.stringify(notifications));
-  }, [activeAccountId, notifications]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "customers"), JSON.stringify(customers));
-  }, [activeAccountId, customers]);
-
-  useEffect(() => {
-    if (!activeAccountId) return;
-    localStorage.setItem(dataKey(activeAccountId, "products"), JSON.stringify(products));
-  }, [activeAccountId, products]);
+  
 
   const addNotification = (notif: { type: NotificationItem["type"]; title: string; message: string; icon?: string; iconColor?: string }) => {
     const newNotif: NotificationItem = {
@@ -539,10 +614,12 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const removeNotification = (id: string) => {
     setNotifications((prev) => prev.filter((n) => n.id !== id));
+    void notificationsApi.dismiss(id).catch(() => {});
   };
 
   const markAllNotificationsRead = () => {
     setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    void notificationsApi.markAllRead(businessId || undefined).catch(() => {});
   };
 
   // Mark a SINGLE notification as read (the per-item "Mark as Read" action).
@@ -551,6 +628,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setNotifications((prev) =>
       prev.map((n) => (n.id === id ? { ...n, read: true } : n))
     );
+    void notificationsApi.markRead(id).catch(() => {});
   };
 
   const confirmDelete = (state: DeleteConfirmState) => {
@@ -591,16 +669,40 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addExpense = (newExpData: Omit<Expense, "id" | "createdAt">) => {
-    const newExp: Expense = {
+    const tempId = `exp-${Date.now()}`;
+    const optimistic: Expense = {
       ...newExpData,
-      id: `exp-${Date.now()}`,
+      id: tempId,
       createdAt: new Date().toISOString(),
     };
-    setExpenses((prev) => [newExp, ...prev]);
+    setExpenses((prev) => [optimistic, ...prev]);
+    if (businessId) {
+      void (async () => {
+        try {
+          const { expense: created } = await expensesApi.create(
+            businessId,
+            expenseToBackendInput(optimistic),
+          );
+          if (created?.id) {
+            setExpenses((prev) =>
+              prev.map((e) => (e.id === tempId ? fromBackendExpense(created) : e)),
+            );
+          }
+        } catch {
+          setExpenses((prev) => prev.filter((e) => e.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Save Expense",
+            message: "The expense could not be saved to the server. Your change was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Expense Recorded",
-      message: `Expense ${newExp.expenseNumber} for ₹${newExp.amount.toLocaleString("en-IN")} was saved successfully.`,
+      message: `Expense ${optimistic.expenseNumber} for ₹${optimistic.amount.toLocaleString("en-IN")} was saved successfully.`,
       icon: "check_circle",
     });
   };
@@ -609,6 +711,29 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setExpenses((prev) =>
       prev.map((exp) => (exp.id === expense.id ? expense : exp))
     );
+    if (businessId) {
+      void (async () => {
+        try {
+          const { expense: updated } = await expensesApi.update(
+            businessId,
+            expense.id,
+            expenseToBackendInput(expense),
+          );
+          if (updated?.id) {
+            setExpenses((prev) =>
+              prev.map((e) => (e.id === updated.id ? fromBackendExpense(updated) : e)),
+            );
+          }
+        } catch {
+          addNotification({
+            type: "error",
+            title: "Could Not Update Expense",
+            message: "The expense update could not be saved to the server. Reload the app to revert.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Expense Updated",
@@ -620,6 +745,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const deleteExpense = (id: string) => {
     const target = expenses.find((e) => e.id === id);
     setExpenses((prev) => prev.filter((e) => e.id !== id));
+    if (businessId) {
+      void (async () => {
+        try {
+          await expensesApi.remove(businessId, id);
+        } catch {
+          addNotification({
+            type: "error",
+            title: "Could Not Delete Expense",
+            message: "The expense could not be deleted on the server. Reload the app to revert.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "info",
       title: "Expense Removed",
@@ -629,20 +768,46 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addVehicle = (vehData: Omit<Vehicle, "id" | "totalExpenses" | "fuelExpenses" | "maintenanceExpenses" | "tollExpenses" | "otherExpenses">) => {
-    const newVeh: Vehicle = {
+    const tempId = `veh-${Date.now()}`;
+    const optimistic: Vehicle = {
       ...vehData,
-      id: `veh-${Date.now()}`,
+      id: tempId,
       totalExpenses: 0,
       fuelExpenses: 0,
       maintenanceExpenses: 0,
       tollExpenses: 0,
       otherExpenses: 0,
     };
-    setVehicles((prev) => [newVeh, ...prev]);
+    setVehicles((prev) => [optimistic, ...prev]);
+    if (businessId) {
+      void (async () => {
+        try {
+          const { vehicle: created } = await vehiclesApi.create(
+            businessId,
+            vehicleToBackendInput(optimistic),
+          );
+          if (created?.id) {
+            setVehicles((prev) =>
+              prev.map((v) =>
+                v.id === tempId ? fromBackendVehicle(created) : v,
+              ),
+            );
+          }
+        } catch {
+          setVehicles((prev) => prev.filter((v) => v.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Add Vehicle",
+            message: "The vehicle could not be saved to the server. Your change was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Vehicle Added",
-      message: `Vehicle ${newVeh.registrationNumber} (${newVeh.makeModel}) registered in fleet.`,
+      message: `Vehicle ${optimistic.registrationNumber} (${optimistic.makeModel}) registered in fleet.`,
       icon: "local_shipping",
     });
   };
@@ -651,10 +816,49 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setVehicles((prev) =>
       prev.map((v) => (v.id === vehicle.id ? vehicle : v))
     );
+    if (businessId) {
+      void (async () => {
+        try {
+          const { vehicle: updated } = await vehiclesApi.update(
+            businessId,
+            vehicle.id,
+            vehicleToBackendInput(vehicle),
+          );
+          if (updated?.id) {
+            setVehicles((prev) =>
+              prev.map((v) =>
+                v.id === updated.id ? fromBackendVehicle(updated) : v,
+              ),
+            );
+          }
+        } catch {
+          addNotification({
+            type: "error",
+            title: "Could Not Update Vehicle",
+            message: "The vehicle update could not be saved to the server. Reload the app to revert.",
+            icon: "error",
+          });
+        }
+      })();
+    }
   };
 
   const deleteVehicle = (id: string) => {
     setVehicles((prev) => prev.filter((v) => v.id !== id));
+    if (businessId) {
+      void (async () => {
+        try {
+          await vehiclesApi.remove(businessId, id);
+        } catch {
+          addNotification({
+            type: "error",
+            title: "Could Not Delete Vehicle",
+            message: "The vehicle could not be deleted on the server. Reload the app to revert.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "info",
       title: "Vehicle Removed",
@@ -689,31 +893,70 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       createdBy: "Fleet Officer",
       createdAt: new Date().toISOString(),
     };
+    // The linked expense is persisted to the backend (POST /api/expenses with the
+    // vehicleId link) so it survives reloads and feeds the vehicle's server-side
+    // expense aggregates. The vehicleExpenses record stays a local UI mirror.
+    const tempExpId = linkedExpense.id;
     setExpenses((prev) => [linkedExpense, ...prev]);
 
-    setVehicles((prev) =>
-      prev.map((v) => {
-        if (v.id === veData.vehicleId) {
-          const isFuel = veData.category === "Fuel";
-          const isMaint =
-            veData.category === "Service & Maintenance" ||
-            veData.category === "Tyre" ||
-            veData.category === "Repairs";
-          const isToll = veData.category === "Fastag / Toll";
-          return {
-            ...v,
-            currentOdometer: Math.max(v.currentOdometer, veData.odometerReading || 0),
-            totalExpenses: v.totalExpenses + veData.amount,
-            fuelExpenses: isFuel ? v.fuelExpenses + veData.amount : v.fuelExpenses,
-            maintenanceExpenses: isMaint ? v.maintenanceExpenses + veData.amount : v.maintenanceExpenses,
-            tollExpenses: isToll ? v.tollExpenses + veData.amount : v.tollExpenses,
-            otherExpenses: !isFuel && !isMaint && !isToll ? v.otherExpenses + veData.amount : v.otherExpenses,
-            lastServiceDate: isMaint ? veData.date : v.lastServiceDate,
-          };
+    const applyVehicleTotals = (dir: 1 | -1) => {
+      setVehicles((prev) =>
+        prev.map((v) => {
+          if (v.id === veData.vehicleId) {
+            const isFuel = veData.category === "Fuel";
+            const isMaint =
+              veData.category === "Service & Maintenance" ||
+              veData.category === "Tyre" ||
+              veData.category === "Repairs";
+            const isToll = veData.category === "Fastag / Toll";
+            const delta = dir * veData.amount;
+            return {
+              ...v,
+              currentOdometer:
+                dir === 1
+                  ? Math.max(v.currentOdometer, veData.odometerReading || 0)
+                  : v.currentOdometer,
+              totalExpenses: v.totalExpenses + delta,
+              fuelExpenses: isFuel ? v.fuelExpenses + delta : v.fuelExpenses,
+              maintenanceExpenses: isMaint ? v.maintenanceExpenses + delta : v.maintenanceExpenses,
+              tollExpenses: isToll ? v.tollExpenses + delta : v.tollExpenses,
+              otherExpenses: !isFuel && !isMaint && !isToll ? v.otherExpenses + delta : v.otherExpenses,
+              lastServiceDate: isMaint && dir === 1 ? veData.date : v.lastServiceDate,
+            };
+          }
+          return v;
+        })
+      );
+    };
+    applyVehicleTotals(1);
+
+    if (businessId) {
+      void (async () => {
+        try {
+          const { expense: created } = await expensesApi.create(
+            businessId,
+            expenseToBackendInput(linkedExpense),
+          );
+          if (created?.id) {
+            setExpenses((prev) =>
+              prev.map((e) => (e.id === tempExpId ? fromBackendExpense(created) : e)),
+            );
+          }
+        } catch {
+          // Roll back the optimistic mirrors so the UI matches the server.
+          setExpenses((prev) => prev.filter((e) => e.id !== tempExpId));
+          setVehicleExpenses((prev) => prev.filter((x) => x.id !== newVE.id));
+          applyVehicleTotals(-1);
+          addNotification({
+            type: "error",
+            title: "Could Not Log Vehicle Expense",
+            message: "The vehicle expense could not be saved to the server. No expense was recorded.",
+            icon: "error",
+          });
+          return;
         }
-        return v;
-      })
-    );
+      })();
+    }
 
     addNotification({
       type: "success",
@@ -724,28 +967,49 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   };
 
   const addTeamMember = (memData: Omit<TeamMember, "id" | "lastActive" | "joinedDate">) => {
-    // The account owner is NOT a paid team-member seat, so only ADDITIONAL
-    // (non-owner) members count against the plan's teamMember ceiling. This is
-    // what lets the Free plan allow 0 extra seats while the owner still uses
-    // the app. A member being invited with the "Owner" role is still an added
-    // seat (it represents an additional person, not the account owner).
     const additionalSeatsUsed = additionalTeamSeatsUsed(teamMembers);
     const gate = checkEntitlement(activePlan, "teamMembers", additionalSeatsUsed);
     if (!gate.allowed) {
       notifyEntitlementBlocked("teamMembers", gate);
       return false;
     }
-    const newMember: TeamMember = {
+    const tempId = `tm-${Date.now()}`;
+    const optimistic: TeamMember = {
       ...memData,
-      id: `tm-${Date.now()}`,
+      id: tempId,
       lastActive: "Never (Invitation sent)",
       joinedDate: new Date().toISOString().split("T")[0],
     };
-    setTeamMembers((prev) => [...prev, newMember]);
+    setTeamMembers((prev) => [...prev, optimistic]);
+    if (businessId) {
+      void (async () => {
+        try {
+          const { member: created } = await teamApi.invite(
+            businessId,
+            teamToBackendInput(optimistic),
+          );
+          if (created?.id) {
+            setTeamMembers((prev) =>
+              prev.map((m) =>
+                m.id === tempId ? fromBackendMember(created) : m,
+              ),
+            );
+          }
+        } catch {
+          setTeamMembers((prev) => prev.filter((m) => m.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Invite Member",
+            message: "The invitation could not be sent to the server. No invitation was created.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Team Member Invited",
-      message: `Invitation email dispatched to ${newMember.email} with ${newMember.role} role.`,
+      message: `Invitation email dispatched to ${optimistic.email} with ${optimistic.role} role.`,
       icon: "group",
     });
     return true;
@@ -765,6 +1029,20 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
 
   const deleteTeamMember = (id: string) => {
     setTeamMembers((prev) => prev.filter((m) => m.id !== id));
+    if (businessId) {
+      void (async () => {
+        try {
+          await teamApi.remove(businessId, id);
+        } catch {
+          addNotification({
+            type: "error",
+            title: "Could Not Remove Member",
+            message: "The team member could not be removed on the server. Reload the app to revert.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "info",
       title: "Member Removed",
@@ -902,15 +1180,50 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       notifyEntitlementBlocked("invoices", gate);
       return false;
     }
-    const newInv: Invoice = {
+    const tempId = `inv-${Date.now()}`;
+    const optimistic: Invoice = {
       ...invData,
-      id: `inv-${Date.now()}`,
+      id: tempId,
     };
-    setInvoices((prev) => [newInv, ...prev]);
+    setInvoices((prev) => [optimistic, ...prev]);
+    // The backend is the source of truth for the number and totals: the create
+    // mints the number atomically and recomputes the GST split server-side.
+    // When it succeeds the optimistic row is swapped for the authoritative one;
+    // when it fails the optimistic row is reverted.
+    if (businessId && activeFyId) {
+      void (async () => {
+        try {
+          const { invoice: created } = await invoicesApi.create(
+            businessId,
+            invoiceToBackendInput(optimistic, {
+              financialYearId: activeFyId,
+              prefix: companyProfile.invoicePrefix || "INV",
+              company: companyProfile,
+            }),
+          );
+          if (created?.id) {
+            setInvoices((prev) =>
+              prev.map((inv) =>
+                inv.id === tempId ? fromBackendInvoice(created) : inv,
+              ),
+            );
+          }
+        } catch {
+          setInvoices((prev) => prev.filter((inv) => inv.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Save Invoice",
+            message:
+              "The invoice could not be saved to the server. Your invoice was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Invoice Created",
-      message: `Invoice ${newInv.invoiceNumber} generated for ${newInv.customerName}.`,
+      message: `Invoice ${optimistic.invoiceNumber} generated for ${optimistic.customerName}.`,
       icon: "description",
     });
     return true;
@@ -958,16 +1271,47 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
   // QUOTATIONS
   // ------------------------------------------------------------------
   const addQuotation = (quotationData: Omit<Quotation, "id" | "createdAt">) => {
-    const newQuotation: Quotation = {
+    const tempId = `quot-${Date.now()}`;
+    const optimistic: Quotation = {
       ...quotationData,
-      id: `quot-${Date.now()}`,
+      id: tempId,
       createdAt: new Date().toISOString(),
     };
-    setQuotations((prev) => [newQuotation, ...prev]);
+    setQuotations((prev) => [optimistic, ...prev]);
+    if (businessId && activeFyId) {
+      void (async () => {
+        try {
+          const { quotation: created } = await quotationsApi.create(
+            businessId,
+            quotationToBackendInput(optimistic, {
+              financialYearId: activeFyId,
+              prefix: "QT",
+              company: companyProfile,
+            }),
+          );
+          if (created?.id) {
+            setQuotations((prev) =>
+              prev.map((q) =>
+                q.id === tempId ? fromBackendQuotation(created) : q,
+              ),
+            );
+          }
+        } catch {
+          setQuotations((prev) => prev.filter((q) => q.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Save Quotation",
+            message:
+              "The quotation could not be saved to the server. Your quotation was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Quotation Created",
-      message: `Quotation ${newQuotation.quotationNumber} prepared for ${newQuotation.customerName}.`,
+      message: `Quotation ${optimistic.quotationNumber} prepared for ${optimistic.customerName}.`,
       icon: "request_quote",
     });
   };
@@ -1014,41 +1358,27 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
 
   // Explicit Quotation -> Invoice conversion. Creates a NEW invoice with its
   // OWN invoice number; the quotation is never deleted and stays unchanged.
+  // The backend mints the number and marks the quotation Accepted + converted
+  // in the same transaction (sourceDocument), so the stored invoice and the
+  // converted-quotation reference always agree.
   const convertQuotationToInvoice = (id: string) => {
     const quotation = quotations.find((q) => q.id === id);
-    if (!quotation) return;
+    if (!quotation || quotation.convertedInvoiceId) return;
     const used = countCurrentPeriodInvoices(invoices, subscription);
     const gate = checkEntitlement(activePlan, "invoices", used);
     if (!gate.allowed) {
       notifyEntitlementBlocked("invoices", gate);
       return;
     }
-    const minted = mintSequence("invoice");
-    const invoiceNumber = buildInvoiceNumber(
-      companyProfile.invoicePrefix || "INV",
-      minted.fyName,
-      minted.value
-    );
-    const invoiceItems: InvoiceItem[] = quotation.items.map((it) => ({
-      id: it.id,
-      productId: it.productId,
-      description: it.description,
-      hsnSac: it.hsnSac,
-      quantity: it.quantity,
-      unit: it.unit,
-      unitPrice: it.unitPrice,
-      taxableAmount: it.taxableAmount,
-      gstRate: it.gstRate,
-      taxAmount: it.taxAmount,
-      totalAmount: it.totalAmount,
-    }));
+    const tempId = makeId("inv");
+    const invoiceItems: InvoiceItem[] = quotation.items.map((it) => ({ ...it }));
     const customer = customers.find((c) => c.id === quotation.customerId);
     const pos = placeOfSupplyFromState(customer?.billingAddress?.state || "");
     const taxType = resolveTaxType(sellerStateCode(companyProfile.state), pos.placeOfSupplyCode);
     const split = splitTaxType(quotation.totalTax || 0, taxType);
-    const inv: Invoice = {
-      id: makeId("inv"),
-      invoiceNumber,
+    const preview: Invoice = {
+      id: tempId,
+      invoiceNumber: "",
       customerId: quotation.customerId,
       customerName: quotation.customerName,
       customerGstin: quotation.customerGstin,
@@ -1069,42 +1399,103 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       pricingMode: quotation.pricingMode || "inclusive",
       notes: quotation.notes,
     };
-    setInvoices((prev) => [inv, ...prev]);
-    setQuotations((prev) =>
-      prev.map((q) =>
-        q.id === id
-          ? {
-              ...q,
-              status: "Accepted",
-              convertedInvoiceId: inv.id,
-              convertedInvoiceNumber: invoiceNumber,
-              convertedAt: nowIso(),
-            }
-          : q
-      )
-    );
-    addNotification({
-      type: "success",
-      title: "Quotation Converted to Invoice",
-      message: `Invoice ${invoiceNumber} created from Quotation ${quotation.quotationNumber}.`,
-      icon: "description",
-    });
+    const persist = (created: Invoice) => {
+      setInvoices((prev) => prev.map((inv) => (inv.id === tempId ? created : inv)));
+      setQuotations((prev) =>
+        prev.map((q) =>
+          q.id === id
+            ? {
+                ...q,
+                status: "Accepted",
+                convertedInvoiceId: created.id,
+                convertedInvoiceNumber: created.invoiceNumber,
+                convertedAt: nowIso(),
+              }
+            : q
+        )
+      );
+      addNotification({
+        type: "success",
+        title: "Quotation Converted to Invoice",
+        message: `Invoice ${created.invoiceNumber} created from Quotation ${quotation.quotationNumber}.`,
+        icon: "description",
+      });
+    };
+    const fail = () => {
+      setInvoices((prev) => prev.filter((inv) => inv.id !== tempId));
+      addNotification({
+        type: "error",
+        title: "Could Not Convert Quotation",
+        message: "The quotation could not be converted. No invoice was created.",
+        icon: "error",
+      });
+    };
+    setInvoices((prev) => [preview, ...prev]);
+    if (businessId && activeFyId) {
+      const payload = invoiceToBackendInput(preview, {
+        financialYearId: activeFyId,
+        prefix: companyProfile.invoicePrefix || "INV",
+        company: companyProfile,
+      });
+      payload.sourceDocument = { type: "quotation", id: quotation.id };
+      void (async () => {
+        try {
+          const { invoice } = await invoicesApi.create(businessId, payload);
+          persist(fromBackendInvoice(invoice));
+        } catch {
+          fail();
+        }
+      })();
+    } else {
+      fail();
+    }
   };
 
   // ------------------------------------------------------------------
   // ESTIMATES
   // ------------------------------------------------------------------
   const addEstimate = (estimateData: Omit<Estimate, "id" | "createdAt">) => {
-    const newEstimate: Estimate = {
+    const tempId = `est-${Date.now()}`;
+    const optimistic: Estimate = {
       ...estimateData,
-      id: `est-${Date.now()}`,
+      id: tempId,
       createdAt: new Date().toISOString(),
     };
-    setEstimates((prev) => [newEstimate, ...prev]);
+    setEstimates((prev) => [optimistic, ...prev]);
+    if (businessId && activeFyId) {
+      void (async () => {
+        try {
+          const { estimate: created } = await estimatesApi.create(
+            businessId,
+            estimateToBackendInput(optimistic, {
+              financialYearId: activeFyId,
+              prefix: "EST",
+              company: companyProfile,
+            }),
+          );
+          if (created?.id) {
+            setEstimates((prev) =>
+              prev.map((e) =>
+                e.id === tempId ? fromBackendEstimate(created) : e,
+              ),
+            );
+          }
+        } catch {
+          setEstimates((prev) => prev.filter((e) => e.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Save Estimate",
+            message:
+              "The estimate could not be saved to the server. Your estimate was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Estimate Created",
-      message: `Estimate ${newEstimate.estimateNumber} prepared for ${newEstimate.customerName}.`,
+      message: `Estimate ${optimistic.estimateNumber} prepared for ${optimistic.customerName}.`,
       icon: "receipt",
     });
   };
@@ -1149,17 +1540,17 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
 
   const advanceEstimateSequence = () => mintSequence("estimate").value;
 
-  // Explicit Estimate -> Quotation conversion. Creates a NEW quotation with
-  // its own QT number; the estimate stays unchanged.
+  // Explicit Estimate -> Quotation conversion. Creates a NEW quotation with its
+  // own QT number; the estimate stays unchanged. The backend mints the number
+  // and records the estimate's conversion reference (sourceEstimateId).
   const convertEstimateToQuotation = (id: string) => {
     const estimate = estimates.find((e) => e.id === id);
-    if (!estimate) return;
-    const minted = mintSequence("quotation");
-    const quotationNumber = buildDocumentNumber("quotation", minted.fyName, minted.value);
+    if (!estimate || estimate.convertedQuotationId) return;
+    const tempId = makeId("quot");
     const items: InvoiceItem[] = estimate.items.map((it) => ({ ...it }));
-    const quotation: Quotation = {
-      id: makeId("quot"),
-      quotationNumber,
+    const preview: Quotation = {
+      id: tempId,
+      quotationNumber: "",
       customerId: estimate.customerId,
       customerName: estimate.customerName,
       customerGstin: estimate.customerGstin,
@@ -1179,53 +1570,79 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       notes: estimate.notes,
       createdAt: nowIso(),
     };
-    setQuotations((prev) => [quotation, ...prev]);
-    setEstimates((prev) =>
-      prev.map((e) =>
-        e.id === id
-          ? {
-              ...e,
-              status: "Accepted",
-              convertedQuotationId: quotation.id,
-              convertedQuotationNumber: quotationNumber,
-              convertedAt: nowIso(),
-            }
-          : e
-      )
-    );
-    addNotification({
-      type: "success",
-      title: "Estimate Converted to Quotation",
-      message: `Quotation ${quotationNumber} created from Estimate ${estimate.estimateNumber}.`,
-      icon: "request_quote",
-    });
+    const persist = (created: Quotation) => {
+      setQuotations((prev) => prev.map((q) => (q.id === tempId ? created : q)));
+      setEstimates((prev) =>
+        prev.map((e) =>
+          e.id === id
+            ? {
+                ...e,
+                status: "Accepted",
+                convertedQuotationId: created.id,
+                convertedQuotationNumber: created.quotationNumber,
+                convertedAt: nowIso(),
+              }
+            : e
+        )
+      );
+      addNotification({
+        type: "success",
+        title: "Estimate Converted to Quotation",
+        message: `Quotation ${created.quotationNumber} created from Estimate ${estimate.estimateNumber}.`,
+        icon: "request_quote",
+      });
+    };
+    const fail = () => {
+      setQuotations((prev) => prev.filter((q) => q.id !== tempId));
+      addNotification({
+        type: "error",
+        title: "Could Not Convert Estimate",
+        message: "The estimate could not be converted. No quotation was created.",
+        icon: "error",
+      });
+    };
+    setQuotations((prev) => [preview, ...prev]);
+    if (businessId && activeFyId) {
+      const payload = quotationToBackendInput(preview, {
+        financialYearId: activeFyId,
+        prefix: "QT",
+        company: companyProfile,
+      });
+      payload.sourceEstimateId = estimate.id;
+      void (async () => {
+        try {
+          const { quotation } = await quotationsApi.create(businessId, payload);
+          persist(fromBackendQuotation(quotation));
+        } catch {
+          fail();
+        }
+      })();
+    } else {
+      fail();
+    }
   };
 
   // Explicit Estimate -> Invoice conversion. Creates a NEW invoice with its
-  // own INV number; the estimate stays unchanged.
+  // own INV number; the estimate stays unchanged. The backend mints the number
+  // and marks the estimate Accepted + converted (sourceDocument) atomically.
   const convertEstimateToInvoice = (id: string) => {
     const estimate = estimates.find((e) => e.id === id);
-    if (!estimate) return;
+    if (!estimate || estimate.convertedInvoiceId) return;
     const used = countCurrentPeriodInvoices(invoices, subscription);
     const gate = checkEntitlement(activePlan, "invoices", used);
     if (!gate.allowed) {
       notifyEntitlementBlocked("invoices", gate);
       return;
     }
-    const minted = mintSequence("invoice");
-    const invoiceNumber = buildInvoiceNumber(
-      companyProfile.invoicePrefix || "INV",
-      minted.fyName,
-      minted.value
-    );
+    const tempId = makeId("inv");
     const invoiceItems: InvoiceItem[] = estimate.items.map((it) => ({ ...it }));
     const customer = customers.find((c) => c.id === estimate.customerId);
     const pos = placeOfSupplyFromState(customer?.billingAddress?.state || "");
     const taxType = resolveTaxType(sellerStateCode(companyProfile.state), pos.placeOfSupplyCode);
     const split = splitTaxType(estimate.totalTax || 0, taxType);
-    const inv: Invoice = {
-      id: makeId("inv"),
-      invoiceNumber,
+    const preview: Invoice = {
+      id: tempId,
+      invoiceNumber: "",
       customerId: estimate.customerId,
       customerName: estimate.customerName,
       customerGstin: estimate.customerGstin,
@@ -1246,42 +1663,103 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       pricingMode: estimate.pricingMode || "inclusive",
       notes: estimate.notes,
     };
-    setInvoices((prev) => [inv, ...prev]);
-    setEstimates((prev) =>
-      prev.map((e) =>
-        e.id === id
-          ? {
-              ...e,
-              status: "Accepted",
-              convertedInvoiceId: inv.id,
-              convertedInvoiceNumber: invoiceNumber,
-              convertedAt: nowIso(),
-            }
-          : e
-      )
-    );
-    addNotification({
-      type: "success",
-      title: "Estimate Converted to Invoice",
-      message: `Invoice ${invoiceNumber} created from Estimate ${estimate.estimateNumber}.`,
-      icon: "description",
-    });
+    const persist = (created: Invoice) => {
+      setInvoices((prev) => prev.map((inv) => (inv.id === tempId ? created : inv)));
+      setEstimates((prev) =>
+        prev.map((e) =>
+          e.id === id
+            ? {
+                ...e,
+                status: "Accepted",
+                convertedInvoiceId: created.id,
+                convertedInvoiceNumber: created.invoiceNumber,
+                convertedAt: nowIso(),
+              }
+            : e
+        )
+      );
+      addNotification({
+        type: "success",
+        title: "Estimate Converted to Invoice",
+        message: `Invoice ${created.invoiceNumber} created from Estimate ${estimate.estimateNumber}.`,
+        icon: "description",
+      });
+    };
+    const fail = () => {
+      setInvoices((prev) => prev.filter((inv) => inv.id !== tempId));
+      addNotification({
+        type: "error",
+        title: "Could Not Convert Estimate",
+        message: "The estimate could not be converted. No invoice was created.",
+        icon: "error",
+      });
+    };
+    setInvoices((prev) => [preview, ...prev]);
+    if (businessId && activeFyId) {
+      const payload = invoiceToBackendInput(preview, {
+        financialYearId: activeFyId,
+        prefix: companyProfile.invoicePrefix || "INV",
+        company: companyProfile,
+      });
+      payload.sourceDocument = { type: "estimate", id: estimate.id };
+      void (async () => {
+        try {
+          const { invoice } = await invoicesApi.create(businessId, payload);
+          persist(fromBackendInvoice(invoice));
+        } catch {
+          fail();
+        }
+      })();
+    } else {
+      fail();
+    }
   };
 
   // ------------------------------------------------------------------
   // PURCHASE ORDERS
   // ------------------------------------------------------------------
   const addPurchaseOrder = (poData: Omit<PurchaseOrder, "id" | "createdAt">) => {
-    const newPo: PurchaseOrder = {
+    const tempId = `po-${Date.now()}`;
+    const optimistic: PurchaseOrder = {
       ...poData,
-      id: `po-${Date.now()}`,
+      id: tempId,
       createdAt: new Date().toISOString(),
     };
-    setPurchaseOrders((prev) => [newPo, ...prev]);
+    setPurchaseOrders((prev) => [optimistic, ...prev]);
+    if (businessId && activeFyId) {
+      void (async () => {
+        try {
+          const { purchaseOrder: created } = await purchaseOrdersApi.create(
+            businessId,
+            poToBackendInput(optimistic, {
+              financialYearId: activeFyId,
+              prefix: "PO",
+              company: companyProfile,
+            }),
+          );
+          if (created?.id) {
+            setPurchaseOrders((prev) =>
+              prev.map((p) =>
+                p.id === tempId ? fromBackendPurchaseOrder(created) : p,
+              ),
+            );
+          }
+        } catch {
+          setPurchaseOrders((prev) => prev.filter((p) => p.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Save Purchase Order",
+            message:
+              "The purchase order could not be saved to the server. No purchase order was created.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "success",
       title: "Purchase Order Created",
-      message: `Purchase Order ${newPo.poNumber} issued to ${newPo.vendor.name}.`,
+      message: `Purchase Order ${optimistic.poNumber} issued to ${optimistic.vendor.name}.`,
       icon: "shopping_cart_checkout",
     });
   };
@@ -1334,9 +1812,41 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     const { kind, item } = lastDeleted;
     if (item && "id" in item) {
       if (kind === "customer") {
-        setCustomers((prev) => [item as Customer, ...prev]);
+        const target = item as Customer;
+        const insertRaw = () => setCustomers((prev) => [target, ...prev]);
+        if (businessId) {
+          void (async () => {
+            try {
+              const { customer: created } = await customersApi.create(
+                businessId,
+                customerToBackendInput(target),
+              );
+              if (created?.id) setCustomers((prev) => [created, ...prev]);
+              else insertRaw();
+            } catch {
+              const gate = checkEntitlement(activePlan, "customers", customers.length);
+              if (gate.allowed) insertRaw();
+            }
+          })();
+        } else {
+          insertRaw();
+        }
       } else if (kind === "product") {
-        setProducts((prev) => [item as Product, ...prev]);
+        const target = item as Product;
+        const insertRaw = () => setProducts((prev) => [target, ...prev]);
+        if (businessId) {
+          void (async () => {
+            try {
+              const { product: created } = await productsApi.create(businessId, target);
+              if (created?.id) setProducts((prev) => [created, ...prev]);
+              else insertRaw();
+            } catch {
+              insertRaw();
+            }
+          })();
+        } else {
+          insertRaw();
+        }
       } else if (kind === "invoice") {
         setInvoices((prev) => [(item as Invoice), ...prev]);
       } else if (kind === "quotation") {
@@ -1386,6 +1896,12 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     }
     if (res.created) {
       setFinancialYears(res.years);
+      if (businessId) {
+        const rolledFy = res.years.find((y) => y.id === res.activeId);
+        if (rolledFy && (backendFyIds === null || !backendFyIds.includes(rolledFy.id))) {
+          syncFy(businessId, rolledFy);
+        }
+      }
     }
     return { value, fyName: fy?.name ?? "", fyId };
   };
@@ -1414,6 +1930,12 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       const from = financialYearName(financialYears, res.previousActiveId);
       setActiveFinancialYearId(res.activeId);
       setFinancialYears(res.years);
+      if (businessId && res.target) {
+        const rolledFy = res.years.find((y) => y.id === res.activeId);
+        if (rolledFy && (backendFyIds === null || !backendFyIds.includes(rolledFy.id))) {
+          syncFy(businessId, rolledFy);
+        }
+      }
       addNotification({
         type: "info",
         title: "Financial Year Rolled Over",
@@ -1423,6 +1945,12 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     } else if (res.created) {
       setFinancialYears(res.years);
       if (!activeFinancialYearId) setActiveFinancialYearId(res.activeId);
+      if (businessId && res.activeId) {
+        const createdFy = res.years.find((y) => y.id === res.activeId);
+        if (createdFy && (backendFyIds === null || !backendFyIds.includes(createdFy.id))) {
+          syncFy(businessId, createdFy);
+        }
+      }
     } else if (!activeFinancialYearId && res.activeId) {
       setActiveFinancialYearId(res.activeId);
     }
@@ -1436,30 +1964,271 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeAccountId]);
 
+  // Domain 3: customers are backend-authoritative. On a business scope change
+  // the authoritative list is fetched; the response replaces the local cache.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    customersApi
+      .list(businessId)
+      .then((data) => {
+        if (active) setCustomers(data.customers ?? []);
+      })
+      .catch(() => {
+        // Backend unreachable: the previous local cache remains usable; the
+        // next write surfaces the API error as a notification.
+      });
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 4: products are backend-authoritative. On a business scope change
+  // the authoritative list is fetched; the response replaces the local cache.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    productsApi
+      .list(businessId)
+      .then((data) => {
+        if (active) setProducts(data.products ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 6: invoices are backend-authoritative on a business scope change.
+  // The authoritative list (totals + numbering minted server-side) replaces the
+  // local cache when the backend has rows; an empty backend (fresh account)
+  // leaves the local demo invoices in place so no data is ever wiped silently.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    invoicesApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.invoices) ? data.invoices : [];
+        if (rows.length > 0) {
+          setInvoices(rows.map(fromBackendInvoice));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 7: quotations are backend-authoritative on a business scope change.
+  // The authoritative list (server-minted numbers, recomputed totals) replaces
+  // the local cache when the backend has rows.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    quotationsApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.quotations) ? data.quotations : [];
+        if (rows.length > 0) {
+          setQuotations(rows.map(fromBackendQuotation));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 8: estimates are backend-authoritative on a business scope change.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    estimatesApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.estimates) ? data.estimates : [];
+        if (rows.length > 0) {
+          setEstimates(rows.map(fromBackendEstimate));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 9: purchase orders are backend-authoritative on a business scope change.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    purchaseOrdersApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.purchaseOrders) ? data.purchaseOrders : [];
+        if (rows.length > 0) {
+          setPurchaseOrders(rows.map(fromBackendPurchaseOrder));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 10: expenses are backend-authoritative on a business scope change.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    expensesApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.expenses) ? data.expenses : [];
+        if (rows.length > 0) {
+          setExpenses(rows.map(fromBackendExpense));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 11: vehicles are backend-authoritative on a business scope change.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    vehiclesApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.vehicles) ? data.vehicles : [];
+        if (rows.length > 0) {
+          setVehicles(rows.map(fromBackendVehicle));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 12: the team roster is backend-authoritative on a business scope change.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    teamApi
+      .list(businessId)
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.members) ? data.members : [];
+        if (rows.length > 0) {
+          setTeamMembers(rows.map(fromBackendMember));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Domain 13: the notification inbox is backend-authoritative once the caller
+  // has a business scope. Ephemeral success/error toasts still render locally.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    notificationsApi
+      .list({ businessId })
+      .then((data) => {
+        if (!active) return;
+        const rows = Array.isArray(data.notifications) ? data.notifications : [];
+        if (rows.length > 0) {
+          setNotifications(rows.map(fromBackendNotification));
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
   const addCustomer = (customer: Omit<Customer, "id">) => {
     const gate = checkEntitlement(activePlan, "customers", customers.length);
     if (!gate.allowed) {
       notifyEntitlementBlocked("customers", gate);
       return false;
     }
-    const newCustomer: Customer = {
-      ...customer,
-      id: `cust-${Date.now()}`,
-    };
-    setCustomers((prev) => [...prev, newCustomer]);
+    const tempId = `cust-${Date.now()}`;
+    const optimistic: Customer = { ...customer, id: tempId };
+    setCustomers((prev) => [...prev, optimistic]);
     addNotification({
       type: "success",
       title: "Customer Added",
-      message: `${newCustomer.name} added to customer directory.`,
+      message: `${optimistic.name} added to customer directory.`,
       icon: "group",
     });
+    if (businessId) {
+      void (async () => {
+        try {
+          const { customer: created } = await customersApi.create(
+            businessId,
+            customerToBackendInput(customer),
+          );
+          if (created?.id) {
+            setCustomers((prev) => prev.map((c) => (c.id === tempId ? created : c)));
+          }
+        } catch {
+          setCustomers((prev) => prev.filter((c) => c.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Save Customer",
+            message:
+              "The customer could not be saved to the server. Your change was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     return true;
   };
 
   const updateCustomer = (customer: Customer) => {
-    setCustomers((prev) =>
-      prev.map((c) => (c.id === customer.id ? customer : c))
-    );
+    if (businessId) {
+      void (async () => {
+        try {
+          const { customer: updated } = await customersApi.update(
+            businessId,
+            customer.id,
+            customerToBackendInput(customer),
+          );
+          if (updated?.id) setCustomers((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+        } catch {
+          addNotification({
+            type: "error",
+            title: "Could Not Update Customer",
+            message:
+              "The customer change could not be saved to the server. Reload the app to revert.",
+            icon: "error",
+          });
+        }
+      })();
+    }
+    setCustomers((prev) => prev.map((c) => (c.id === customer.id ? customer : c)));
     addNotification({
       type: "info",
       title: "Customer Updated",
@@ -1472,6 +2241,25 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     const target = customers.find((c) => c.id === id);
     setCustomers((prev) => prev.filter((c) => c.id !== id));
     if (target) setLastDeleted({ kind: "customer", item: target });
+    if (businessId) {
+      void (async () => {
+        try {
+          await customersApi.remove(businessId, id);
+        } catch {
+          setCustomers((prev) => {
+            if (target && !prev.some((c) => c.id === id)) return [target, ...prev];
+            return prev;
+          });
+          addNotification({
+            type: "error",
+            title: "Could Not Remove Customer",
+            message:
+              "The customer could not be removed from the server. Your change was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "info",
       title: "Customer Removed",
@@ -1488,24 +2276,55 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
       notifyEntitlementBlocked("products", gate);
       return false;
     }
-    const newProduct: Product = {
-      ...product,
-      id: `prod-${Date.now()}`,
-    };
-    setProducts((prev) => [...prev, newProduct]);
+    const tempId = `prod-${Date.now()}`;
+    const optimistic: Product = { ...product, id: tempId };
+    setProducts((prev) => [...prev, optimistic]);
     addNotification({
       type: "success",
       title: "Product Added",
-      message: `${newProduct.name} added to catalog.`,
+      message: `${optimistic.name} added to catalog.`,
       icon: "inventory_2",
     });
+    if (businessId) {
+      void (async () => {
+        try {
+          const { product: created } = await productsApi.create(businessId, product);
+          if (created?.id) {
+            setProducts((prev) => prev.map((p) => (p.id === tempId ? created : p)));
+          }
+        } catch {
+          setProducts((prev) => prev.filter((p) => p.id !== tempId));
+          addNotification({
+            type: "error",
+            title: "Could Not Save Product",
+            message:
+              "The product could not be saved to the server. Your change was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     return true;
   };
 
   const updateProduct = (product: Product) => {
-    setProducts((prev) =>
-      prev.map((p) => (p.id === product.id ? product : p))
-    );
+    if (businessId) {
+      void (async () => {
+        try {
+          const { product: updated } = await productsApi.update(businessId, product.id, product);
+          if (updated?.id) setProducts((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+        } catch {
+          addNotification({
+            type: "error",
+            title: "Could Not Update Product",
+            message:
+              "The product change could not be saved to the server. Reload the app to revert.",
+            icon: "error",
+          });
+        }
+      })();
+    }
+    setProducts((prev) => prev.map((p) => (p.id === product.id ? product : p)));
     addNotification({
       type: "info",
       title: "Product Updated",
@@ -1518,6 +2337,25 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     const target = products.find((p) => p.id === id);
     setProducts((prev) => prev.filter((p) => p.id !== id));
     if (target) setLastDeleted({ kind: "product", item: target });
+    if (businessId) {
+      void (async () => {
+        try {
+          await productsApi.remove(businessId, id);
+        } catch {
+          setProducts((prev) => {
+            if (target && !prev.some((p) => p.id === id)) return [target, ...prev];
+            return prev;
+          });
+          addNotification({
+            type: "error",
+            title: "Could Not Remove Product",
+            message:
+              "The product could not be removed from the server. Your change was not saved.",
+            icon: "error",
+          });
+        }
+      })();
+    }
     addNotification({
       type: "info",
       title: "Product Removed",
@@ -1683,10 +2521,11 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     teamMembers: additionalTeamSeatsUsed(teamMembers),
     invoicesInPeriod: countCurrentPeriodInvoices(invoices, subscription),
     directoryListings:
-      activeAccountId && getMyDirectoryListing(activeAccountId) ? 1 : 0,
+      businessId && getMyDirectoryListingCache(businessId) ? 1 : 0,
   });
 
   const value: AppContextType = {
+    activeBusinessId: businessId,
     activeRoute,
     setActiveRoute,
     openModal,
@@ -1731,6 +2570,8 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     requestRefund,
     plans: SUBSCRIPTION_PLANS,
     activePlan,
+    subscriptionStatus,
+    retrySubscription,
     currentUsage: resourceUsage,
     canCreateResource: (kind: LimitKind) =>
       canCreate(activePlan, kind, usageForKind(resourceUsage, kind)),

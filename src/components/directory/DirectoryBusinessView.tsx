@@ -1,6 +1,6 @@
 "use client";
 
-import React from "react";
+import React, { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import {
   ArrowLeft,
@@ -15,7 +15,9 @@ import {
   Hash,
   ShieldCheck,
 } from "lucide-react";
-import { getDirectoryBusiness, telLink, directoryEntitlement } from "@/lib/directory";
+import { telLink, directoryEntitlement, getSeedBusiness } from "@/lib/directory";
+import { directoryApi, fromPublicDetailJson } from "@/lib/api/directory";
+import type { DirectoryBusiness } from "@/types";
 import { useApp } from "@/context/AppContext";
 import { BusinessNetworkGate } from "@/components/directory/BusinessNetworkGate";
 
@@ -24,8 +26,44 @@ export const DirectoryBusinessView: React.FC = () => {
   const router = useRouter();
   const { activePlan } = useApp();
   const entitled = directoryEntitlement(activePlan).allowed;
+  const [business, setBusiness] = useState<DirectoryBusiness | null>(null);
+  const [loading, setLoading] = useState(true);
 
-  const business = params?.id ? getDirectoryBusiness(params.id) : null;
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const id = params?.id;
+      if (!id) {
+        if (!cancelled) setLoading(false);
+        return;
+      }
+      setLoading(true);
+      try {
+        const res = await directoryApi.getPublic(id);
+        if (!cancelled) setBusiness(fromPublicDetailJson(res.business));
+      } catch {
+        // Unknown/unpublished id, or backend unavailable — fall back to the
+        // read-only seed catalog before declaring the listing missing.
+        if (!cancelled) setBusiness(getSeedBusiness(id));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [params?.id]);
+
+  if (loading) {
+    return (
+      <BusinessNetworkGate entitled={entitled}>
+        <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs p-12 text-center">
+          <Store className="w-10 h-10 text-gray-300 mx-auto mb-3" />
+          <p className="text-sm font-semibold text-[#191c1e]">Loading listing…</p>
+        </div>
+      </BusinessNetworkGate>
+    );
+  }
 
   if (!business) {
     return (

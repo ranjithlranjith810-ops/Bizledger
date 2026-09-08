@@ -10,15 +10,30 @@ import {
   CreditCard,
   Sparkles,
 } from "lucide-react";
-import { formatINR, planLabel, methodLabel } from "@/lib/billing";
+import { formatINRString, planLabel } from "@/lib/billing";
 
-export const PaymentSuccessView: React.FC = () => {
-  const { paymentHistory, subscription } = useApp();
+export interface PaymentSuccessViewProps {
+  planId?: string;
+  period?: string;
+  orderId?: string;
+  paymentId?: string;
+  total?: string;
+}
+
+// Phase 4E: this page is the honest post-verification state. Payment has been
+// VERIFIED server-side (HMAC) but the subscription is STILL PENDING — durable
+// activation happens in Phase 4F via webhooks. We therefore never claim the
+// plan is "active".
+export const PaymentSuccessView: React.FC<PaymentSuccessViewProps> = ({
+  planId,
+  period,
+  orderId,
+  paymentId,
+  total,
+}) => {
+  const { plans } = useApp();
   const router = useRouter();
 
-  const record = [...paymentHistory].find((p) => p.status === "success");
-  const planId = record?.planId ?? subscription?.currentPlanId;
-  const plans = useApp().plans;
   const plan = plans.find((p) => p.id === planId);
 
   useEffect(() => {
@@ -31,33 +46,45 @@ export const PaymentSuccessView: React.FC = () => {
         <div className="mx-auto w-16 h-16 rounded-full bg-emerald-100 text-emerald-600 flex items-center justify-center mb-4">
           <CheckCircle2 className="w-9 h-9" />
         </div>
-        <h2 className="text-xl font-bold text-[#191c1e]">Payment Successful</h2>
+        <h2 className="text-xl font-bold text-[#191c1e]">Payment Verified</h2>
         <p className="text-xs text-gray-500 mt-2">
-          Your <span className="font-bold text-gray-900">{planLabel(plan?.name ?? "Business")}</span>{" "}
-          plan is now active. Thank you for subscribing to BizLedger.
+          Payment verified. Your{" "}
+          <span className="font-bold text-gray-900">
+            {planLabel(plan?.name ?? "Business")}
+          </span>{" "}
+          subscription is being confirmed. It will become active once payment
+          confirmation completes.
         </p>
 
         <div className="mt-6 bg-[#f7f9fb] rounded-xl border border-[#eceef0] p-4 text-left space-y-2.5">
           <div className="flex items-center justify-between">
-            <span className="text-xs text-gray-500">Invoice</span>
-            <span className="text-xs font-mono font-bold text-gray-900">{record?.id ?? "—"}</span>
+            <span className="text-xs text-gray-500">Order</span>
+            <span className="text-xs font-mono font-bold text-gray-900">
+              {orderId ?? "—"}
+            </span>
+          </div>
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-gray-500">Payment</span>
+            <span className="text-xs font-mono font-bold text-gray-900">
+              {paymentId ?? "—"}
+            </span>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-xs text-gray-500">Plan</span>
-            <span className="text-xs font-bold text-gray-900">{plan?.name ?? "Business Plan"}</span>
+            <span className="text-xs font-bold text-gray-900">
+              {plan?.name ?? "Selected Plan"}
+            </span>
           </div>
           <div className="flex items-center justify-between">
             <span className="text-xs text-gray-500">Billing</span>
-            <span className="text-xs font-medium text-gray-700 capitalize">{record?.billingPeriod ?? "month"}</span>
-          </div>
-          <div className="flex items-center justify-between">
-            <span className="text-xs text-gray-500">Payment method</span>
-            <span className="text-xs font-medium text-gray-700">{record ? methodLabel(record.method) : "—"}</span>
+            <span className="text-xs font-medium text-gray-700 capitalize">
+              {period ?? "month"}
+            </span>
           </div>
           <div className="flex items-center justify-between pt-2 border-t border-[#eceef0]">
-            <span className="text-xs font-bold text-gray-900">Paid</span>
+            <span className="text-xs font-bold text-gray-900">Verified amount</span>
             <span className="text-lg font-bold font-mono text-emerald-600">
-              {formatINR(record?.totalAmount ?? 0)}
+              {total ? formatINRString(total) : "—"}
             </span>
           </div>
         </div>
@@ -81,7 +108,7 @@ export const PaymentSuccessView: React.FC = () => {
 
         <p className="mt-4 text-[11px] text-gray-400 flex items-center justify-center gap-1">
           <Sparkles className="w-3 h-3" />
-          Your GST tax invoice is available in Billing History.
+          Demo checkout via Razorpay Test Mode — no real money was charged.
         </p>
       </div>
     </div>

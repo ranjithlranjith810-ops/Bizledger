@@ -1,27 +1,81 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
-import { ArrowLeft, Lock, CreditCard, Loader2, XCircle, CheckCircle2 } from "lucide-react";
+import { useAuth } from "@/context/AuthContext";
+import { ArrowLeft, Lock, CreditCard, Loader2, ShieldCheck } from "lucide-react";
+import { formatINRString, planLabel } from "@/lib/billing";
+import { billingApi, PaidCheckout, FreeCheckout } from "@/lib/api/billing";
 import {
-  computeTotals,
-  formatINR,
-  planLabel,
-  PAYMENT_METHODS,
-} from "@/lib/billing";
-import { PaymentMethod } from "@/types";
+  buildRazorpayOptions,
+  loadRazorpayCheckoutScript,
+  openRazorpayCheckout,
+  reduceCheckoutPhase,
+  serverOrderAmounts,
+  shouldLaunchPaidCheckout,
+  CheckoutPhase,
+  CheckoutEvent,
+} from "@/lib/razorpay-checkout";
 
 export const PaymentView: React.FC = () => {
-  const { plans, pendingPlanId, pendingPeriod, completePayment } = useApp();
+  const { plans, pendingPlanId, pendingPeriod, activeBusinessId, companyProfile } = useApp();
+  const { account } = useAuth();
   const router = useRouter();
 
   const plan = plans.find((p) => p.id === pendingPlanId);
   const period = pendingPeriod ?? "month";
 
-  const [method, setMethod] = useState<PaymentMethod>("upi");
-  const [outcome, setOutcome] = useState<"success" | "failed">("success");
-  const [processing, setProcessing] = useState(false);
+  const [checkout, setCheckout] = useState<PaidCheckout | FreeCheckout | null>(null);
+  const [phase, setPhase] = useState<CheckoutPhase>("idle");
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const settledRef = useRef(false);
+
+  const go = (event: CheckoutEvent) => {
+    setPhase((prev) => reduceCheckoutPhase(prev, event));
+  };
+
+  // Fetches the secure checkout server-side (Phase 4D reuse protects accidental
+  // doubles). PURE: never touches state, so both the mount effect and the
+  // "Load Checkout Again" button can call it and only then update state
+  // (react-hooks/set-state-in-effect only forbids SYNCHRONOUS setState in the
+  // effect body — the awaits below keep every state write on the async path).
+  const fetchCheckout = useCallback(async () => {
+    if (!plan || !activeBusinessId) return null;
+    const res = await billingApi.createCheckout(
+      activeBusinessId,
+      plan.id,
+      period,
+    );
+    return res.checkout;
+  }, [plan, activeBusinessId, period]);
+
+  useEffect(() => {
+    if (!plan?.id || !activeBusinessId) return;
+    let active = true;
+    (async () => {
+      try {
+        const checkout = await fetchCheckout();
+        if (!active || !checkout) return;
+        setError(null);
+        go("create");
+        setCheckout(checkout);
+        go("checkout");
+      } catch (e) {
+        if (!active) return;
+        const msg =
+          e && typeof e === "object" && "message" in e
+            ? String((e as { message: unknown }).message)
+            : "Could not start checkout.";
+        setError(msg);
+        go("error");
+      }
+    })();
+    return () => {
+      active = false;
+    };
+  }, [plan?.id, period, activeBusinessId, fetchCheckout]);
 
   if (!plan) {
     return (
@@ -42,25 +96,107 @@ export const PaymentView: React.FC = () => {
     );
   }
 
-  const totals = computeTotals(plan, period);
+  const isFree = plan.id === "base";
+  const amounts = checkout ? serverOrderAmounts(checkout) : null;
+  const canPay =
+    !!checkout &&
+    shouldLaunchPaidCheckout(checkout) &&
+    phase === "ready";
+  const retryable = phase === "failed" || phase === "cancelled";
 
-  const handlePay = () => {
-    if (processing) return;
-    setProcessing(true);
-    setTimeout(() => {
-      completePayment(outcome, method);
-      if (outcome === "success") {
-        router.push("/payment/success");
-      } else {
-        router.push("/payment/failed");
-      }
-    }, 1800);
+  const description = `${planLabel(plan.name)} — ${period === "month" ? "1 Month" : "1 Year (2 months free)"} subscription`;
+
+  const prefill = {
+    name: account?.name ?? undefined,
+    email: account?.email ?? undefined,
+    contact: companyProfile?.mobile || undefined,
+  };
+
+  const handlePay = async () => {
+    if (!checkout) return;
+    if (!shouldLaunchPaidCheckout(checkout)) {
+      setError("Online payment is not available for this selection.");
+      return;
+    }
+    if (phase !== "ready") return; // double-launch guard
+    go("open");
+    let RazorpayCtor;
+    try {
+      await loadRazorpayCheckoutScript();
+      RazorpayCtor =
+        typeof window !== "undefined" ? window.Razorpay : undefined;
+    } catch {
+      setError("The payment window could not be loaded. Please try again.");
+      go("error");
+      return;
+    }
+    if (!RazorpayCtor) {
+      setError("Online payment is not available right now. Please try again later.");
+      go("error");
+      return;
+    }
+    settledRef.current = false;
+    const onErrorEvent = () => {
+      if (settledRef.current) return;
+      go("error");
+      setNotice("Payment failed. No subscription change was made — you can try again.");
+    };
+    const onCloseEvent = () => {
+      if (settledRef.current) return;
+      go("dismiss");
+      setNotice("Payment cancelled. No charge was made — you can try again when ready.");
+    };
+
+    const options = buildRazorpayOptions(
+      checkout,
+      description,
+      (payload) => {
+        if (settledRef.current) return;
+        settledRef.current = true;
+        go("success");
+        void (async () => {
+          try {
+            const res = await billingApi.verifyPayment(payload);
+            go("verified");
+            const qs = new URLSearchParams({
+              planId: plan.id,
+              period,
+              orderId: res.orderId,
+              paymentId: res.paymentId,
+              total: checkout.totalAmount,
+            });
+            router.push(`/payment/success?${qs.toString()}`);
+          } catch {
+            go("verify-error");
+            setNotice(
+              "Payment verified by the bank, but confirmation could not be stored right now. Keep your payment reference and check Billing History shortly.",
+            );
+          }
+        })();
+      },
+      onErrorEvent,
+      prefill,
+    );
+
+    openRazorpayCheckout(RazorpayCtor, options, {
+      onError: onErrorEvent,
+      onClose: onCloseEvent,
+    });
   };
 
   const handleCancel = () => {
-    if (processing) return;
+    if (phase === "opening" || phase === "verifying") return;
     router.push("/pricing/checkout");
   };
+
+  const statusLabel =
+    phase === "creating"
+      ? "Preparing secure checkout…"
+      : phase === "opening"
+      ? "Opening Razorpay…"
+      : phase === "verifying"
+      ? "Verifying payment…"
+      : null;
 
   return (
     <div className="space-y-6">
@@ -69,7 +205,8 @@ export const PaymentView: React.FC = () => {
         <div>
           <h2 className="text-xl font-bold text-[#191c1e] tracking-tight">Payment</h2>
           <p className="text-xs text-gray-500 mt-0.5">
-            Choose a payment method and pay {formatINR(totals.total)} to activate the {planLabel(plan.name)} plan.
+            Pay securely for the {planLabel(plan.name)} plan in Razorpay Test Mode. No real
+            money is charged.
           </p>
         </div>
         <button
@@ -82,68 +219,45 @@ export const PaymentView: React.FC = () => {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-        {/* Payment methods + simulation */}
+        {/* Secure Razorpay Checkout */}
         <div className="lg:col-span-3 space-y-4">
           <div className="bg-white p-6 rounded-2xl border border-[#eceef0] shadow-xs">
             <div className="flex items-center gap-2 mb-4">
               <CreditCard className="w-4 h-4 text-[#93000b]" />
-              <h3 className="text-sm font-bold text-[#191c1e]">Payment Method</h3>
+              <h3 className="text-sm font-bold text-[#191c1e]">Razorpay Secure Checkout</h3>
             </div>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              {PAYMENT_METHODS.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => !processing && setMethod(m.id)}
-                  className={`rounded-xl border px-4 py-3 text-left transition-colors ${
-                    method === m.id
-                      ? "border-[#93000b] ring-2 ring-[#93000b]/20 bg-[#fff7f7]"
-                      : "border-[#eceef0] hover:border-gray-300"
-                  } ${processing ? "opacity-60 pointer-events-none" : ""}`}
-                >
-                  <p className="text-xs font-bold text-gray-900">{m.label}</p>
-                  <p className="text-[11px] text-gray-500 mt-0.5">{m.hint}</p>
-                </button>
-              ))}
+            <div className="rounded-xl border border-[#eceef0] bg-[#fafbfc] p-4 text-xs text-gray-600 space-y-2.5">
+              <div className="flex items-start gap-2.5">
+                <ShieldCheck className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                <span>
+                  Clicking <span className="font-bold text-gray-900">Pay Securely</span> opens the
+                  Razorpay payment window (UPI, cards, net banking, wallets).
+                </span>
+              </div>
+              <div className="flex items-start gap-2.5">
+                <Lock className="w-4 h-4 text-[#93000b] shrink-0 mt-0.5" />
+                <span>
+                  The amount and order are prepared by the server. Your subscription activates
+                  only after payment verification is confirmed.
+                </span>
+              </div>
+              <p className="text-[11px] text-gray-400">
+                Demo checkout — Test Mode only. Razorpay test card / UPI credentials can be used.
+              </p>
             </div>
           </div>
 
-          {/* Mock gateway / simulation control */}
-          <div className="bg-white p-6 rounded-2xl border border-[#eceef0] shadow-xs">
-            <h3 className="text-sm font-bold text-[#191c1e] mb-1">Simulate Payment Gateway</h3>
-            <p className="text-xs text-gray-500 mb-4">
-              This is a mock checkout without a backend. Pick a gateway outcome to physically verify the flow.
-            </p>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <button
-                onClick={() => !processing && setOutcome("success")}
-                className={`rounded-xl border px-4 py-3 text-left transition-colors flex items-start gap-2.5 ${
-                  outcome === "success"
-                    ? "border-emerald-500 ring-2 ring-emerald-500/20 bg-emerald-50"
-                    : "border-[#eceef0] hover:border-gray-300"
-                } ${processing ? "opacity-60 pointer-events-none" : ""}`}
-              >
-                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                <span>
-                  <span className="block text-xs font-bold text-gray-900">Successful</span>
-                  <span className="block text-[11px] text-gray-500">Activates the plan</span>
-                </span>
-              </button>
-              <button
-                onClick={() => !processing && setOutcome("failed")}
-                className={`rounded-xl border px-4 py-3 text-left transition-colors flex items-start gap-2.5 ${
-                  outcome === "failed"
-                    ? "border-rose-500 ring-2 ring-rose-500/20 bg-rose-50"
-                    : "border-[#eceef0] hover:border-gray-300"
-                } ${processing ? "opacity-60 pointer-events-none" : ""}`}
-              >
-                <XCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                <span>
-                  <span className="block text-xs font-bold text-gray-900">Declined</span>
-                  <span className="block text-[11px] text-gray-500">Plan stays unchanged</span>
-                </span>
-              </button>
+          {(notice || error) && (
+            <div
+              className={`rounded-xl border px-4 py-3 text-xs font-medium ${
+                error
+                  ? "border-rose-200 bg-rose-50 text-[#93000b]"
+                  : "border-amber-200 bg-amber-50 text-amber-800"
+              }`}
+            >
+              {error ?? notice}
             </div>
-          </div>
+          )}
         </div>
 
         {/* Pay summary */}
@@ -153,46 +267,105 @@ export const PaymentView: React.FC = () => {
             <div className="space-y-2.5 text-sm">
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-500">Base amount</span>
-                <span className="text-xs font-mono font-bold text-gray-900">{formatINR(totals.base)}</span>
+                <span className="text-xs font-mono font-bold text-gray-900">
+                  {amounts ? formatINRString(amounts.base) : "—"}
+                </span>
               </div>
               <div className="flex items-center justify-between">
                 <span className="text-xs text-gray-500">GST (18%)</span>
-                <span className="text-xs font-mono font-bold text-gray-900">{formatINR(totals.gstAmount)}</span>
+                <span className="text-xs font-mono font-bold text-gray-900">
+                  {amounts ? formatINRString(amounts.gst) : "—"}
+                </span>
+              </div>
+              <div className="flex items-center justify-between">
+                <span className="text-xs text-gray-500">Billing</span>
+                <span className="text-xs font-medium text-gray-700 capitalize">{period}</span>
               </div>
               <div className="pt-3 border-t border-[#eceef0] flex items-center justify-between">
-                <span className="text-xs font-bold text-gray-900">Total</span>
-                <span className="text-lg font-bold font-mono text-[#93000b]">{formatINR(totals.total)}</span>
+                <span className="text-xs font-bold text-gray-900">Total to pay</span>
+                <span className="text-lg font-bold font-mono text-[#93000b]">
+                  {amounts ? formatINRString(amounts.total) : "—"}
+                </span>
               </div>
             </div>
 
-            <button
-              onClick={handlePay}
-              disabled={processing}
-              className="mt-6 w-full bg-[#93000b] hover:bg-[#770008] text-white py-3 rounded-xl text-xs font-bold transition-colors shadow-xs flex items-center justify-center gap-2 disabled:opacity-70"
-            >
-              {processing ? (
-                <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                  Processing Payment…
-                </>
-              ) : (
-                <>
-                  <Lock className="w-4 h-4" />
-                  Pay {formatINR(totals.total)} Securely
-                </>
-              )}
-            </button>
+            {isFree ? (
+              <button
+                disabled
+                className="mt-6 w-full bg-gray-100 text-gray-500 py-3 rounded-xl text-xs font-bold cursor-default"
+              >
+                Base plan is free — no payment required
+              </button>
+            ) : (
+              <button
+                onClick={() => void handlePay()}
+                disabled={!canPay}
+                className="mt-6 w-full bg-[#93000b] hover:bg-[#770008] text-white py-3 rounded-xl text-xs font-bold transition-colors shadow-xs flex items-center justify-center gap-2 disabled:opacity-70 disabled:cursor-not-allowed"
+              >
+                {phase === "creating" || phase === "opening" || phase === "verifying" ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {statusLabel}
+                  </>
+                ) : canPay ? (
+                  <>
+                    <Lock className="w-4 h-4" />
+                    Pay {amounts ? formatINRString(amounts.total) : ""} Securely
+                  </>
+                ) : (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Preparing…
+                  </>
+                )}
+              </button>
+            )}
 
-            <button
-              onClick={handleCancel}
-              disabled={processing}
-              className="mt-3 w-full bg-white hover:bg-[#f7f9fb] text-gray-700 border border-[#eceef0] py-3 rounded-xl text-xs font-bold transition-colors disabled:opacity-70"
-            >
-              Cancel Payment
-            </button>
+            {retryable ? (
+              <button
+                onClick={() => {
+                  settledRef.current = false;
+                  setNotice(null);
+                  setError(null);
+                  go("retry");
+                }}
+                className="mt-3 w-full bg-white hover:bg-[#f7f9fb] text-gray-700 border border-[#eceef0] py-3 rounded-xl text-xs font-bold transition-colors"
+              >
+                Try Payment Again
+              </button>
+            ) : error && !checkout ? (
+              <button
+                onClick={async () => {
+                  try {
+                    const next = await fetchCheckout();
+                    if (!next) return;
+                    setError(null);
+                    go("create");
+                    setCheckout(next);
+                    go("checkout");
+                  } catch {
+                    setError("Could not start checkout. Please try again.");
+                    go("error");
+                  }
+                }}
+                className="mt-3 w-full bg-white hover:bg-[#f7f9fb] text-gray-700 border border-[#eceef0] py-3 rounded-xl text-xs font-bold transition-colors"
+              >
+                Load Checkout Again
+              </button>
+            ) : (
+              !isFree && (
+                <button
+                  onClick={handleCancel}
+                  disabled={phase === "opening" || phase === "verifying"}
+                  className="mt-3 w-full bg-white hover:bg-[#f7f9fb] text-gray-700 border border-[#eceef0] py-3 rounded-xl text-xs font-bold transition-colors disabled:opacity-60"
+                >
+                  Cancel Payment
+                </button>
+              )
+            )}
 
             <p className="mt-3 text-[11px] text-gray-400 text-center">
-              Demo only — no real money is charged.
+              Demo checkout via Razorpay Test Mode — no real money is charged.
             </p>
           </div>
         </div>

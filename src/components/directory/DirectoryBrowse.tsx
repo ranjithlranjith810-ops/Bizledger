@@ -1,19 +1,21 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Search, Store, Phone, MapPin, Briefcase, PhoneOff } from "lucide-react";
 import {
   DIRECTORY_BUSINESS_TYPES,
-  getPublishedDirectoryBusinesses,
   filterDirectoryBusinesses,
   getDirectoryCategories,
   getDirectoryStates,
+  getSeedBusinesses,
   toDirectoryCard,
   telLink,
   directoryEntitlement,
 } from "@/lib/directory";
+import { directoryApi, fromCardJson } from "@/lib/api/directory";
+import type { DirectoryBusiness } from "@/types";
 import { INDIAN_STATES } from "@/lib/india";
 import { useApp } from "@/context/AppContext";
 import { BusinessNetworkGate } from "@/components/directory/BusinessNetworkGate";
@@ -26,8 +28,33 @@ export const DirectoryBrowse: React.FC = () => {
   const [businessType, setBusinessType] = useState<string>("All");
   const [category, setCategory] = useState<string>("All");
   const [state, setState] = useState<string>("All");
+  const [pool, setPool] = useState<DirectoryBusiness[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const all = useMemo(() => getPublishedDirectoryBusinesses(), []);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await directoryApi.browse();
+        if (cancelled) return;
+        // Backend-authoritative when the DB has published listings; otherwise
+        // fall back to the read-only seed catalog (demo data).
+        setPool(res.businesses.length > 0 ? res.businesses.map(fromCardJson) : []);
+      } catch {
+        if (!cancelled) setPool([]);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const all = useMemo(
+    () => (pool.length > 0 ? pool : getSeedBusinesses()),
+    [pool]
+  );
   const categories = useMemo(() => getDirectoryCategories(all), [all]);
   const states = useMemo(() => getDirectoryStates(all), [all]);
 
@@ -132,8 +159,14 @@ export const DirectoryBrowse: React.FC = () => {
 
       {/* Results count */}
       <div className="text-xs text-gray-500">
-        <span className="font-semibold text-[#191c1e]">{cards.length}</span> business
-        {cards.length === 1 ? "" : "es"} in directory
+        {loading ? (
+          <span className="text-gray-400">Loading directory…</span>
+        ) : (
+          <>
+            <span className="font-semibold text-[#191c1e]">{cards.length}</span> business
+            {cards.length === 1 ? "" : "es"} in directory
+          </>
+        )}
       </div>
 
       {/* Results Grid */}

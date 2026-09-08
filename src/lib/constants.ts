@@ -1,4 +1,4 @@
-import { NavSection } from "@/types";
+import { NavSection, OnboardingState } from "@/types";
 
 // Central support e-mail used by the in-app feedback flow. Reachable via a
 // mailto: link prefilled with a "BizLedger Feedback" subject.
@@ -106,4 +106,25 @@ export function onboardingRouteForStep(step: number): string {
   const clamped = Math.min(6, Math.max(1, step || 1));
   const found = ONBOARDING_STEPS.find((s) => s.step === clamped);
   return found ? found.href : "/onboarding/business";
+}
+
+// Resolve the initial onboarding state for an authenticated account.
+//
+// The onboarding wizard is server-backed: finishing it creates the backend
+// business tenant via POST /api/businesses. The Providers scope resolver runs
+// GET /api/businesses BEFORE AppProvider mounts, so a non-null resolved
+// businessId is the single deterministic signal that this account already
+// completed onboarding. Deriving from it (instead of localStorage, which is
+// retired) restores completion after full page loads, refreshes, or native
+// back navigation — the root cause of payment-flow users being bounced to
+// /onboarding/business. An anon or brand-new account has no business yet and
+// must run the wizard.
+export function resolveInitialOnboardingState(args: {
+  activeAccountId: string | null;
+  businessId: string | null | undefined;
+}): OnboardingState {
+  if (args.activeAccountId && args.businessId) {
+    return { completed: true, currentStep: 6 };
+  }
+  return { completed: false, currentStep: 0 };
 }

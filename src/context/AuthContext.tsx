@@ -1,78 +1,17 @@
 "use client";
 
-import React, {
-  createContext,
-  useContext,
-  useMemo,
-  useState,
-  useSyncExternalStore,
-} from "react";
+import React, { createContext, useContext, useMemo, useState } from "react";
 import { LocalAccount, AuthContextType } from "@/types";
-import {
-  ACCOUNT_KEY,
-  ACCOUNTS_KEY,
-  LAST_ROUTE_KEY,
-  safeGet,
-  safeSet,
-  safeRemove,
-} from "@/lib/storage";
+import { LAST_ROUTE_KEY, safeGet, safeSet, safeRemove } from "@/lib/storage";
+import { authClient } from "@/lib/auth-client";
 
-type Listener = () => void;
-const listeners = new Set<Listener>();
-
-function subscribe(listener: Listener) {
-  listeners.add(listener);
-  if (typeof window !== "undefined") {
-    window.addEventListener("storage", listener);
-  }
-  return () => {
-    listeners.delete(listener);
-    if (typeof window !== "undefined") {
-      window.removeEventListener("storage", listener);
-    }
-  };
-}
-
-// Returns the persisted active account serialized. Used as the sync external
-// store snapshot so the account is read from localStorage safely on the client
-// (and is server-safe during SSR).
-function getAccountSnapshot(): string {
-  return safeGet(ACCOUNT_KEY) ?? "";
-}
-
-const getServerSnapshot = (): string => "";
-
-function readAccounts(): LocalAccount[] {
-  const raw = safeGet(ACCOUNTS_KEY);
-  if (!raw) return [];
-  try {
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as LocalAccount[]) : [];
-  } catch {
-    return [];
-  }
-}
-
-function emit(): void {
-  listeners.forEach((l) => l());
-}
-
-function isKnownAccount(email: string): boolean {
-  return readAccounts().some(
-    (a) => a.email.trim().toLowerCase() === email.trim().toLowerCase()
-  );
-}
-
-function persistActiveAccount(acct: LocalAccount | null): void {
-  if (acct) {
-    safeSet(ACCOUNT_KEY, JSON.stringify(acct));
-    const accounts = readAccounts();
-    const without = accounts.filter((a) => a.id !== acct.id);
-    safeSet(ACCOUNTS_KEY, JSON.stringify([acct, ...without]));
-  } else {
-    safeRemove(ACCOUNT_KEY);
-  }
-  emit();
+// Transition: the previous mock-auth implementation kept the active account in
+// localStorage (ACCOUNT_KEY / ACCOUNTS_KEY). Those keys are no longer read or
+// written; the Better Auth session cookie is the only auth authority. Stale
+// values are purged on first mount so they cannot affect routing or identity.
+function clearLegacyAccountKeys(): void {
+  safeRemove("bizledger_account");
+  safeRemove("bizledger_accounts");
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
@@ -80,69 +19,79 @@ const AuthContext = createContext<AuthContextType | undefined>(undefined);
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({
   children,
 }) => {
-  const accountRaw = useSyncExternalStore(
-    subscribe,
-    getAccountSnapshot,
-    getServerSnapshot
-  );
+  const { data, isPending } = authClient.useSession();
 
   const account = useMemo<LocalAccount | null>(() => {
-    if (!accountRaw) return null;
-    try {
-      return JSON.parse(accountRaw) as LocalAccount;
-    } catch {
-      return null;
-    }
-  }, [accountRaw]);
+    if (!data?.user) return null;
+    const u = data.user;
+    return {
+      id: u.id,
+      name: u.name ?? "",
+      email: u.email,
+      businessName: undefined,
+      createdAt: u.createdAt ? String(u.createdAt) : new Date().toISOString(),
+    };
+  }, [data]);
 
-  const [lastRoute, setLastRouteState] = useState<string | null>(() =>
-    safeGet(LAST_ROUTE_KEY)
-  );
+  const [lastRoute, setLastRouteState] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    clearLegacyAccountKeys();
+    return safeGet(LAST_ROUTE_KEY);
+  });
 
   const setLastRoute: AuthContextType["setLastRoute"] = (route) => {
     setLastRouteState(route);
     safeSet(LAST_ROUTE_KEY, route);
   };
 
-  const createAccount: AuthContextType["createAccount"] = (input) => {
-    const normalizedEmail = input.email.trim().toLowerCase();
-    const existing = readAccounts().find(
-      (a) => a.email.trim().toLowerCase() === normalizedEmail
-    );
-    if (existing) {
-      persistActiveAccount(existing);
-      return existing;
-    }
-    const acct: LocalAccount = {
-      id: `acct-${Date.now()}-${Math.random().toString(36).substring(2, 6)}`,
-      name: input.name.trim(),
-      email: normalizedEmail,
-      businessName: input.businessName?.trim() || undefined,
-      createdAt: new Date().toISOString(),
-    };
-    persistActiveAccount(acct);
-    return acct;
+  const errorMessage = (e: unknown): string => {
+    if (!e) return "Something went wrong. Please try again.";
+    const err = e as { status?: number; message?: string; details?: unknown };
+    if (err.message) return err.message;
+    return `Request failed${err.status ? ` (${err.status})` : ""}. Please try again.`;
   };
 
-  const login: AuthContextType["login"] = (email) => {
-    if (!isKnownAccount(email)) return false;
-    const match = readAccounts().find(
-      (a) => a.email.trim().toLowerCase() === email.trim().toLowerCase()
-    );
-    if (match) {
-      persistActiveAccount(match);
-      return true;
+  const createAccount: AuthContextType["createAccount"] = async (input) => {
+    const email = input.email.trim().toLowerCase();
+    const name = input.name.trim().replace(/\s+/g, " ");
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return { ok: false, error: "Please enter a valid email address." };
     }
-    return false;
+    if (input.password !== undefined && input.password.length < 8) {
+      return { ok: false, error: "Password must be at least 8 characters long." };
+    }
+    const res = await authClient.signUp.email({ email, password: input.password, name });
+    if (res.error) {
+      return { ok: false, error: errorMessage(res.error) };
+    }
+    return { ok: true };
   };
 
-  const logout = () => {
-    persistActiveAccount(null);
+  const login: AuthContextType["login"] = async (input) => {
+    const email = input.email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return { ok: false, error: "Please enter a valid email address." };
+    }
+    if (!input.password) {
+      return { ok: false, error: "Please enter your password." };
+    }
+    const res = await authClient.signIn.email({ email, password: input.password });
+    if (res.error) {
+      return { ok: false, error: errorMessage(res.error) };
+    }
+    return { ok: true };
   };
+
+  const logout = async () => {
+    await authClient.signOut();
+  };
+
+  const isAuthenticated = !!account;
 
   const value: AuthContextType = {
     account,
-    isAuthenticated: !!account,
+    isAuthenticated,
+    authPending: isPending,
     lastRoute,
     createAccount,
     login,

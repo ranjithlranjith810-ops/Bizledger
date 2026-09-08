@@ -129,3 +129,24 @@
 ::-webkit-scrollbar-thumb:hover {
   background: #cbd5e1;
 }
+
+/* Phase 6A — clean receipts on paper/PDF. The billing invoice page is the only
+   surface that prints; hide the app chrome and strip the padded shell so the
+   receipt renders full-bleed. Elements carrying `print:hidden` (Tailwind) are
+   hidden by the utility itself; the shell selectors here cover the layout. */
+@media print {
+  aside,
+  header,
+  nav {
+    display: none !important;
+  }
+  main {
+    margin: 0 !important;
+    padding: 0 !important;
+    overflow: visible !important;
+    height: auto !important;
+  }
+  body {
+    background: #ffffff !important;
+  }
+}

@@ -21,6 +21,12 @@ function createClient(): PrismaClient {
   return new PrismaClient({
     adapter: new PrismaPg({
       connectionString: process.env.DATABASE_URL as string,
+      // Hosted Postgres (Supabase pooler) round-trips are slow. Interactive
+      // transactions hold a connection for their full duration, so size the
+      // pool well above the concurrent-invoice-creation load to avoid
+      // interactive-transaction expiry (P2028) when several creates land at
+      // once.
+      max: 25,
     }),
   });
 }

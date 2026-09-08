@@ -14,12 +14,14 @@ export default function SignupPage() {
   const { createAccount, isAuthenticated } = useAuth();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
   const [businessName, setBusinessName] = useState("");
   const [error, setError] = useState("");
   const [consent, setConsent] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
     if (!name.trim() || !email.trim()) {
@@ -30,12 +32,25 @@ export default function SignupPage() {
       setError("Please enter a valid email address.");
       return;
     }
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters long.");
+      return;
+    }
+    if (password !== confirmPassword) {
+      setError("Passwords do not match.");
+      return;
+    }
     if (!consent) {
       setError("Please accept the Terms of Service and Privacy Policy to continue.");
       return;
     }
     setSubmitting(true);
-    createAccount({ name, email, businessName });
+    const result = await createAccount({ name, email, password, businessName });
+    if (!result.ok) {
+      setSubmitting(false);
+      setError(result.error);
+      return;
+    }
     // New accounts enter the business onboarding wizard (never straight to the
     // dashboard). The wizard will open on its first step.
     router.replace("/onboarding");
@@ -75,6 +90,22 @@ export default function SignupPage() {
               icon="mail"
               value={email}
               onChange={(e) => setEmail(e.target.value)}
+            />
+            <Input
+              label="Password"
+              type="password"
+              placeholder="Minimum 8 characters"
+              icon="lock"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+            />
+            <Input
+              label="Confirm password"
+              type="password"
+              placeholder="Re-enter your password"
+              icon="lock"
+              value={confirmPassword}
+              onChange={(e) => setConfirmPassword(e.target.value)}
             />
             <Input
               label="Business name (optional)"
