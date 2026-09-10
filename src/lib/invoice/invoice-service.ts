@@ -19,13 +19,15 @@
 // (Business.stateCode) vs the place-of-supply state code.
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
+import { assertCreateAllowed } from "@/lib/billing/entitlements-server";
 import {
   ValidationError,
   ResourceNotFoundError,
   ConflictError,
 } from "@/lib/business/api-error";
 import { rejectProtectedKeys } from "@/lib/sales-document/shared";
+import { assertFinancialYearActive } from "@/lib/financial-year/financial-year-service";
 import { allocateDocumentNumber } from "@/lib/sequence/sequence-service";
 import { INDIAN_STATES } from "@/lib/india";
 import {
@@ -46,6 +48,13 @@ const INVOICE_STATUSES = [
   "Draft",
   "Cancelled",
 ] as const;
+
+// F4 — statuses a NEW invoice may be born with. "Paid" (a real payment event)
+// and "Cancelled" (a closure decision) are recorded through explicit server-side
+// transitions (`transitionInvoiceStatus`), never chosen by the client at create
+// time. The workflow is Draft -> Pending -> Paid, with Overdue/Cancelled reached
+// only by server-authorized lifecycle operations.
+const INVOICE_CREATEABLE_STATUSES = ["Draft", "Pending", "Overdue"] as const;
 
 const PRICING_MODES = ["inclusive", "exclusive"] as const;
 
@@ -134,6 +143,36 @@ const INVOICE_PROTECTED_KEYS = [
   "prefix",
   "invoicePrefix",
   "sourceDocument",
+] as const;
+
+// F4 — keys whose values are engine-computed (never client-supplied).
+const INVOICE_TOTAL_KEYS = [
+  "subtotal",
+  "totalDiscount",
+  "taxableAmount",
+  "cgst",
+  "sgst",
+  "igst",
+  "totalTax",
+  "grandTotal",
+] as const;
+
+// F4 — financial-substance keys that freeze once an invoice leaves Draft.
+const INVOICE_FINANCIAL_OVERRIDE_KEYS = [
+  "items",
+  "pricingMode",
+  "customerId",
+  "invoiceDate",
+  "placeOfSupplyCode",
+] as const;
+
+// F4 — remaining mutability also locks once an invoice is Paid or Cancelled
+// (only notes / terms / e-way bill remain editable).
+const INVOICE_FINALIZED_LOCKED_KEYS = [
+  "dueDate",
+  "placeOfSupply",
+  "vehicle",
+  "company",
 ] as const;
 
 // --------------------------------------------------------------------------
@@ -465,7 +504,7 @@ export async function createInvoice(
   raw: Record<string, unknown>,
 ) {
   const businessId = validateBusinessId(businessIdInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "create");
   const business = ctx.business;
 
   const pricingMode = normalizePricingMode(
@@ -475,6 +514,13 @@ export async function createInvoice(
 
   // Validate enum-ish values that need the payload.
   const status = normalizeStatus(payload.status);
+  // F4: an invoice cannot be born Paid or Cancelled. "Mark as paid" is a real
+  // payment lifecycle event performed server-side via `transitionInvoiceStatus`.
+  if (!(INVOICE_CREATEABLE_STATUSES as readonly string[]).includes(status)) {
+    throw new ValidationError(
+      "Invoices cannot be created directly as Paid or Cancelled",
+    );
+  }
   const fyId = validateId(raw.financialYearId, "financialYearId is required");
   const sourceDocument = normalizeSourceDocument(raw.sourceDocument);
 
@@ -559,6 +605,7 @@ export async function createInvoice(
   ]);
   if (!customer) throw new ResourceNotFoundError("Customer not found");
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
+  assertFinancialYearActive(fy);
   if (found.length !== productIds.length) {
     throw new ResourceNotFoundError("One or more products were not found");
   }
@@ -590,6 +637,11 @@ export async function createInvoice(
 
   const created = await prisma.$transaction(
     async (tx) => {
+      // F3: the plan's invoice ceiling is enforced server-side inside this
+      // transaction (business-row lock → rolling-period count → check) BEFORE
+      // the number is allocated and the record inserted.
+      await assertCreateAllowed(tx, businessId, "invoices");
+
       // Mint the number from the same FY-scoped sequence as the frontend.
       const allocated = await allocateDocumentNumber(
         businessId,
@@ -704,7 +756,7 @@ export async function createInvoice(
  */
 export async function listInvoices(businessIdInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
 
   const rows = await prisma.invoice.findMany({
     where: { businessId },
@@ -721,7 +773,7 @@ export async function listInvoices(businessIdInput: unknown) {
 export async function getInvoice(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
 
   const invoice = await prisma.invoice.findFirst({
     where: { id, businessId },
@@ -758,7 +810,7 @@ export async function updateInvoice(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
   const business = ctx.business;
 
   rejectProtectedKeys(raw, INVOICE_PROTECTED_KEYS);
@@ -768,6 +820,52 @@ export async function updateInvoice(
     include: { items: true },
   });
   if (!existing) throw new ResourceNotFoundError("Invoice not found");
+
+  // F4 — status is a lifecycle fact, transitioned ONLY through the dedicated
+  // status endpoint (Draft -> Pending -> Paid, Overdue/Cancelled by server flow).
+  // A forged status on PATCH is rejected outright.
+  if (raw.status !== undefined) {
+    throw new ValidationError(
+      "Invoice status must be changed via the invoice status endpoint",
+    );
+  }
+
+  // F4 — totals are ALWAYS recomputed server-side by the GST engine; a client can
+  // never rewrite the stored financial outcome of an invoice.
+  for (const k of INVOICE_TOTAL_KEYS) {
+    if (raw[k] !== undefined) {
+      throw new ValidationError(
+        "Invoice totals are computed by the server and cannot be supplied",
+      );
+    }
+  }
+
+  // F4 — issued/finalized lockdown. A Draft is fully editable per RBAC; an
+  // issued invoice (Pending/Overdue) keeps its financial substance frozen
+  // (items, pricing mode, date, customer association, place-of-supply code);
+  // a finalized invoice (Paid/Cancelled) is immutable except for non-financial
+  // annotations (notes, terms, e-way bill). Violations are a state conflict
+  // (409) — the record is an accounting document, not a client-editable form.
+  if (existing.status !== "Draft") {
+    for (const k of INVOICE_FINANCIAL_OVERRIDE_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(raw, k)) {
+        throw new ConflictError(
+          existing.status === "Paid" || existing.status === "Cancelled"
+            ? "Paid or cancelled invoices are immutable financial records and cannot be rewritten"
+            : `Issued ${existing.status} invoices cannot have their financial fields rewritten`,
+        );
+      }
+    }
+    if (existing.status === "Paid" || existing.status === "Cancelled") {
+      for (const k of INVOICE_FINALIZED_LOCKED_KEYS) {
+        if (Object.prototype.hasOwnProperty.call(raw, k)) {
+          throw new ConflictError(
+            "Paid or cancelled invoices are immutable financial records and cannot be rewritten",
+          );
+        }
+      }
+    }
+  }
 
   const hasItems = raw.items !== undefined;
   const items = hasItems
@@ -853,9 +951,6 @@ export async function updateInvoice(
     grandTotal,
   };
 
-  if (raw.status !== undefined) {
-    data.status = normalizeStatus(str(raw.status) ?? "");
-  }
   if (raw.pricingMode !== undefined) {
     data.pricingMode = normalizePricingMode(str(raw.pricingMode) ?? "");
   }
@@ -977,6 +1072,65 @@ export async function updateInvoice(
 }
 
 // ---------------------------------------------------------------------------
+// PATCH .../status — the ONLY server-side lifecycle path that changes invoice
+// status (F4). The browser can never write the status field directly:
+//
+//   Draft    -> Pending     (issue)
+//   Pending  -> Paid        (record payment)
+//   Pending  -> Overdue     (aging, server/compliance flow)
+//   Pending  -> Cancelled   (void an unpaid issued invoice)
+//   Overdue  -> Paid        (record payment)
+//   Overdue  -> Pending     (reopen after missed window)
+//   Overdue  -> Cancelled   (void an unpaid overdue invoice)
+//   Paid     -> (terminal)  no transitions
+//   Cancelled-> (terminal)  no transitions
+//
+// Transitions are server-authoritative: an allowed edge only ever moves the
+// status FORWARD on the lifecycle and requires `invoices.edit` — the same gate
+// that guards editing any invoice. Unpermitted edges are a 409 (state conflict).
+// ---------------------------------------------------------------------------
+const INVOICE_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
+  Draft: ["Pending"],
+  Pending: ["Paid", "Overdue", "Cancelled"],
+  Overdue: ["Paid", "Pending", "Cancelled"],
+  Paid: [],
+  Cancelled: [],
+};
+
+export async function transitionInvoiceStatus(
+  businessIdInput: unknown,
+  idInput: unknown,
+  requestedStatus: unknown,
+) {
+  const businessId = validateBusinessId(businessIdInput);
+  const id = validateId(idInput);
+  await requireBusinessPermission(businessId, "invoices", "edit");
+
+  const target = normalizeStatus(str(requestedStatus) ?? "");
+
+  const existing = await prisma.invoice.findFirst({
+    where: { id, businessId },
+    select: { id: true, status: true },
+  });
+  if (!existing) throw new ResourceNotFoundError("Invoice not found");
+
+  const allowed = INVOICE_STATUS_TRANSITIONS[existing.status];
+  if (!allowed.includes(target)) {
+    throw new ConflictError(
+      `Invoice cannot transition from ${existing.status} to ${target}`,
+    );
+  }
+
+  const updated = await prisma.invoice.update({
+    where: { id },
+    data: { status: target },
+    include: { items: true },
+  });
+
+  return toInvoiceJson(updated);
+}
+
+// ---------------------------------------------------------------------------
 // DELETE — physical removal allowed ONLY for Draft invoices.
 //
 // POLICY: an invoice is (or has become) an accounting record. Issued /
@@ -990,7 +1144,7 @@ export async function updateInvoice(
 export async function deleteInvoice(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "delete");
 
   const existing = await prisma.invoice.findFirst({
     where: { id, businessId },

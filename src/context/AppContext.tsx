@@ -52,7 +52,7 @@ import { invoicesApi, toBackendInput as invoiceToBackendInput, fromBackendInvoic
 import { quotationsApi, toBackendInput as quotationToBackendInput, fromBackendQuotation } from "@/lib/api/quotations";
 import { estimatesApi, toBackendInput as estimateToBackendInput, fromBackendEstimate } from "@/lib/api/estimates";
 import { purchaseOrdersApi, toBackendInput as poToBackendInput, fromBackendPurchaseOrder } from "@/lib/api/purchaseOrders";
-import { expensesApi, toBackendInput as expenseToBackendInput, fromBackendExpense } from "@/lib/api/expenses";
+import { expensesApi, toBackendInput as expenseToBackendInput, toBackendUpdateInput as expenseToBackendUpdateInput, fromBackendExpense } from "@/lib/api/expenses";
 import { vehiclesApi, toBackendInput as vehicleToBackendInput, fromBackendVehicle } from "@/lib/api/vehicles";
 import { teamApi, toBackendInput as teamToBackendInput, fromBackendMember } from "@/lib/api/team";
 import { notificationsApi, fromBackendNotification } from "@/lib/api/notifications";
@@ -717,7 +717,7 @@ export const AppProvider: React.FC<{
           const { expense: updated } = await expensesApi.update(
             businessId,
             expense.id,
-            expenseToBackendInput(expense),
+            expenseToBackendUpdateInput(expense),
           );
           if (updated?.id) {
             setExpenses((prev) =>

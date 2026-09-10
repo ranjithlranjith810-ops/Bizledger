@@ -17,6 +17,13 @@
 
 import { prisma } from "@/lib/prisma";
 import { requireUser } from "@/lib/business/tenant";
+import {
+  canPerform,
+  effectivePermissions,
+  type AuthzAction,
+  type AuthzModule,
+  type AuthzRole,
+} from "@/lib/authz/authz-core";
 
 export interface CreateBusinessInput {
   name: string;
@@ -118,7 +125,7 @@ export async function getMyBusinesses() {
   }));
 }
 
-export type BusinessRole = "OWNER" | "ADMIN" | "MANAGER" | "STAFF";
+export type BusinessRole = AuthzRole;
 
 /**
  * Resolves a business for a specific authenticated user BY MEMBERSHIP ONLY.
@@ -128,6 +135,13 @@ export type BusinessRole = "OWNER" | "ADMIN" | "MANAGER" | "STAFF";
  * Throws BusinessNotFoundError if the user is not a member (or the business
  * does not exist) — never leaks whether the business exists or belongs to
  * another tenant.
+ *
+ * STATUS GATE (Security Hardening 1 — F1): this is the ONE centralized
+ * tenant-status rule. A membership that exists but is not ACTIVE (INVITED /
+ * SUSPENDED) or a business that is not ACTIVE (SUSPENDED) is rejected with
+ * 403. Every business-scoped service/route resolves scope through this helper,
+ * so deactivated/invited members and suspended businesses lose ALL data
+ * access — billing/team inline checks remain as defense-in-depth.
  */
 export async function getBusinessForMember(businessId: string) {
   const { user } = await requireUser();
@@ -145,7 +159,15 @@ export async function getBusinessForMember(businessId: string) {
     throw new BusinessNotFoundError();
   }
 
+  if (membership.status !== "ACTIVE") {
+    throw new ForbiddenError("Membership is not active");
+  }
+  if (membership.business.status !== "ACTIVE") {
+    throw new ForbiddenError("Business is not active");
+  }
+
   return {
+    user,
     membership,
     business: membership.business,
     branches: membership.business.branches,
@@ -170,6 +192,54 @@ export async function requireBusinessRole(
   }
 
   return ctx;
+}
+
+/**
+ * Server-side authorization gate (Security Hardening 1 — F2).
+ *
+ * Resolves the member's context (ACTIVE membership + ACTIVE business — F1)
+ * and evaluates the member's EFFECTIVE permissions for `(module, action)`:
+ *   role baseline (OWNER/ADMIN/MANAGER/STAFF) merged with any per-member
+ *   `permissions` override stored on the BusinessMember row.
+ *
+ * Role and permissions are ALWAYS derived from trusted server state (the
+ * membership row); anything the browser sends (role, userId, membershipId,
+ * permission flags) is ignored.
+ *
+ * Throws ForbiddenError (403) when the member lacks the permission.
+ */
+export async function requireBusinessPermission(
+  businessId: string,
+  module: AuthzModule,
+  action: AuthzAction,
+) {
+  const ctx = await getBusinessForMember(businessId);
+  assertPermission(ctx, module, action);
+  return ctx;
+}
+
+/**
+ * Synchronous permission check against an ALREADY-resolved context (from
+ * `getBusinessForMember` / `requireBusinessPermission`). Enables multi-gate
+ * operations (e.g. "create expense requires `expenses.create`; WRITING a
+ * status of Approved/Rejected additionally requires `expenses.approve`")
+ * without re-resolving the membership for each gate.
+ */
+export function assertPermission(
+  ctx: Awaited<ReturnType<typeof getBusinessForMember>>,
+  module: AuthzModule,
+  action: AuthzAction,
+) {
+  const effective = effectivePermissions(
+    ctx.membership.role as AuthzRole,
+    ctx.membership.permissions,
+  );
+
+  if (!canPerform(effective, module, action)) {
+    throw new ForbiddenError(
+      `Role '${ctx.membership.role}' is not authorized for '${module}.${action}'`,
+    );
+  }
 }
 
 export class BusinessNotFoundError extends Error {

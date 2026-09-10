@@ -12,7 +12,7 @@
 // precedent). Vehicle numbers are unique WITHIN a business.
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -353,7 +353,7 @@ function toVehicleJsonWithTotals(
 
 export async function createVehicle(businessIdInput: unknown, raw: Record<string, unknown>) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "vehicles", "manage");
   const data = normalizeVehicleInput(raw);
   try {
     const created = await prisma.vehicle.create({
@@ -376,7 +376,7 @@ export async function listVehicles(
   opts: { q?: string; status?: string; vehicleType?: string },
 ) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "vehicles", "view");
 
   const where: Prisma.VehicleWhereInput = { businessId };
   const q = String(opts?.q ?? "").trim().toLowerCase();
@@ -413,7 +413,7 @@ export async function listVehicles(
 export async function getVehicle(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "vehicles", "view");
 
   const vehicle = await prisma.vehicle.findFirst({ where: { id, businessId } });
   if (!vehicle) throw new ResourceNotFoundError("Vehicle not found");
@@ -428,7 +428,7 @@ export async function updateVehicle(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "vehicles", "manage");
 
   const existing = await prisma.vehicle.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Vehicle not found");
@@ -448,7 +448,7 @@ export async function updateVehicle(
 export async function deleteVehicle(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "vehicles", "manage");
 
   const existing = await prisma.vehicle.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Vehicle not found");

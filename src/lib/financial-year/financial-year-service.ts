@@ -12,7 +12,7 @@
 // stays aligned.
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -159,6 +159,21 @@ function toFinancialYearJson(fy: {
 export type FinancialYearJson = ReturnType<typeof toFinancialYearJson>;
 
 /**
+ * F10 — financial-year integrity gate. A new financial document (invoice,
+ * estimate, quotation, purchase order) may only be created against an ACTIVE
+ * financial year. When a year is closed (switched away / no longer active),
+ * historical documents remain readable, but NO new documents may be booked
+ * into it. Throws ValidationError (400) for closed years.
+ */
+export function assertFinancialYearActive(fy: { isActive: boolean }): void {
+  if (!fy.isActive) {
+    throw new ValidationError(
+      "The selected financial year is not active; new documents cannot be created in a closed financial year",
+    );
+  }
+}
+
+/**
  * Create a financial year in the member's verified business. Activates it when
  * it is the business's FIRST financial year. Enforces the single-active
  * invariant transactionally (a partial unique DB index on the business also
@@ -169,7 +184,7 @@ export async function createFinancialYear(
   raw: Record<string, unknown>,
 ) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "settings", "edit");
   // Non-partial normalization always populates name/startDate/endDate.
   const data = normalizeFinancialYearInput(raw) as {
     name: string;
@@ -207,7 +222,7 @@ export async function createFinancialYear(
  */
 export async function listFinancialYears(businessIdInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
 
   const rows = await prisma.financialYear.findMany({
     where: { businessId },
@@ -225,7 +240,7 @@ export async function getFinancialYear(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
 
   const fy = await prisma.financialYear.findFirst({ where: { id, businessId } });
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
@@ -238,7 +253,7 @@ export async function getFinancialYear(
  */
 export async function currentFinancialYear(businessIdInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
 
   const now = new Date();
 
@@ -271,7 +286,7 @@ export async function activateFinancialYear(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "settings", "edit");
 
   const fy = await prisma.financialYear.findFirst({ where: { id, businessId } });
   if (!fy) throw new ResourceNotFoundError("Financial year not found");

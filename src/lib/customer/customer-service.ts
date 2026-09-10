@@ -9,7 +9,8 @@
 // globally unique (duplicates are allowed across businesses).
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
+import { withEntitlementCheck } from "@/lib/billing/entitlements-server";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -224,17 +225,21 @@ export type CustomerJson = ReturnType<typeof toCustomerJson>;
  */
 export async function createCustomer(businessIdInput: unknown, raw: Record<string, unknown>) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "customers", "manage");
   const data = normalizeCustomerInput(raw);
 
-  const created = await prisma.customer.create({
-    data: {
-      businessId,
-      ...data,
-      code: data.code ?? `CUST-${Date.now().toString().slice(-6)}`,
-      createdDate: data.sinceDate ? new Date(data.sinceDate) : new Date(),
-    },
-  });
+  // F3: plan ceiling for customers enforced server-side inside ONE transaction
+  // (business-row lock → count → check → insert).
+  const created = await withEntitlementCheck(businessId, "customers", (tx) =>
+    tx.customer.create({
+      data: {
+        businessId,
+        ...data,
+        code: data.code ?? `CUST-${Date.now().toString().slice(-6)}`,
+        createdDate: data.sinceDate ? new Date(data.sinceDate) : new Date(),
+      },
+    }),
+  );
 
   return toCustomerJson(created);
 }
@@ -246,7 +251,7 @@ export async function createCustomer(businessIdInput: unknown, raw: Record<strin
  */
 export async function listCustomers(businessIdInput: unknown, opts: { q?: string }) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "customers", "view");
 
   const q = String(opts?.q ?? "").trim().toLowerCase();
 
@@ -273,7 +278,7 @@ export async function listCustomers(businessIdInput: unknown, opts: { q?: string
 export async function getCustomer(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "customers", "view");
 
   const customer = await prisma.customer.findFirst({
     where: { id, businessId },
@@ -293,7 +298,7 @@ export async function updateCustomer(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "customers", "manage");
 
   const existing = await prisma.customer.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Customer not found");
@@ -326,7 +331,7 @@ export async function updateCustomer(
 export async function deleteCustomer(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "customers", "manage");
 
   const existing = await prisma.customer.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Customer not found");

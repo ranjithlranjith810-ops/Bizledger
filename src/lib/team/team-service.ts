@@ -29,6 +29,13 @@ import {
   requireBusinessRole,
   ForbiddenError,
 } from "@/lib/business/business-service";
+import {
+  MEMBER_ROLES,
+  mergePermissions,
+  roleDefaultPermissions,
+  type AuthzRole,
+} from "@/lib/authz/authz-core";
+import { assertCreateAllowed } from "@/lib/billing/entitlements-server";
 import type { BusinessMemberRole as RoleEnum } from "@/generated/prisma/client";
 import {
   ValidationError,
@@ -37,10 +44,7 @@ import {
 } from "@/lib/business/api-error";
 import type { Prisma } from "@/generated/prisma/client";
 
-const MEMBER_ROLES = ["OWNER", "ADMIN", "MANAGER", "STAFF"] as const;
-type MemberRole = (typeof MEMBER_ROLES)[number];
-
-const ROLE_LABELS: Record<MemberRole, string> = {
+const ROLE_LABELS: Record<AuthzRole, string> = {
   OWNER: "Owner",
   ADMIN: "Accountant",
   MANAGER: "Manager",
@@ -52,60 +56,6 @@ const STATUS_LABELS: Record<string, string> = {
   INVITED: "Pending Invitation",
   SUSPENDED: "Suspended",
 };
-
-// Fixed-shape module permission allowlist (server-side mirror of the frontend
-// ModulePermissions type). Unknown modules/actions are rejected — the stored
-// `permissions` JSONB is never an arbitrary blob.
-const PERMISSION_KEYMAP: Record<string, string[]> = {
-  invoices: ["view", "create", "edit", "delete"],
-  expenses: ["view", "create", "approve", "delete"],
-  vehicles: ["view", "manage", "logExpenses"],
-  customers: ["view", "manage"],
-  reports: ["view", "export"],
-  settings: ["view", "edit"],
-};
-
-function roleDefaultPermissions(role: MemberRole): Record<string, Record<string, boolean>> {
-  if (role === "OWNER") {
-    return {
-      invoices: { view: true, create: true, edit: true, delete: true },
-      expenses: { view: true, create: true, approve: true, delete: true },
-      vehicles: { view: true, manage: true, logExpenses: true },
-      customers: { view: true, manage: true },
-      reports: { view: true, export: true },
-      settings: { view: true, edit: true },
-    };
-  }
-  if (role === "MANAGER") {
-    return {
-      invoices: { view: true, create: true, edit: true, delete: false },
-      expenses: { view: true, create: true, approve: true, delete: false },
-      vehicles: { view: true, manage: true, logExpenses: true },
-      customers: { view: true, manage: true },
-      reports: { view: true, export: true },
-      settings: { view: true, edit: false },
-    };
-  }
-  if (role === "ADMIN") {
-    // Frontend "Accountant" preset — same as Manager except fleet manage is off.
-    return {
-      invoices: { view: true, create: true, edit: true, delete: false },
-      expenses: { view: true, create: true, approve: true, delete: false },
-      vehicles: { view: true, manage: false, logExpenses: true },
-      customers: { view: true, manage: true },
-      reports: { view: true, export: true },
-      settings: { view: true, edit: false },
-    };
-  }
-  return {
-    invoices: { view: true, create: true, edit: false, delete: false },
-    expenses: { view: true, create: true, approve: false, delete: false },
-    vehicles: { view: true, manage: false, logExpenses: true },
-    customers: { view: true, manage: false },
-    reports: { view: false, export: false },
-    settings: { view: false, edit: false },
-  };
-}
 
 function str(v: unknown): string | undefined {
   if (v == null) return undefined;
@@ -120,33 +70,12 @@ function assertPlainObject(v: unknown): Record<string, unknown> {
   return v as Record<string, unknown>;
 }
 
-/** Validate an optional permissions override against the fixed key allowlist. */
-function normalizePermissions(role: MemberRole, raw: unknown): Record<string, Record<string, boolean>> {
-  const out = roleDefaultPermissions(role);
-  if (raw === undefined || raw === null) return out;
-
-  const input = assertPlainObject(raw);
-  for (const [module, allowedActions] of Object.entries(PERMISSION_KEYMAP)) {
-    const value = input[module];
-    if (value === undefined) continue;
-    const moduleValue = assertPlainObject(value);
-    const allowed = new Set(allowedActions);
-    for (const key of Object.keys(moduleValue)) {
-      if (!allowed.has(key)) {
-        throw new ValidationError(`Unknown permission '${module}.${key}'`);
-      }
-      if (typeof moduleValue[key] !== "boolean") {
-        throw new ValidationError(`Permission '${module}.${key}' must be a boolean`);
-      }
-      out[module][key] = Boolean(moduleValue[key]);
-    }
-  }
-  for (const key of Object.keys(input)) {
-    if (!(key in PERMISSION_KEYMAP)) {
-      throw new ValidationError(`Unknown permission module '${key}'`);
-    }
-  }
-  return out;
+/** Validate an optional permissions override against the fixed key allowlist.
+ * Role baselines and the allowlist live in `@/lib/authz/authz-core` (single
+ * server-side source of truth shared with the authorization guards). */
+function normalizePermissions(role: AuthzRole, raw: unknown): Record<string, Record<string, boolean>> {
+  if (raw === undefined || raw === null) return roleDefaultPermissions(role);
+  return mergePermissions(roleDefaultPermissions(role), assertPlainObject(raw));
 }
 
 function validateBusinessId(businessId: unknown): string {
@@ -178,7 +107,7 @@ function normalizeInviteInput(raw: Record<string, unknown>) {
     throw new ValidationError("Enter a valid email address");
   }
 
-  const role = str(raw.role) as MemberRole | undefined;
+  const role = str(raw.role) as AuthzRole | undefined;
   if (!role) throw new ValidationError("Role is required");
   if (!(MEMBER_ROLES as readonly string[]).includes(role)) {
     throw new ValidationError("Invalid role");
@@ -284,43 +213,50 @@ export async function inviteTeamMember(businessIdInput: unknown, raw: Record<str
 
   const data = normalizeInviteInput(raw);
 
-  const created = await prisma.$transaction(async (tx) => {
-    let user = await tx.user.findUnique({ where: { email: data.email } });
-    if (!user) {
-      // Placeholder User for a not-yet-registered invitee. Acceptance/join is a
-      // Phase 3G concern; email delivery deferred (no provider).
-      user = await tx.user.create({
+  const created = await prisma.$transaction(
+    async (tx) => {
+      // F3: the plan's team-seat ceiling is enforced server-side inside this
+      // transaction (business-row lock → count non-OWNER seats → check).
+      await assertCreateAllowed(tx, businessId, "teamMembers");
+
+      let user = await tx.user.findUnique({ where: { email: data.email } });
+      if (!user) {
+        // Placeholder User for a not-yet-registered invitee. Acceptance/join is a
+        // Phase 3G concern; email delivery deferred (no provider).
+        user = await tx.user.create({
+          data: {
+            id: randomUUID(),
+            name: data.name,
+            email: data.email,
+            emailVerified: false,
+          },
+        });
+      }
+
+      const existing = await tx.businessMember.findUnique({
+        where: { userId_businessId: { userId: user.id, businessId } },
+      });
+      if (existing) {
+        throw new DuplicateResourceError("This user is already a team member of this business");
+      }
+
+      return tx.businessMember.create({
         data: {
-          id: randomUUID(),
-          name: data.name,
-          email: data.email,
-          emailVerified: false,
+          userId: user.id,
+          businessId,
+          role: data.role,
+          status: "INVITED",
+          designation: data.designation,
+          phone: data.phone,
+          permissions: data.permissions,
+        },
+        include: {
+          user: { select: { id: true, name: true, email: true, image: true } },
         },
       });
-    }
-
-    const existing = await tx.businessMember.findUnique({
-      where: { userId_businessId: { userId: user.id, businessId } },
-    });
-    if (existing) {
-      throw new DuplicateResourceError("This user is already a team member of this business");
-    }
-
-    return tx.businessMember.create({
-      data: {
-        userId: user.id,
-        businessId,
-        role: data.role,
-        status: "INVITED",
-        designation: data.designation,
-        phone: data.phone,
-        permissions: data.permissions,
-      },
-      include: {
-        user: { select: { id: true, name: true, email: true, image: true } },
-      },
-    });
-  });
+    },
+    { timeout: 30001, maxWait: 30000 },
+  );
 
   return toTeamMemberJson(created);
 }

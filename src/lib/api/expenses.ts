@@ -7,7 +7,6 @@ export interface ExpenseBackendInput {
   title: string;
   amount: number;
   date: string;
-  expenseNumber?: string;
   category?: Expense["category"];
   paymentMethod?: Expense["paymentMethod"];
   expenseType?: Expense["expenseType"];
@@ -21,8 +20,6 @@ export interface ExpenseBackendInput {
   receiptSize?: string;
   vehicleId?: string;
   vehicleRegistration?: string;
-  createdBy?: string;
-  approvedBy?: string;
 }
 
 export interface ExpenseBackendJson {
@@ -50,13 +47,15 @@ export interface ExpenseBackendJson {
   updatedAt: string;
 }
 
-/** Frontend Expense -> backend payload. */
+/** Frontend Expense -> backend CREATE payload. F5: the server always mints the
+ * expense number and records the authenticated creator; the client never sends
+ * expenseNumber / createdBy / approvedBy. Only Paid / Pending may be chosen at
+ * create time (Approved/Rejected require `expenses.approve` regardless). */
 export function toBackendInput(expense: Omit<Expense, "id" | "createdAt">): ExpenseBackendInput {
   return {
     title: expense.title,
     amount: expense.amount,
     date: expense.date,
-    expenseNumber: expense.expenseNumber,
     category: expense.category,
     paymentMethod: expense.paymentMethod,
     expenseType: expense.expenseType,
@@ -70,9 +69,16 @@ export function toBackendInput(expense: Omit<Expense, "id" | "createdAt">): Expe
     receiptSize: expense.receiptSize || undefined,
     vehicleId: expense.vehicleId || undefined,
     vehicleRegistration: expense.vehicleRegistration || undefined,
-    createdBy: expense.createdBy || undefined,
-    approvedBy: expense.approvedBy || undefined,
   };
+}
+
+/** Frontend Expense -> backend UPDATE payload. F5: status (and every
+ * server-authoritative field) is excluded — status changes ONLY through the
+ * approve/reject endpoint. */
+export function toBackendUpdateInput(expense: Omit<Expense, "id" | "createdAt">): Partial<ExpenseBackendInput> {
+  const forCreate = toBackendInput(expense);
+  delete forCreate.status;
+  return forCreate;
 }
 
 /** Backend ExpenseJson -> frontend Expense shape (nulls become undefined). */

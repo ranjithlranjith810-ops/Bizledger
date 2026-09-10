@@ -16,7 +16,7 @@
 // converted into a NEW invoice, recorded via convertedInvoice* — one-time only.
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -42,6 +42,7 @@ import {
 } from "@/lib/sales-document/shared";
 import type { QuotationStatusT, PricingModeT } from "@/lib/sales-document/shared";
 import type { Prisma } from "@/generated/prisma/client";
+import { assertFinancialYearActive } from "@/lib/financial-year/financial-year-service";
 
 
 function normalizeStatus(status: string): QuotationStatusT {
@@ -211,7 +212,7 @@ export async function createQuotation(
   raw: Record<string, unknown>,
 ) {
   const businessId = validateBusinessId(businessIdInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "create");
   const business = ctx.business;
 
   const pricingMode = normalizePricingMode(
@@ -262,6 +263,7 @@ export async function createQuotation(
   ]);
   if (!customer) throw new ResourceNotFoundError("Customer not found");
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
+  assertFinancialYearActive(fy);
   if (found.length !== productIds.length) {
     throw new ResourceNotFoundError("One or more products were not found");
   }
@@ -370,7 +372,7 @@ export async function createQuotation(
 
 export async function listQuotations(businessIdInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
   const rows = await prisma.quotation.findMany({
     where: { businessId },
     orderBy: { quotationDate: "desc" },
@@ -385,7 +387,7 @@ export async function getQuotation(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
   const quotation = await prisma.quotation.findFirst({
     where: { id, businessId },
     include: quotationInclude(),
@@ -423,7 +425,7 @@ export async function updateQuotation(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
   const business = ctx.business;
 
   rejectProtectedKeys(raw, QUOTATION_PROTECTED_KEYS);
@@ -601,7 +603,7 @@ export async function updateQuotation(
 export async function deleteQuotation(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "delete");
 
   const existing = await prisma.quotation.findFirst({
     where: { id, businessId },

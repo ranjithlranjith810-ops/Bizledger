@@ -12,6 +12,12 @@
  * "act as another member" session exists yet, so runtime enforcement here uses
  * the Owner's (full) permissions. The matrix below stays authoritative for the
  * backend phase and is fully unit-testable.
+ *
+ * HARDENING 2: The SERVER matrix in src/lib/authz/authz-core.ts is the source
+ * of truth. Rows here must mirror it so the UI never advertises an action the
+ * server would reject: Manager cannot delete invoices/expenses nor edit
+ * settings; Accountant (server ADMIN) CAN approve expenses and manage
+ * customers. Only the Owner holds full access.
  */
 
 import { ModulePermissions, TeamRole } from "@/types";
@@ -42,18 +48,18 @@ export const NO_PERMISSIONS: ModulePermissions = {
 export const PERMISSIONS_BY_ROLE: Record<TeamRole, ModulePermissions> = {
   Owner: FULL_PERMISSIONS,
   Manager: {
-    invoices: { view: true, create: true, edit: true, delete: true },
-    expenses: { view: true, create: true, approve: true, delete: true },
+    invoices: { view: true, create: true, edit: true, delete: false },
+    expenses: { view: true, create: true, approve: true, delete: false },
     vehicles: { view: true, manage: true, logExpenses: true },
     customers: { view: true, manage: true },
     reports: { view: true, export: true },
-    settings: { view: true, edit: true },
+    settings: { view: true, edit: false },
   },
   Accountant: {
     invoices: { view: true, create: true, edit: true, delete: false },
-    expenses: { view: true, create: true, approve: false, delete: false },
+    expenses: { view: true, create: true, approve: true, delete: false },
     vehicles: { view: true, manage: false, logExpenses: true },
-    customers: { view: true, manage: false },
+    customers: { view: true, manage: true },
     reports: { view: true, export: true },
     settings: { view: true, edit: false },
   },

@@ -15,7 +15,7 @@
 // frontend value "Partially Received" cannot be a Prisma enum value).
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -40,6 +40,7 @@ import {
 } from "@/lib/sales-document/shared";
 import type { PoStatusT, PricingModeT } from "@/lib/sales-document/shared";
 import type { Prisma } from "@/generated/prisma/client";
+import { assertFinancialYearActive } from "@/lib/financial-year/financial-year-service";
 
 
 function normalizeStatus(status: string): PoStatusT {
@@ -195,7 +196,7 @@ export async function createPurchaseOrder(
   raw: Record<string, unknown>,
 ) {
   const businessId = validateBusinessId(businessIdInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "create");
   const business = ctx.business;
 
   const pricingMode = normalizePricingMode(
@@ -237,6 +238,7 @@ export async function createPurchaseOrder(
         }[]),
   ]);
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
+  assertFinancialYearActive(fy);
   if (found.length !== productIds.length) {
     throw new ResourceNotFoundError("One or more products were not found");
   }
@@ -319,7 +321,7 @@ export async function createPurchaseOrder(
 
 export async function listPurchaseOrders(businessIdInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
   const rows = await prisma.purchaseOrder.findMany({
     where: { businessId },
     orderBy: { poDate: "desc" },
@@ -334,7 +336,7 @@ export async function getPurchaseOrder(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
   const po = await prisma.purchaseOrder.findFirst({
     where: { id, businessId },
     include: purchaseOrderInclude(),
@@ -367,7 +369,7 @@ export async function updatePurchaseOrder(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
   const business = ctx.business;
 
   rejectProtectedKeys(raw, PO_PROTECTED_KEYS);
@@ -540,7 +542,7 @@ export async function updatePurchaseOrder(
 export async function deletePurchaseOrder(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "delete");
 
   const existing = await prisma.purchaseOrder.findFirst({
     where: { id, businessId },

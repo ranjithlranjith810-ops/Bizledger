@@ -17,6 +17,7 @@ import {
   RazorpayApiError,
   RazorpayConfigError,
 } from "@/lib/billing/razorpay";
+import { EntitlementDeniedError } from "@/lib/billing/entitlements-server";
 
 /**
  * Request-payload validation failure. Mapped to 400 Bad Request.
@@ -93,6 +94,21 @@ export function handleApiError(error: unknown) {
   }
   if (error instanceof ConflictError) {
     return NextResponse.json({ error: error.message }, { status: 409 });
+  }
+  // Plan-ceiling denial (Security Hardening 1 — F3). 403 with a stable,
+  // machine-readable payload the frontend can map to an upgrade banner. No
+  // subscription row/plan/payment internals are disclosed.
+  if (error instanceof EntitlementDeniedError) {
+    return NextResponse.json(
+      {
+        error: "Plan limit reached",
+        code: "ENTITLEMENT_LIMIT",
+        kind: error.kind,
+        limit: error.limit,
+        used: error.used,
+      },
+      { status: 403 },
+    );
   }
   // Upstream provider failures are ALREADY sanitized by the Razorpay provider
   // (never carry secrets/headers). Config gaps are environmental, not client

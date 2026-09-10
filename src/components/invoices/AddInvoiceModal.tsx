@@ -443,7 +443,6 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
                 className="w-full bg-white border border-[#eceef0] focus:border-[#93000b] py-2 px-3 rounded-lg outline-none font-medium"
               >
                 <option value="Pending">Pending Payment</option>
-                <option value="Paid">Mark as Paid</option>
               </select>
             </div>
 

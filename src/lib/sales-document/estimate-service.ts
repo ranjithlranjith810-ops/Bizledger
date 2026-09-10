@@ -17,7 +17,7 @@
 // fields back out for rendering.
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -43,6 +43,7 @@ import {
 } from "@/lib/sales-document/shared";
 import type { EstimateStatusT, PricingModeT } from "@/lib/sales-document/shared";
 import type { Prisma } from "@/generated/prisma/client";
+import { assertFinancialYearActive } from "@/lib/financial-year/financial-year-service";
 
 
 function normalizeStatus(status: string): EstimateStatusT {
@@ -212,7 +213,7 @@ export async function createEstimate(
   raw: Record<string, unknown>,
 ) {
   const businessId = validateBusinessId(businessIdInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "create");
   const business = ctx.business;
 
   const pricingMode = normalizePricingMode(
@@ -257,6 +258,7 @@ export async function createEstimate(
   ]);
   if (!customer) throw new ResourceNotFoundError("Customer not found");
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
+  assertFinancialYearActive(fy);
   if (found.length !== productIds.length) {
     throw new ResourceNotFoundError("One or more products were not found");
   }
@@ -345,7 +347,7 @@ export async function createEstimate(
 
 export async function listEstimates(businessIdInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
   const rows = await prisma.estimate.findMany({
     where: { businessId },
     orderBy: { estimateDate: "desc" },
@@ -357,7 +359,7 @@ export async function listEstimates(businessIdInput: unknown) {
 export async function getEstimate(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
   const estimate = await prisma.estimate.findFirst({
     where: { id, businessId },
     include: estimateInclude(),
@@ -394,7 +396,7 @@ export async function updateEstimate(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
   const business = ctx.business;
 
   rejectProtectedKeys(raw, ESTIMATE_PROTECTED_KEYS);
@@ -572,7 +574,7 @@ export async function updateEstimate(
 export async function deleteEstimate(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "delete");
 
   const existing = await prisma.estimate.findFirst({
     where: { id, businessId },

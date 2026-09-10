@@ -27,6 +27,11 @@ import {
   DuplicateResourceError,
 } from "@/lib/business/api-error";
 import { INDIAN_STATES } from "@/lib/india";
+import { getLimitFor } from "@/lib/plans";
+import {
+  EntitlementDeniedError,
+  resolveEffectivePlan,
+} from "@/lib/billing/entitlements-server";
 import type { DirectoryStatus as StatusEnum } from "@/generated/prisma/client";
 import type { Prisma } from "@/generated/prisma/client";
 
@@ -435,19 +440,40 @@ export async function saveMyDirectoryProfile(businessIdInput: unknown, raw: Reco
 /**
  * POST /api/directory/mine/submit?businessId=... — submit the listing for
  * moderation (PENDING_REVIEW) and take it off the public directory.
+ *
+ * F3: a listing that goes live consumes a plan allowance. Submitting is denied
+ * when the effective plan allows ZERO directory listings and the profile is not
+ * already live (Free plan → 403 ENTITLEMENT_LIMIT). Resubmitting an existing
+ * live/ever-listed profile is allowed on any plan that grants >=1 listing
+ * (Business/Enterprise) — the single-profile uniqueness constraint is the hard
+ * upper bound, so a business can never hold more listings than it is granted.
  */
 export async function submitMyDirectoryProfile(businessIdInput: unknown) {
   const businessId = await resolveBusiness(businessIdInput);
-  const existing = await prisma.businessDirectoryProfile.findUnique({
-    where: { businessId },
-  });
-  if (!existing) throw new ResourceNotFoundError("No listing to submit");
 
-  const profile = await prisma.businessDirectoryProfile.update({
-    where: { businessId },
-    data: { status: "PENDING_REVIEW", isListed: false },
+  return prisma.$transaction(async (tx) => {
+    const existing = await tx.businessDirectoryProfile.findUnique({
+      where: { businessId },
+    });
+    if (!existing) throw new ResourceNotFoundError("No listing to submit");
+
+    const { plan } = await resolveEffectivePlan(tx, businessId);
+    const limit = getLimitFor(plan, "directoryListing");
+    const cap = typeof limit === "number" ? limit : null;
+    if (
+      cap === 0 &&
+      existing.status !== "PENDING_REVIEW" &&
+      existing.status !== "PUBLISHED"
+    ) {
+      throw new EntitlementDeniedError("directoryListing", 0, 0);
+    }
+
+    const profile = await tx.businessDirectoryProfile.update({
+      where: { businessId },
+      data: { status: "PENDING_REVIEW", isListed: false },
+    });
+    return toMineJson(profile);
   });
-  return toMineJson(profile);
 }
 
 /**

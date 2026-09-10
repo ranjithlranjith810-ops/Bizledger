@@ -8,7 +8,8 @@
 // business-scoped and NOT globally unique.
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import { requireBusinessPermission } from "@/lib/business/business-service";
+import { withEntitlementCheck } from "@/lib/billing/entitlements-server";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -151,19 +152,22 @@ export type ProductJson = ReturnType<typeof toProductJson>;
  */
 export async function createProduct(businessIdInput: unknown, raw: Record<string, unknown>) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "create");
   const data = normalizeProductInput(raw);
   const { name } = data;
   if (!name) throw new ValidationError("Product name is required");
 
-  const created = await prisma.product.create({
-    data: {
-      businessId,
-      ...data,
-      name,
-      sku: data.sku ?? `SKU-${Date.now().toString().slice(-6)}`,
-    },
-  });
+  // F3: plan ceiling for products enforced server-side inside ONE transaction.
+  const created = await withEntitlementCheck(businessId, "products", (tx) =>
+    tx.product.create({
+      data: {
+        businessId,
+        ...data,
+        name,
+        sku: data.sku ?? `SKU-${Date.now().toString().slice(-6)}`,
+      },
+    }),
+  );
 
   return toProductJson(created);
 }
@@ -175,7 +179,7 @@ export async function createProduct(businessIdInput: unknown, raw: Record<string
  */
 export async function listProducts(businessIdInput: unknown, opts: { q?: string }) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
 
   const q = String(opts?.q ?? "").trim().toLowerCase();
 
@@ -203,7 +207,7 @@ export async function listProducts(businessIdInput: unknown, opts: { q?: string 
 export async function getProduct(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "view");
 
   const product = await prisma.product.findFirst({ where: { id, businessId } });
   if (!product) throw new ResourceNotFoundError("Product not found");
@@ -220,7 +224,7 @@ export async function updateProduct(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
   const existing = await prisma.product.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Product not found");
@@ -240,7 +244,7 @@ export async function updateProduct(
 export async function deleteProduct(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
   const existing = await prisma.product.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Product not found");

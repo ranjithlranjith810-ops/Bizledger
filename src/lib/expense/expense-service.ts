@@ -18,10 +18,16 @@
 // Eligible" decorative badge). Expense GST calculation is therefore DEFERRED.
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import {
+  requireBusinessPermission,
+  requireBusinessRole,
+  assertPermission,
+  ForbiddenError,
+} from "@/lib/business/business-service";
 import {
   ValidationError,
   ResourceNotFoundError,
+  ConflictError,
 } from "@/lib/business/api-error";
 import type { Prisma } from "@/generated/prisma/client";
 
@@ -152,7 +158,6 @@ const category = str(raw.category);
   }
 
   for (const k of [
-    "expenseNumber",
     "paidFromAccount",
     "referenceNumber",
     "vendor",
@@ -161,8 +166,6 @@ const category = str(raw.category);
     "receiptName",
     "receiptSize",
     "vehicleRegistration",
-    "createdBy",
-    "approvedBy",
   ]) {
     const v = str(raw[k]);
     if (v !== undefined) {
@@ -191,7 +194,9 @@ const category = str(raw.category);
   }
 
   if (!partial) {
-    out.expenseNumber = str(raw.expenseNumber) ?? generateExpenseNumber();
+    // F5: the expense number is ALWAYS minted server-side. A forged
+    // expenseNumber in the body is ignored — it never reaches the whitelist.
+    out.expenseNumber = generateExpenseNumber();
     out.category = category ?? "Other";
     out.paymentMethod = paymentMethod ?? "Bank Transfer";
     out.expenseType = expenseType ?? "Direct";
@@ -288,8 +293,20 @@ async function resolveVehicleForExpense(vehicleId: string | undefined) {
 
 export async function createExpense(businessIdInput: unknown, raw: Record<string, unknown>) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  const ctx = await requireBusinessPermission(businessId, "expenses", "create");
   const data = normalizeExpenseInput(raw);
+
+  // Writing an Approved/Rejected status is an APPROVAL action — it requires
+  // `expenses.approve` (F2), even when the expense itself is being created.
+  if (data.status === "Approved" || data.status === "Rejected") {
+    assertPermission(ctx, "expenses", "approve");
+  }
+
+  // F5 — server-authoritative provenance: the authenticated member is ALWAYS
+  // recorded as the creator and nothing in the browser body can forge it (the
+  // body's createdBy/approvedBy keys were stripped before normalization). The
+  // expense number was already minted server-side in normalizeExpenseInput.
+  // approvedBy stays null here — it is set only by the explicit approval op.
 
   let vehicleRegistration: string | undefined;
   const vehicleId = data.vehicleId as string | undefined;
@@ -305,6 +322,8 @@ export async function createExpense(businessIdInput: unknown, raw: Record<string
     data: {
       businessId,
       ...(data as Omit<Prisma.ExpenseUncheckedCreateInput, "businessId">),
+      createdBy: ctx.user.name,
+      approvedBy: null,
       ...(vehicleRegistration
         ? { vehicleRegistration }
         : { vehicleRegistration: (data.vehicleRegistration as string | null) ?? null }),
@@ -318,7 +337,7 @@ export async function listExpenses(
   opts: { q?: string; category?: string; paymentMethod?: string; status?: string },
 ) {
   const businessId = validateBusinessId(businessIdInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "expenses", "view");
 
   const where: Prisma.ExpenseWhereInput = { businessId };
   const q = String(opts?.q ?? "").trim().toLowerCase();
@@ -356,7 +375,7 @@ export async function listExpenses(
 export async function getExpense(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "expenses", "view");
 
   const expense = await prisma.expense.findFirst({ where: { id, businessId } });
   if (!expense) throw new ResourceNotFoundError("Expense not found");
@@ -370,7 +389,22 @@ export async function updateExpense(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  // The expenses module has no `edit` permission (its keymap is only
+  // view/create/approve/delete), so editing expense FIELDS is a sanctioned
+  // action reserved for Owner / Accountant / Manager — apply the role gate.
+  // F5 hardening keeps `status`/`createdBy`/`approvedBy`/`expenseNumber`
+  // server-authoritative below; only explicit approval may change status.
+  await requireBusinessRole(businessId, ["OWNER", "ADMIN", "MANAGER"]);
+
+  // F5 — expense status is server-authoritative. Only the explicit approval
+  // operation (approveExpense) may change it; a forged status on PATCH is
+  // rejected outright. createdBy / approvedBy / expenseNumber were stripped
+  // from the accepted whitelist, so they are ignored here too.
+  if (raw.status !== undefined) {
+    throw new ValidationError(
+      "Expense status must be changed via the approve/reject endpoint",
+    );
+  }
 
   const existing = await prisma.expense.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Expense not found");
@@ -408,10 +442,70 @@ export async function updateExpense(
   return toExpenseJson(updated);
 }
 
+// F5 — explicit, server-authorized approval operation. The ONLY path that
+// changes expense status. Requires `expenses.approve`, sets `approvedBy` to
+// the authenticated approver (never the browser), and REFUSES self-approval
+// (the creator cannot approve/reject their own expense — creator is recorded
+// server-side at create time). Unpermitted transitions -> 409.
+const EXPENSE_APPROVAL_TRANSITIONS: Record<string, readonly string[]> = {
+  Paid: ["Approved", "Rejected"],
+  Pending: ["Approved", "Rejected"],
+  Approved: ["Rejected"],
+  Rejected: [],
+};
+
+export async function decideExpenseApproval(
+  businessIdInput: unknown,
+  idInput: unknown,
+  decisionInput: unknown,
+) {
+  const businessId = validateBusinessId(businessIdInput);
+  const id = validateId(idInput);
+  const ctx = await requireBusinessPermission(businessId, "expenses", "approve");
+
+  const decision = String(decisionInput ?? "").trim().toUpperCase();
+  if (decision !== "APPROVE" && decision !== "REJECT") {
+    throw new ValidationError('decision must be "APPROVE" or "REJECT"');
+  }
+  const targetStatus = decision === "APPROVE" ? "Approved" : "Rejected";
+
+  const existing = await prisma.expense.findFirst({
+    where: { id, businessId },
+    select: { id: true, status: true, createdBy: true },
+  });
+  if (!existing) throw new ResourceNotFoundError("Expense not found");
+
+  // F5 — self-approval prevention. The creator is server-recorded, so a creator
+  // can never approve (or overturn) their own expense — an independent reviewer
+  // must act.
+  if (
+    existing.createdBy &&
+    ctx.user.name &&
+    existing.createdBy === ctx.user.name
+  ) {
+    throw new ForbiddenError(
+      "You cannot approve or reject an expense you created",
+    );
+  }
+
+  const allowed = EXPENSE_APPROVAL_TRANSITIONS[existing.status] ?? [];
+  if (!allowed.includes(targetStatus)) {
+    throw new ConflictError(
+      `Expense cannot transition from ${existing.status} to ${targetStatus}`,
+    );
+  }
+
+  const updated = await prisma.expense.update({
+    where: { id },
+    data: { status: targetStatus, approvedBy: ctx.user.name },
+  });
+  return toExpenseJson(updated);
+}
+
 export async function deleteExpense(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await getBusinessForMember(businessId);
+  await requireBusinessPermission(businessId, "expenses", "delete");
 
   const existing = await prisma.expense.findFirst({ where: { id, businessId } });
   if (!existing) throw new ResourceNotFoundError("Expense not found");
