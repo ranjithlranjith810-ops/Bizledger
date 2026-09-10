@@ -28,15 +28,16 @@ export function isUnlimited(value: number | "Unlimited"): boolean {
   return value === UNLIMITED || value === -1;
 }
 
-// Backward-compatible guard: whether an ACTIVE (paid) plan is currently in
-// effect. This only reflects a successful paid subscription. For entitlement
-// decisions prefer `getEffectivePlan` (which never yields null for a valid
-// account) — see `plans.ts`.
+// Backward-compatible guard: whether the subscribed (paid) plan is currently in
+// effect. Both "active" and "grace" count — the subscribed plan governs during
+// the grace window (server decides the effective status; the client mirrors).
+// For entitlement decisions prefer `getEffectivePlan` (which never yields null
+// for a valid account) — see `plans.ts`.
 export function getActivePlan(
   plans: SubscriptionPlan[],
   state: SubscriptionState | null
 ): SubscriptionPlan | null {
-  if (!state || state.status !== "active") return null;
+  if (!state || (state.status !== "active" && state.status !== "grace")) return null;
   if (!state.currentPlanId) return null;
   return getPlanById(plans, state.currentPlanId);
 }

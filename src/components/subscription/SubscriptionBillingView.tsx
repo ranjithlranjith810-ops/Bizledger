@@ -168,7 +168,9 @@ export const SubscriptionBillingView: React.FC = () => {
   };
 
   const isActive = !!currentPlan;
-  const isPaidPlan = subscription?.status === "active";
+  const isPaidPlan = subscription?.status === "active" || subscription?.status === "grace";
+  const isGracePeriod = subscription?.status === "grace";
+  const graceEndsAt = subscription?.billing?.graceEndsAt ?? null;
 
   const goCheckout = (planId: SubscriptionPlan["id"]) => {
     if (planId === currentPlanId) return;
@@ -197,6 +199,16 @@ export const SubscriptionBillingView: React.FC = () => {
           </button>
         )}
       </div>
+
+      {/* Grace-period banner — the paid period has ended but the subscribed plan
+          still governs for the server-computed grace window. */}
+      {isGracePeriod && (
+        <div className="bg-amber-50 border border-amber-200 text-amber-900 px-4 py-3 rounded-xl text-xs font-semibold shadow-xs mb-6">
+          Your subscription period has ended — you're in the grace period. Renew by{" "}
+          {graceEndsAt ? fmtDate(graceEndsAt) : "the grace deadline"} to keep the{" "}
+          {planDisplayName} plan; afterwards you'll be on the free plan.
+        </div>
+      )}
 
       {/* Current Active Plan Overview & Usage Gauges */}
       <div className="bg-white p-6 rounded-2xl border border-[#eceef0] shadow-xs space-y-6">

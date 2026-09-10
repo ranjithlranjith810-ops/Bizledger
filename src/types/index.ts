@@ -421,7 +421,11 @@ export interface SubscriptionPlan {
 
 export type PaymentMethod = 'upi' | 'card' | 'netbanking' | 'wallet';
 export type PaymentOutcome = 'success' | 'failed' | 'cancelled';
-export type SubscriptionStatus = 'active' | 'none' | 'suspended';
+// Client mirror of the server-effective subscription lifecycle. 'grace' is an
+// effective (not stored) state: the paid period ended but the subscribed plan
+// still governs during the 3-calendar-day grace window. The server DTO is
+// authoritative; the client never derives this from the browser clock.
+export type SubscriptionStatus = 'active' | 'grace' | 'none' | 'suspended';
 
 export interface PaymentRecord {
   id: string;
@@ -447,10 +451,14 @@ export interface PaymentRecord {
 export interface SubscriptionBilling {
   period: 'month' | 'year';
   startedAt: string | null; // ISO
-  renewsAt: string | null; // ISO next billing date
+  renewsAt: string | null; // ISO next billing date (paid-period end)
   amount: number; // base amount (pre-GST)
   gstRate: number;
   lastPaidAt?: string | null; // ISO
+  // Effective-lifecycle metadata (server-supplied; null/false when not in a
+  // grace or expired window). graceEndsAt is the ISO instant FREE begins.
+  graceEndsAt?: string | null;
+  renewalRequired?: boolean;
 }
 
 // SINGLE source of truth for subscription state (persisted per account).

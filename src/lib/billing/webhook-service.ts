@@ -45,7 +45,7 @@ import {
   verifyWebhookSignature as defaultVerifyWebhookSignature,
   webhookConfigured,
 } from "@/lib/billing/razorpay";
-import { inrToPaise } from "@/lib/billing/calculator";
+import { inrToPaise, moneyString } from "@/lib/billing/calculator";
 import {
   capturedAtFromEntity,
   extractSafePaymentMethod,
@@ -54,6 +54,8 @@ import {
 } from "@/lib/billing/billing-invoice-service";
 import { ValidationError } from "@/lib/business/api-error";
 import { PaymentStatus, SubscriptionStatus } from "@/generated/prisma/enums";
+import { computeSubscriptionLifecycle } from "@/lib/plans";
+import { getActivePlanForBilling } from "@/lib/billing/plan-service";
 
 export interface WebhookInput {
   rawBody: string;
@@ -79,6 +81,7 @@ export type WebhookReason =
   | "FAILED_PAYMENT_ID_CONFLICT"
   | "NO_SUBSCRIPTION"
   | "PLAN_MISMATCH"
+  | "PLAN_UNAVAILABLE"
   | "UNEXPECTED_ACTIVATION_STATE"
   | "UNEXPECTED_STATE"
   | "ACTIVATION_CONFLICT";
@@ -606,9 +609,18 @@ type ActivationOutcome =
   | { type: "blocked"; reason: WebhookReason };
 
 /**
- * Activates a PENDING → ACTIVE subscription and records exactly ONE
- * SubscriptionEvent. Already-ACTIVE subscriptions stay ACTIVE with no second
- * activation record; other statuses are never resurrected.
+ * Activates a subscription after a VERIFIED payment. Exactly ONE
+ * SubscriptionEvent is recorded; already-ACTIVE subscriptions stay ACTIVE with
+ * no second activation record; other statuses are never resurrected.
+ *
+ * Two activation modes:
+ *   LINKED  (subscriptionId set — first-time purchase)  → promote PENDING→ACTIVE.
+ *   UNLINKED (subscriptionId null — renewal/upgrade after the paid period,
+ *   Phase 7): never a row mutation of a possibly-fine subscription. The prior
+ *   governing ACTIVE row is retired to EXPIRED and a brand-new ACTIVE row for
+ *   the paid plan is created, and the payment is linked to it — atomically —
+ *   ONLY after the money has been verified (the old row stays raw-ACTIVE the
+ *   whole time between checkout and webhook success).
  */
 async function activateSubscription(
   tx: Prisma.TransactionClient,
@@ -616,12 +628,13 @@ async function activateSubscription(
   eventId: string,
   record: PaymentRow,
 ): Promise<ActivationOutcome> {
-  let matched =
-    record.subscriptionId !== null
-      ? await tx.businessSubscription.findUnique({
-          where: { id: record.subscriptionId },
-        })
-      : null;
+  if (record.subscriptionId === null) {
+    return activateRenewal(tx, auditId, eventId, record);
+  }
+
+  let matched = await tx.businessSubscription.findUnique({
+    where: { id: record.subscriptionId },
+  });
 
   if (!matched) {
     matched = await tx.businessSubscription.findFirst({
@@ -717,4 +730,213 @@ async function activateSubscription(
   });
 
   return { type: "activated", subscriptionId: matched.id };
+}
+
+/**
+ * Renewal/upgrade activation for an UNLINKED payment (subscriptionId null).
+ *
+ * The checkout deliberately created NO pending row and left the prior ACTIVE
+ * row untouched until now. On a VERIFIED payment this atomically:
+ *   1. guards idempotency (a replay already linked the payment → ALREADY_ACTIVE)
+ *   2. retires the governing raw-ACTIVE row to EXPIRED — only when its derived
+ *      lifecycle is past-paid (GRACE/EXPIRED), never when it is still ACTIVE
+ *      (a renewal must not cancel time that is still paid)
+ *   3. creates a brand-new ACTIVE row for the STORED plan/period with a fresh
+ *      planSnapshot from plan_catalog (never the webhook body)
+ *   4. links the payment → created subscription (durable idempotency)
+ *   5. records a `superseded` event on the old row and an `activation` event on
+ *      the new one (both in this same transaction)
+ *
+ * Concurrency: two simultaneous renewal webhooks for the same business race on
+ * the retire-CAS of the SAME prior row; the loser re-reads the frontier (now the
+ * winner's brand-new ACTIVE row) and reports ALREADY_ACTIVE — the one-PENDING-
+ * or-ACTIVE partial unique index can never be violated.
+ */
+async function activateRenewal(
+  tx: Prisma.TransactionClient,
+  auditId: string,
+  eventId: string,
+  record: PaymentRow,
+): Promise<ActivationOutcome> {
+  // Durable idempotency: verify the STORED link state in this transaction — a
+  // replay of the same order must not mint a second subscription.
+  const fresh = await tx.paymentRecord.findUnique({
+    where: { id: record.id },
+    select: { subscriptionId: true },
+  });
+  if (fresh?.subscriptionId) {
+    const linked = await tx.businessSubscription.findUnique({
+      where: { id: fresh.subscriptionId },
+      select: { status: true },
+    });
+    if (linked?.status === SubscriptionStatus.ACTIVE) {
+      await tx.webhookEvent.update({
+        where: { id: auditId },
+        data: { processed: true, error: "ALREADY_ACTIVE" },
+      });
+      return { type: "blocked", reason: "ALREADY_ACTIVE" };
+    }
+    await tx.webhookEvent.update({
+      where: { id: auditId },
+      data: { processed: true, error: "ACTIVATION_CONFLICT" },
+    });
+    return { type: "blocked", reason: "ACTIVATION_CONFLICT" };
+  }
+
+  // The governing row is the raw-ACTIVE subscription that was in GRACE/EXPIRED
+  // when the customer checked out (expiry is DERIVED, so the row is still
+  // ACTIVE — nothing mutated it at checkout).
+  const governing = await tx.businessSubscription.findFirst({
+    where: {
+      businessId: record.businessId,
+      status: { in: [SubscriptionStatus.PENDING, SubscriptionStatus.ACTIVE] },
+    },
+    orderBy: { createdAt: "desc" },
+  });
+
+  if (!governing) {
+    await tx.webhookEvent.update({
+      where: { id: auditId },
+      data: { processed: true, error: "NO_SUBSCRIPTION" },
+    });
+    return { type: "blocked", reason: "NO_SUBSCRIPTION" };
+  }
+
+  if (governing.status === SubscriptionStatus.PENDING) {
+    // A concurrent first-purchase created a PENDING row. This renewal payment
+    // was NOT created against it — never hijack another purchase's subscription.
+    await tx.webhookEvent.update({
+      where: { id: auditId },
+      data: { processed: true, error: "UNEXPECTED_ACTIVATION_STATE" },
+    });
+    return { type: "blocked", reason: "UNEXPECTED_ACTIVATION_STATE" };
+  }
+
+  // governing.status === ACTIVE. Retire it ONLY if it has genuinely passed its
+  // paid period against the SERVER clock (GRACE/EXPIRED). A still-ACTIVE plan
+  // means another renewal already superseded this one → ALREADY_ACTIVE.
+  const lifecycle = computeSubscriptionLifecycle(governing.renewsAt, new Date());
+  if (lifecycle.status === "ACTIVE") {
+    await tx.webhookEvent.update({
+      where: { id: auditId },
+      data: { processed: true, error: "ALREADY_ACTIVE" },
+    });
+    return { type: "blocked", reason: "ALREADY_ACTIVE" };
+  }
+
+  // Plan snapshot authority: the STORED planId (from the PaymentRecord that the
+  // checkout -not the webhook- created), read from the ACTIVE plan_catalog. If
+  // the plan is no longer purchasable, block rather than invent a snapshot.
+  const plan = await getActivePlanForBilling(record.planId);
+  if (!plan) {
+    await tx.webhookEvent.update({
+      where: { id: auditId },
+      data: { processed: true, error: "PLAN_UNAVAILABLE" },
+    });
+    return { type: "blocked", reason: "PLAN_UNAVAILABLE" };
+  }
+
+  // Compare-and-swap retire: retires only if the row is STILL the ACTIVE row.
+  // The row lock serializes concurrent renewal deliveries for this business.
+  const retired = await tx.businessSubscription.updateMany({
+    where: { id: governing.id, status: SubscriptionStatus.ACTIVE },
+    data: { status: SubscriptionStatus.EXPIRED, endedAt: new Date() },
+  });
+
+  if (retired.count === 0) {
+    // A concurrent renewal already retired this row. Re-evaluate the frontier.
+    const frontier = await tx.businessSubscription.findFirst({
+      where: {
+        businessId: record.businessId,
+        status: { in: [SubscriptionStatus.PENDING, SubscriptionStatus.ACTIVE] },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    if (frontier?.status === SubscriptionStatus.ACTIVE) {
+      await tx.webhookEvent.update({
+        where: { id: auditId },
+        data: { processed: true, error: "ALREADY_ACTIVE" },
+      });
+      return { type: "blocked", reason: "ALREADY_ACTIVE" };
+    }
+    await tx.webhookEvent.update({
+      where: { id: auditId },
+      data: { processed: true, error: "ACTIVATION_CONFLICT" },
+    });
+    return { type: "blocked", reason: "ACTIVATION_CONFLICT" };
+  }
+
+  const snapshot: Prisma.InputJsonValue = {
+    id: plan.id,
+    name: plan.name,
+    price: moneyString(plan.price),
+    period: record.billingPeriod,
+    businessNetworkIncluded: plan.businessNetworkIncluded,
+    limits: plan.limits,
+  } as Prisma.InputJsonValue;
+
+  // Renewal is driven by the STORED billing period (authoritative): month →
+  // +30 days, year → +365 days (mirrors AppContext / SubscriptionService).
+  const renewalDays = record.billingPeriod === "year" ? 365 : 30;
+  const startedAt = new Date();
+  const renewsAt = new Date(startedAt.getTime() + renewalDays * 86400000);
+
+  const created = await tx.businessSubscription.create({
+    data: {
+      businessId: record.businessId,
+      planId: record.planId,
+      status: SubscriptionStatus.ACTIVE,
+      period: record.billingPeriod,
+      planSnapshot: snapshot,
+      startedAt,
+      renewsAt,
+    },
+    select: { id: true },
+  });
+
+  // Link for durable idempotency of later replays/deliveries of the same order.
+  await tx.paymentRecord.update({
+    where: { id: record.id },
+    data: { subscriptionId: created.id },
+  });
+
+  await tx.subscriptionEvent.create({
+    data: {
+      subscriptionId: governing.id,
+      type: "superseded",
+      payload: {
+        businessId: record.businessId,
+        previousPlanId: governing.planId,
+        previousPeriod: governing.period,
+        planId: record.planId,
+        billingPeriod: record.billingPeriod,
+        status: SubscriptionStatus.EXPIRED,
+        orderId: record.orderId,
+        paymentId: record.paymentId,
+        webhookEventId: eventId,
+        supersededAt: new Date().toISOString(),
+      } as Prisma.InputJsonValue,
+    },
+  });
+
+  await tx.subscriptionEvent.create({
+    data: {
+      subscriptionId: created.id,
+      type: "activation",
+      payload: {
+        businessId: record.businessId,
+        planId: record.planId,
+        planName: record.planName,
+        billingPeriod: record.billingPeriod,
+        subscriptionId: created.id,
+        status: SubscriptionStatus.ACTIVE,
+        orderId: record.orderId,
+        paymentId: record.paymentId,
+        webhookEventId: eventId,
+        activatedAt: new Date().toISOString(),
+      } as Prisma.InputJsonValue,
+    },
+  });
+
+  return { type: "activated", subscriptionId: created.id };
 }

@@ -117,6 +117,88 @@ export const PLAN_CATALOG: SubscriptionPlan[] = [
 // the count of ADDITIONAL team members at 0, so a Free account cannot add seats.
 export const FREE_PLAN_ID: SubscriptionPlanId = "base";
 
+// ---------------------------------------------------------------------------
+// Subscription lifecycle (expiry + grace) — SHARED, pure, server-authoritative.
+// ---------------------------------------------------------------------------
+//
+// The only constant in the system: how long a business keeps its subscribed-plan
+// entitlements after the paid period ends, before the effective plan drops to
+// FREE. Expressed in whole calendar days.
+//
+// BOUNDARY (documented, deterministic, UTC calendar days):
+//
+//   renewsAt  = the stored paid-period end (BusinessSubscription.renewsAt).
+//               It fixes the CALENDAR DAY the paid period ends on; its
+//               time-of-day does not shift the boundary.
+//   ACTIVE     = before the end of renewsAt's calendar day
+//                (i.e. now < startOfDay(renewsAt) + 1 day).
+//   GRACE      = the 3 calendar days that follow that day
+//                ([startOfDay(renewsAt)+1day, startOfDay(renewsAt)+4day)).
+//   EXPIRED    = from the start of the day after grace (FREE).
+//
+// Example: renewsAt on Sep 30 → Sep 30 fully ACTIVE, Oct 1/2/3 GRACE days
+// 1/2/3, Oct 4 FREE. The entire day OF renewsAt is still paid; grace ALWAYS
+// starts on the next calendar day — never at the renewsAt instant itself.
+//
+// "3 calendar days" is implemented as 3×24h from the UTC midnight that starts
+// the grace window (startOfDay(renewsAt)+1d → +4d). This is timezone-stable:
+// Postgres stores UTC timestamps, and UTC calendar days have no DST, so the
+// same stored row yields the same effective status on every server.
+//
+// `now` is injectable ONLY so tests can drive the boundaries deterministically.
+// Production callers pass the SERVER clock (new Date()); the browser clock is
+// never used to decide whether a subscription has expired (rule 5).
+export const GRACE_PERIOD_DAYS = 3;
+const DAY_MS = 86400000;
+
+/**
+ * Server-effective subscription lifecycle for one subscription row.
+ *
+ * @param renewsAt  the stored paid-period end (timestamp). A missing/invalid
+ *   value means no expiry can be computed, so the subscription is treated as
+ *   ACTIVE (paid access is preserved rather than possibly-downgraded) with
+ *   null grace bounds.
+ * @param now       the authoritative time source (server clock).
+ */
+export type EffectiveSubscriptionStatus = "ACTIVE" | "GRACE_PERIOD" | "EXPIRED";
+
+export function computeSubscriptionLifecycle(
+  renewsAt: Date | string | null | undefined,
+  now: Date | number = new Date(),
+): {
+  status: EffectiveSubscriptionStatus;
+  graceStartsAt: Date | null;
+  graceEndsAt: Date | null;
+  renewalRequired: boolean;
+} {
+  const nowMs = now instanceof Date ? now.getTime() : now;
+  const renews = renewsAt ? new Date(renewsAt) : null;
+  if (!renews || Number.isNaN(renews.getTime())) {
+    return {
+      status: "ACTIVE",
+      graceStartsAt: null,
+      graceEndsAt: null,
+      renewalRequired: false,
+    };
+  }
+
+  const day = Date.UTC(
+    renews.getUTCFullYear(),
+    renews.getUTCMonth(),
+    renews.getUTCDate(),
+  );
+  const graceStartsAt = new Date(day + DAY_MS); // next UTC midnight
+  const graceEndsAt = new Date(day + (1 + GRACE_PERIOD_DAYS) * DAY_MS); // day after grace
+
+  if (nowMs < graceStartsAt.getTime()) {
+    return { status: "ACTIVE", graceStartsAt, graceEndsAt, renewalRequired: false };
+  }
+  if (nowMs < graceEndsAt.getTime()) {
+    return { status: "GRACE_PERIOD", graceStartsAt, graceEndsAt, renewalRequired: true };
+  }
+  return { status: "EXPIRED", graceStartsAt, graceEndsAt, renewalRequired: true };
+}
+
 export function getPlanById(
   catalog: SubscriptionPlan[] = PLAN_CATALOG,
   id: SubscriptionPlanId | null | undefined
@@ -135,13 +217,19 @@ export function getEffectivePlan(
   catalog: SubscriptionPlan[] = PLAN_CATALOG
 ): SubscriptionPlan | null {
   if (!state) return getPlanById(catalog, FREE_PLAN_ID);
-  // A successfully-paid plan is active and governs.
-  if (state.status === "active" && state.currentPlanId) {
+  // A successfully-paid plan is active and governs. A GRACE-period plan also
+  // governs: the subscribed plan stays in effect for the 3-calendar-day grace
+  // window after the paid period ends (server tells us the effective status).
+  if (
+    (state.status === "active" || state.status === "grace") &&
+    state.currentPlanId
+  ) {
     const plan = getPlanById(catalog, state.currentPlanId);
     if (plan) return plan;
   }
-  // Everything else (never-paid, failed, suspended-payment state) falls back to
-  // the Free plan so an account owner is never locked out of product basics.
+  // Everything else (never-paid, expired, failed, suspended-payment state) falls
+  // back to the Free plan so an account owner is never locked out of product
+  // basics.
   return getPlanById(catalog, FREE_PLAN_ID);
 }
 

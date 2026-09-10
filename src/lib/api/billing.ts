@@ -47,10 +47,14 @@ export interface PaymentVerificationResult {
 
 export interface BillingSubscriptionDto {
   planId: string;
-  status: string;
+  effectivePlanId: string;
+  status: "ACTIVE" | "GRACE_PERIOD" | "EXPIRED";
   period: string;
   startedAt: string | null;
   renewsAt: string | null;
+  graceStartsAt: string | null;
+  graceEndsAt: string | null;
+  renewalRequired: boolean;
 }
 
 // Phase 6A — billing history + receipt (Billing Invoice / Payment Receipt).

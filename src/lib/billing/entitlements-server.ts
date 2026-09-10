@@ -21,6 +21,7 @@ import "server-only";
 import type { Prisma } from "@/generated/prisma/client";
 import { prisma } from "@/lib/prisma";
 import {
+  computeSubscriptionLifecycle,
   FREE_PLAN_ID,
   getLimitFor,
   getPlanById,
@@ -47,7 +48,7 @@ export interface EntitlementDb {
     ...values: unknown[]
   ): Promise<T>;
   businessSubscription: {
-    findFirst(args: unknown): Promise<{ planId: string; period: string } | null>;
+    findFirst(args: unknown): Promise<{ planId: string; period: string; renewsAt: Date | null } | null>;
   };
   customer: { count(args: unknown): Promise<number> };
   product: { count(args: unknown): Promise<number> };
@@ -77,10 +78,15 @@ export interface EntitlementDecision {
 
 /**
  * Resolve the plan currently governing a business's entitlements from the
- * database. An ACTIVE subscription's planId + period apply; EVERYTHING else
- * (no subscription, non-ACTIVE status) resolves to the Free (base) plan —
- * exactly matching `getEffectivePlan` semantics on the client. Never trusts a
- * planId/plan name/price supplied by the browser.
+ * database, using the EFFECTIVE subscription lifecycle (expiry + grace) from
+ * the stored `renewsAt` vs the SERVER clock:
+ *   - ACTIVE / GRACE_PERIOD: the subscribed plan governs (grace keeps the paid
+ *     limits; no data is deleted).
+ *   - EXPIRED (paid period + 3 calendar days passed): the FREE plan governs.
+ *   - Anything else (no subscription row, non-ACTIVE raw status): FREE.
+ * This exactly matches `getEffectivePlan` semantics on the client and never
+ * trusts a planId/plan name/price supplied by the browser. The raw ACTIVE
+ * database status is NOT mutated — expiry is derived on every read (rule 9).
  */
 export async function resolveEffectivePlan(
   db: EntitlementDb,
@@ -89,12 +95,15 @@ export async function resolveEffectivePlan(
   const row = await db.businessSubscription.findFirst({
     where: { businessId, status: "ACTIVE" },
     orderBy: { createdAt: "desc" },
-    select: { planId: true, period: true },
+    select: { planId: true, period: true, renewsAt: true },
   });
   if (row) {
-    const plan = getPlanById(PLAN_CATALOG, row.planId as SubscriptionPlanId);
-    if (plan) {
-      return { plan, period: row.period === "year" ? "year" : "month" };
+    const lifecycle = computeSubscriptionLifecycle(row.renewsAt, new Date());
+    if (lifecycle.status === "ACTIVE" || lifecycle.status === "GRACE_PERIOD") {
+      const plan = getPlanById(PLAN_CATALOG, row.planId as SubscriptionPlanId);
+      if (plan) {
+        return { plan, period: row.period === "year" ? "year" : "month" };
+      }
     }
   }
   return {

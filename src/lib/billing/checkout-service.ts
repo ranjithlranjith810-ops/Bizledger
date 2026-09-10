@@ -37,7 +37,7 @@ import {
   getActivePlanForBilling,
   type BillingPlanRow,
 } from "@/lib/billing/plan-service";
-import { FREE_PLAN_ID } from "@/lib/plans";
+import { computeSubscriptionLifecycle, FREE_PLAN_ID } from "@/lib/plans";
 import {
   BillingPeriodError,
   BillingAmountError,
@@ -117,19 +117,28 @@ export interface PersistInput {
   receipt: string;
   /** Set when reusing an existing PENDING subscription (same plan+period). */
   subscriptionId?: string;
+  /**
+   * Renewal/upgrade after the paid period (GRACE/EXPIRED). Do NOT create a
+   * PENDING subscription and do NOT link the payment to one: the payment row
+   * stays `subscriptionId = null` and the webhook links it to a brand-new
+   * ACTIVE row only after payment succeeds (the old row is retired atomically).
+   */
+  renewal?: boolean;
 }
 
 /**
- * Creates the PENDING subscription + CREATED payment record in one transaction
- * and returns the subscription id. Store Decimal totals EXACTLY as calculated;
- * store orderId from the provider; paymentId/razorpayEventId stay null until
- * actual payment (Phase 4F). A P2002 from the partial unique index propagates
- * so callers can treat a concurrent duplicate as idempotent.
+ * Creates the PENDING subscription (first purchase) + CREATED payment record in
+ * one transaction and returns the subscription id — OR, for a renewal/upgrade,
+ * persists ONLY the CREATED payment record (no PENDING row, subscriptionId
+ * null). Store Decimal totals EXACTLY as calculated; store orderId from the
+ * provider; paymentId/razorpayEventId stay null until actual payment (Phase
+ * 4F). A P2002 from the partial unique index propagates so callers can treat a
+ * concurrent duplicate as idempotent.
  */
 export async function persistCheckoutRecords(
   businessId: string,
   input: PersistInput,
-): Promise<{ subscriptionId: string }> {
+): Promise<{ subscriptionId: string | null }> {
   const { plan, period, totals, order } = input;
 
   const snapshot: Prisma.InputJsonValue = {
@@ -142,21 +151,25 @@ export async function persistCheckoutRecords(
   } as Prisma.InputJsonValue;
 
   return prisma.$transaction(async (tx) => {
-    const subscriptionId =
-      input.subscriptionId ??
-      (
-        await tx.businessSubscription.create({
-          data: {
-            businessId,
-            planId: plan.id,
-            status: "PENDING",
-            period,
-            planSnapshot: snapshot,
-            startedAt: null,
-          },
-          select: { id: true },
-        })
-      ).id;
+    // Renewal/upgrade: deliberately no PENDING row is created, and the payment
+    // is deliberately NOT linked — one-PENDING-or-ACTIVE stays untouched until
+    // the webhook proves the money arrived.
+    const subscriptionId: string | null = input.renewal
+      ? null
+      : input.subscriptionId ??
+        (
+          await tx.businessSubscription.create({
+            data: {
+              businessId,
+              planId: plan.id,
+              status: "PENDING",
+              period,
+              planSnapshot: snapshot,
+              startedAt: null,
+            },
+            select: { id: true },
+          })
+        ).id;
 
     await tx.paymentRecord.create({
       data: {
@@ -283,29 +296,68 @@ export async function createCheckoutForBusiness(
     },
   });
 
+  let reuseSubscriptionId: string | undefined;
+  let renewal = false;
+
   if (existing) {
-    if (existing.status === "ACTIVE") {
-      throw new ConflictError("This business already has an active subscription");
+    if (existing.status === "PENDING") {
+      if (existing.planId !== plan.id || existing.period !== period) {
+        throw new ConflictError("A different checkout is already in progress for this business");
+      }
+      const previous = existing.payments[0];
+      if (previous?.orderId) {
+        // Idempotent reuse: same business+plan+period checkout already created a
+        // Razorpay order — return it, do NOT create another order or records.
+        const reusedTotals = calculateBillingTotals(
+          { id: plan.id, price: plan.price },
+          period,
+        );
+        return buildPaidCheckout(
+          reusedTotals,
+          previous.orderId,
+          inrToPaise(previous.totalAmount),
+        );
+      }
+      // fall through: same plan/period PENDING but no order yet — reuse the
+      // subscription and attach a new CREATED payment with a new order.
+      reuseSubscriptionId = existing.id;
+    } else {
+      // Raw ACTIVE row. Renewal/upgrade is allowed ONLY once the paid period has
+      // genuinely elapsed (GRACE or EXPIRED — derived from the stored renewsAt
+      // vs the SERVER clock, never the browser). An effectively-ACTIVE plan can
+      // not be renewed early through checkout, and the row is never mutated here:
+      // the existing ACTIVE stays untouched until a webhook proves the payment.
+      const lifecycle = computeSubscriptionLifecycle(existing.renewsAt, new Date());
+      if (lifecycle.status === "ACTIVE") {
+        throw new ConflictError("This business already has an active subscription");
+      }
+      renewal = true;
+      // Idempotent reuse of a prior renewal/upgrade checkout with the SAME
+      // plan+period (an unlinked CREATED payment) — return its Razorpay order.
+      const priorRenewal = await prisma.paymentRecord.findFirst({
+        where: {
+          businessId,
+          subscriptionId: null,
+          planId: plan.id,
+          billingPeriod: period,
+          status: "CREATED",
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      if (priorRenewal?.orderId) {
+        const reusedTotals = calculateBillingTotals(
+          { id: plan.id, price: plan.price },
+          period,
+        );
+        return buildPaidCheckout(
+          reusedTotals,
+          priorRenewal.orderId,
+          inrToPaise(priorRenewal.totalAmount),
+        );
+      }
+      // fall through: renewal/upgrade order is created and persisted UNLINKED
+      // (subscriptionId null) — no PENDING row, the old ACTIVE is untouched.
     }
-    if (existing.planId !== plan.id || existing.period !== period) {
-      throw new ConflictError("A different checkout is already in progress for this business");
-    }
-    const previous = existing.payments[0];
-    if (previous?.orderId) {
-      // Idempotent reuse: same business+plan+period checkout already created a
-      // Razorpay order — return it, do NOT create another order or records.
-      const reusedTotals = calculateBillingTotals(
-        { id: plan.id, price: plan.price },
-        period,
-      );
-      return buildPaidCheckout(
-        reusedTotals,
-        previous.orderId,
-        inrToPaise(previous.totalAmount),
-      );
-    }
-    // fall through: same plan/period PENDING but no order yet — reuse the
-    // subscription and attach a new CREATED payment with a new order.
   }
 
   const totals = calculateBillingTotals({ id: plan.id, price: plan.price }, period);
@@ -339,7 +391,7 @@ export async function createCheckoutForBusiness(
   }
 
   const subscriptionId =
-    existing && existing.status === "PENDING" ? existing.id : undefined;
+    reuseSubscriptionId ?? (existing && existing.status === "PENDING" ? existing.id : undefined);
 
   try {
     await persist(businessId, {
@@ -355,6 +407,7 @@ export async function createCheckoutForBusiness(
       order,
       receipt,
       subscriptionId,
+      renewal,
     });
   } catch (error) {
     if (isP2002(error)) {
