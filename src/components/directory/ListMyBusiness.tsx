@@ -363,7 +363,7 @@ export const ListMyBusiness: React.FC = () => {
             label="Landmark (optional)"
             value={draft.landmark}
             onChange={(e) => set("landmark", e.target.value)}
-            placeholder="e.g. Near Odhav Circle"
+            placeholder="e.g. Near railway station"
           />
           <Input
             label="City"

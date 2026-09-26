@@ -104,12 +104,14 @@ export function toDirectoryCard(b: DirectoryBusiness): DirectoryCard {
 }
 
 // ---------------------------------------------------------------------------
-// Seed catalog (read-only demo fallback)
+// Seed catalog (test/tooling fixtures only — NOT a render fallback)
 // ---------------------------------------------------------------------------
 
-// A small read-only set of sample published businesses used ONLY when the
-// backend serves zero published listings, so a brand-new account's directory
-// is still populated without depending on the admin app.
+// A small read-only set of fabricated sample businesses. It is NEVER used to
+// populate the directory: the UI renders an empty state when the API returns no
+// rows, so fabricated businesses cannot reach production. Kept only for local
+// tooling and fixtures, and pinned as unreachable by
+// `src/__tests__/directory-production-safety.test.ts`.
 export function getSeedBusinesses(): DirectoryBusiness[] {
   const now = "2026-01-05T00:00:00.000Z";
   const seed: DirectoryBusiness[] = [
@@ -250,7 +252,9 @@ export function getSeedBusinesses(): DirectoryBusiness[] {
   return seed;
 }
 
-// Resolve a seed listing by id — returns a PUBLISHED seed or null.
+// Resolve a seed listing by id — TEST/TOOLING ONLY, never a production
+// fallback. Returns a PUBLISHED seed or null. Not called by any directory
+// component; the production read path resolves real listings from the API.
 export function getSeedBusiness(id: string): DirectoryBusiness | null {
   return (
     getSeedBusinesses().find((b) => b.id === id && b.status === "Published") ?? null
