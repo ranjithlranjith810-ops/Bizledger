@@ -39,6 +39,10 @@ import {
 } from "@/lib/billing/entitlements-server";
 import type { DirectoryStatus as StatusEnum } from "@/generated/prisma/client";
 import type { Prisma } from "@/generated/prisma/client";
+import {
+  DIRECTORY_QUERY_TOO_LONG,
+  prepareDirectoryQuery,
+} from "./query-utils";
 
 export const DIRECTORY_BUSINESS_TYPES = [
   "Manufacturer",
@@ -128,10 +132,6 @@ function validatePhone(value: string, label: string): string {
     throw new ValidationError(`${label} must be a valid 10-digit Indian mobile number`);
   }
   return value;
-}
-
-function normalizeQuery(v: unknown): string {
-  return String(v ?? "").trim().replace(/\s+/g, " ");
 }
 
 /** Validate and normalize a full listing profile payload (draft -> save). */
@@ -361,7 +361,13 @@ export async function listDirectory(opts: {
     where.state = state;
   }
 
-  const q = normalizeQuery(opts?.q);
+  const query = prepareDirectoryQuery(opts?.q);
+  // The length guard lives in the pure helper (measured on the raw input); the
+  // public boundary maps the rejection onto the real ValidationError -> HTTP 400.
+  if (!query.ok) {
+    throw new ValidationError(DIRECTORY_QUERY_TOO_LONG);
+  }
+  const q = query.value;
   if (q) {
     where.OR = [
       { companyName: { contains: q, mode: "insensitive" } },
