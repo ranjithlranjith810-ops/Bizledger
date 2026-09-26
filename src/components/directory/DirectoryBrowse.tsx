@@ -9,7 +9,6 @@ import {
   filterDirectoryBusinesses,
   getDirectoryCategories,
   getDirectoryStates,
-  getSeedBusinesses,
   toDirectoryCard,
   telLink,
   directoryEntitlement,
@@ -30,6 +29,8 @@ export const DirectoryBrowse: React.FC = () => {
   const [state, setState] = useState<string>("All");
   const [pool, setPool] = useState<DirectoryBusiness[]>([]);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,11 +38,16 @@ export const DirectoryBrowse: React.FC = () => {
       try {
         const res = await directoryApi.browse();
         if (cancelled) return;
-        // Backend-authoritative when the DB has published listings; otherwise
-        // fall back to the read-only seed catalog (demo data).
-        setPool(res.businesses.length > 0 ? res.businesses.map(fromCardJson) : []);
+        // Backend-authoritative. An empty result means the directory really is
+        // empty and the empty state is shown. Fabricated seed businesses are
+        // NEVER substituted for real data, in any environment.
+        setPool(res.businesses.map(fromCardJson));
+        setFailed(false);
       } catch {
-        if (!cancelled) setPool([]);
+        if (!cancelled) {
+          setPool([]);
+          setFailed(true);
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -49,12 +55,9 @@ export const DirectoryBrowse: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [attempt]);
 
-  const all = useMemo(
-    () => (pool.length > 0 ? pool : getSeedBusinesses()),
-    [pool]
-  );
+  const all = pool;
   const categories = useMemo(() => getDirectoryCategories(all), [all]);
   const states = useMemo(() => getDirectoryStates(all), [all]);
 
@@ -161,6 +164,8 @@ export const DirectoryBrowse: React.FC = () => {
       <div className="text-xs text-gray-500">
         {loading ? (
           <span className="text-gray-400">Loading directory…</span>
+        ) : failed ? (
+          <span className="text-[#93000b]">Directory unavailable</span>
         ) : (
           <>
             <span className="font-semibold text-[#191c1e]">{cards.length}</span> business
@@ -170,7 +175,24 @@ export const DirectoryBrowse: React.FC = () => {
       </div>
 
       {/* Results Grid */}
-      {cards.length === 0 ? (
+      {failed ? (
+        <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs p-12 text-center">
+          <Store className="w-10 h-10 text-gray-300 mx-auto mb-3" />
+          <p className="text-sm font-semibold text-[#191c1e]">Could not load the directory</p>
+          <p className="text-xs text-gray-500 mt-1">
+            Something went wrong reaching the directory service. Please try again.
+          </p>
+          <button
+            onClick={() => {
+              setLoading(true);
+              setAttempt((n) => n + 1);
+            }}
+            className="mt-4 px-4 py-2 rounded-lg bg-[#93000b] hover:bg-[#770008] text-white text-xs font-semibold"
+          >
+            Try again
+          </button>
+        </div>
+      ) : cards.length === 0 ? (
         <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs p-12 text-center">
           <Store className="w-10 h-10 text-gray-300 mx-auto mb-3" />
           <p className="text-sm font-semibold text-[#191c1e]">No businesses found</p>

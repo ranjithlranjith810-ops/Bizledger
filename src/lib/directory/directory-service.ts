@@ -315,6 +315,12 @@ export async function listDirectory(opts: {
   const where: Prisma.BusinessDirectoryProfileWhereInput = {
     status: "PUBLISHED",
     isListed: true,
+    // F1: a listing belongs to the tenant `Business` record. Public visibility
+    // additionally requires the business itself to be ACTIVE — a suspended
+    // business (even with a lingering PUBLISHED listing) must never appear in
+    // the public directory. This relation filter is the server-side gate; the
+    // suspend transaction also flips the listing (defense in depth).
+    business: { status: "ACTIVE" },
   };
 
   const businessType = str(opts?.businessType);
@@ -363,8 +369,17 @@ export async function getDirectoryProfile(profileIdInput: unknown) {
   const id = str(profileIdInput);
   if (!id) throw new ValidationError("Missing listing id");
 
-  const profile = await prisma.businessDirectoryProfile.findUnique({ where: { id } });
-  if (!profile || profile.status !== "PUBLISHED" || !profile.isListed) {
+  const profile = await prisma.businessDirectoryProfile.findUnique({
+    where: { id },
+    // F1: only an ACTIVE business's listing may be served publicly.
+    include: { business: { select: { status: true } } },
+  });
+  if (
+    !profile ||
+    profile.status !== "PUBLISHED" ||
+    !profile.isListed ||
+    profile.business.status !== "ACTIVE"
+  ) {
     throw new ResourceNotFoundError("Listing not found");
   }
   return toPublicDetail(profile);

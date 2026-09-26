@@ -8,10 +8,15 @@
 // Backend-authoritative: reads and writes flow through the HTTP API in
 // `src/lib/api/directory.ts`, backed by the `business_directory_profile` table.
 // This module keeps the pure helpers (vocabularies, validation-ish utilities,
-// filtering, entitlements) plus the read-only seed catalog used ONLY as a demo
-// fallback when the backend has no published listings yet. A tiny in-memory
-// cache of the caller's own listing powers synchronous plan-usage lookups; it
-// is never the source of truth.
+// filtering, entitlements).
+//
+// The read-only seed catalog (`getSeedBusinesses` / `getSeedBusiness`) is
+// retained ONLY for local tooling and fixtures. It is deliberately NOT used as
+// a render fallback: the directory UI shows an empty state when the API returns
+// no rows, so a production database can never display fabricated businesses.
+// `src/__tests__/directory-production-safety.test.ts` pins that invariant.
+// A tiny in-memory cache of the caller's own listing powers synchronous
+// plan-usage lookups; it is never the source of truth.
 import { DirectoryBusiness, DirectoryListingStatus } from "@/types";
 import { INDIAN_STATES } from "@/lib/india";
 

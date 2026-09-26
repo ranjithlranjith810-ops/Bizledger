@@ -290,7 +290,7 @@ export const ListMyBusiness: React.FC = () => {
               label="Business / Company Name"
               value={draft.companyName}
               onChange={(e) => set("companyName", e.target.value)}
-              placeholder="e.g. Shree Vallabh Steel Traders"
+              placeholder="e.g. Your Company Name"
               required
             />
           </div>
