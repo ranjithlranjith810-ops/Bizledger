@@ -15,11 +15,29 @@ import {
   Hash,
   ShieldCheck,
 } from "lucide-react";
-import { telLink, directoryEntitlement, getSeedBusiness } from "@/lib/directory";
+import { telLink, directoryEntitlement } from "@/lib/directory";
 import { directoryApi, fromPublicDetailJson } from "@/lib/api/directory";
+import { ApiError } from "@/lib/api-client";
 import type { DirectoryBusiness } from "@/types";
 import { useApp } from "@/context/AppContext";
 import { BusinessNetworkGate } from "@/components/directory/BusinessNetworkGate";
+
+/**
+ * Which state a failed public-detail fetch should render.
+ *
+ * "missing" — the listing is not publicly available. This is PERMANENT, so no
+ *   "Try again" is offered. The service deliberately answers an identical 404
+ *   for an unknown id and for a profile that is not
+ *   PUBLISHED + isListed + ACTIVE, so this branch reveals nothing about whether
+ *   the business exists; anti-probing behaviour is unchanged.
+ * "error" — an indeterminate/transient failure (network, 5xx, 429, ...), where
+ *   a retry is meaningful.
+ */
+export type DirectoryDetailErrorState = "missing" | "error";
+
+export function directoryDetailErrorState(error: unknown): DirectoryDetailErrorState {
+  return error instanceof ApiError && error.status === 404 ? "missing" : "error";
+}
 
 export const DirectoryBusinessView: React.FC = () => {
   const params = useParams<{ id: string }>();
@@ -28,6 +46,8 @@ export const DirectoryBusinessView: React.FC = () => {
   const entitled = directoryEntitlement(activePlan).allowed;
   const [business, setBusiness] = useState<DirectoryBusiness | null>(null);
   const [loading, setLoading] = useState(true);
+  const [failed, setFailed] = useState(false);
+  const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
@@ -40,11 +60,18 @@ export const DirectoryBusinessView: React.FC = () => {
       setLoading(true);
       try {
         const res = await directoryApi.getPublic(id);
-        if (!cancelled) setBusiness(fromPublicDetailJson(res.business));
-      } catch {
-        // Unknown/unpublished id, or backend unavailable — fall back to the
-        // read-only seed catalog before declaring the listing missing.
-        if (!cancelled) setBusiness(getSeedBusiness(id));
+        if (cancelled) return;
+        setBusiness(fromPublicDetailJson(res.business));
+        setFailed(false);
+      } catch (error) {
+        // The seed catalog is deliberately NOT consulted here: an unresolvable
+        // id must render the missing/unavailable state, never a fabricated
+        // business. A 404 is a permanent answer and shows the not-found state;
+        // every other failure keeps the retry state.
+        if (!cancelled) {
+          setBusiness(null);
+          setFailed(directoryDetailErrorState(error) === "error");
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -52,7 +79,7 @@ export const DirectoryBusinessView: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [params?.id]);
+  }, [params?.id, attempt]);
 
   if (loading) {
     return (
@@ -60,6 +87,29 @@ export const DirectoryBusinessView: React.FC = () => {
         <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs p-12 text-center">
           <Store className="w-10 h-10 text-gray-300 mx-auto mb-3" />
           <p className="text-sm font-semibold text-[#191c1e]">Loading listing…</p>
+        </div>
+      </BusinessNetworkGate>
+    );
+  }
+
+  if (failed) {
+    return (
+      <BusinessNetworkGate entitled={entitled}>
+        <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs p-12 text-center">
+          <Store className="w-10 h-10 text-gray-300 mx-auto mb-3" />
+          <p className="text-sm font-semibold text-[#191c1e]">Could not load this listing</p>
+          <p className="text-xs text-gray-500 mt-1">
+            Something went wrong reaching the directory service. Please try again.
+          </p>
+          <button
+            onClick={() => {
+              setLoading(true);
+              setAttempt((n) => n + 1);
+            }}
+            className="mt-4 px-4 py-2 rounded-lg bg-[#93000b] hover:bg-[#770008] text-white text-xs font-semibold"
+          >
+            Try again
+          </button>
         </div>
       </BusinessNetworkGate>
     );
