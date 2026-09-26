@@ -33,6 +33,8 @@ import { INDIAN_STATES } from "@/lib/india";
 import { getLimitFor } from "@/lib/plans";
 import {
   EntitlementDeniedError,
+  FeatureDeniedError,
+  hasFeature,
   resolveEffectivePlan,
 } from "@/lib/billing/entitlements-server";
 import type { DirectoryStatus as StatusEnum } from "@/generated/prisma/client";
@@ -501,7 +503,7 @@ export async function submitMyDirectoryProfile(businessIdInput: unknown) {
     });
     if (!existing) throw new ResourceNotFoundError("No listing to submit");
 
-    const { plan } = await resolveEffectivePlan(tx, businessId);
+    const { plan, features } = await resolveEffectivePlan(tx, businessId);
     const limit = getLimitFor(plan, "directoryListing");
     const cap = typeof limit === "number" ? limit : null;
     if (
@@ -510,6 +512,12 @@ export async function submitMyDirectoryProfile(businessIdInput: unknown) {
       existing.status !== "PUBLISHED"
     ) {
       throw new EntitlementDeniedError("directoryListing", 0, 0);
+    }
+    // Phase 9C-4: a plan that EXPLICITLY sets the registered `businessDirectory`
+    // feature to false/0 is denied submission outright, regardless of the
+    // numeric cap — a deliberate administrative off-switch beats a positive cap.
+    if (!hasFeature(features, "businessDirectory")) {
+      throw new FeatureDeniedError("businessDirectory");
     }
 
     const profile = await tx.businessDirectoryProfile.update({
