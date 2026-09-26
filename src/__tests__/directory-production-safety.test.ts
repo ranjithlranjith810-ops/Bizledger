@@ -210,6 +210,99 @@ describe("directory: detail distinguishes 404 from a service failure", () => {
   });
 });
 
+describe("directory: public listing writes are role-gated (F4)", () => {
+  const SERVICE = "src/lib/directory/directory-service.ts";
+
+  // `directory-service.ts` is a server-only module: it imports the Prisma
+  // client, so importing it here would require a react-server condition AND a
+  // live database. Instead, extract and evaluate the exported constant's
+  // initializer. This asserts its real runtime value, so neither a comment nor
+  // a renamed/reordered export can make the suite pass.
+  function writeRoles(): readonly string[] {
+    const m = /export const DIRECTORY_WRITE_ROLES\s*=\s*([^;]+);/.exec(read(SERVICE));
+    assert.ok(m, "DIRECTORY_WRITE_ROLES must be exported from directory-service.ts");
+    const expr = m![1].replace(/\bas\s+const\b/g, " ").trim();
+    return new Function("Object", `return ${expr};`)(Object) as readonly string[];
+  }
+
+  // Narrow helper: slice one exported service function out of the source.
+  function functionBody(name: string): string {
+    const src = read(SERVICE);
+    const start = src.indexOf(`export async function ${name}(`);
+    assert.ok(start > -1, `${name} not found in ${SERVICE}`);
+    const end = src.indexOf("\n}", start);
+    assert.ok(end > start, `could not delimit the body of ${name}`);
+    return src.slice(start, end);
+  }
+
+  it("allows OWNER", () => {
+    assert.ok(writeRoles().includes("OWNER"), "OWNER must retain directory write access");
+  });
+
+  it("allows ADMIN", () => {
+    assert.ok(writeRoles().includes("ADMIN"), "ADMIN must retain directory write access");
+  });
+
+  it("allows MANAGER", () => {
+    assert.ok(writeRoles().includes("MANAGER"), "MANAGER must retain directory write access");
+  });
+
+  it("does NOT allow STAFF", () => {
+    assert.ok(
+      !writeRoles().includes("STAFF"),
+      "STAFF must not be able to write a listing (defeats the whole gate)"
+    );
+  });
+
+  it("grants exactly those three roles and nothing else", () => {
+    assert.deepEqual(
+      [...writeRoles()].sort(),
+      ["ADMIN", "MANAGER", "OWNER"],
+      "the allowlist must not silently gain or lose a role"
+    );
+  });
+
+  it("is frozen, so a caller cannot widen the allowlist at runtime", () => {
+    // `as const` is compile-time only; Object.freeze is what actually protects
+    // the array at runtime. An unfrozen allowlist is a privilege-escalation risk.
+    assert.ok(Object.isFrozen(writeRoles()), "DIRECTORY_WRITE_ROLES must be frozen");
+  });
+
+  for (const fn of [
+    "saveMyDirectoryProfile",
+    "submitMyDirectoryProfile",
+    "unlistMyDirectoryProfile",
+  ] as const) {
+    it(`${fn} gates its write on DIRECTORY_WRITE_ROLES`, () => {
+      const body = functionBody(fn);
+      assert.ok(body.includes("requireBusinessRole("), `${fn} must call requireBusinessRole`);
+      assert.ok(
+        body.includes("DIRECTORY_WRITE_ROLES"),
+        `${fn} must authorize against DIRECTORY_WRITE_ROLES (not an inline list)`
+      );
+      // The gate must precede every DB access, or a rejected STAFF request could
+      // still read or write before being refused.
+      assert.ok(
+        body.indexOf("requireBusinessRole(") < body.indexOf("prisma."),
+        `${fn} must authorize before touching the database`
+      );
+    });
+  }
+
+  it("getMyDirectoryProfile stays ungated, preserving STAFF read access", () => {
+    const body = functionBody("getMyDirectoryProfile");
+    assert.ok(body.includes("resolveBusiness("), "the read path must still use resolveBusiness");
+    assert.ok(
+      !body.includes("DIRECTORY_WRITE_ROLES"),
+      "the read path must NOT be role-gated (STAFF must keep read access)"
+    );
+    assert.ok(
+      !body.includes("requireBusinessRole("),
+      "the read path must NOT be role-gated (STAFF must keep read access)"
+    );
+  });
+});
+
 describe("directory: public read boundary stays server-authoritative", () => {
   it("the API only serves published, listed profiles of active businesses", () => {
     const svc = read("src/lib/directory/directory-service.ts");

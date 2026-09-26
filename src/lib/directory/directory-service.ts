@@ -20,7 +20,10 @@
 // frontend labels ("Pending Review", "Not Listed", ...).
 
 import { prisma } from "@/lib/prisma";
-import { getBusinessForMember } from "@/lib/business/business-service";
+import {
+  getBusinessForMember,
+  requireBusinessRole,
+} from "@/lib/business/business-service";
 import {
   ValidationError,
   ResourceNotFoundError,
@@ -66,6 +69,21 @@ const STATUS_LABELS: Record<StatusEnum, string> = {
   SUSPENDED: "Suspended",
   REJECTED: "Rejected",
 };
+
+// F4: the roles allowed to WRITE a directory listing (save / submit / unlist).
+// Publishing and un-publishing a public business profile is a
+// direction/management action, so STAFF is deliberately excluded even though the
+// STAFF permission baseline is "view + create". STAFF retains read access via
+// `getMyDirectoryProfile`, which is intentionally ungated.
+//
+// `as const` alone is compile-time only, so the tuple is also frozen: an
+// authorization allowlist must not be widenable at runtime. `requireBusinessRole`
+// takes a mutable array, hence the spread at each call site.
+//
+// Pinned by `src/__tests__/directory-production-safety.test.ts`.
+export const DIRECTORY_WRITE_ROLES = Object.freeze(
+  ["OWNER", "ADMIN", "MANAGER"] as const
+);
 
 function str(v: unknown): string | undefined {
   if (v == null) return undefined;
@@ -408,8 +426,14 @@ export async function getMyDirectoryProfile(businessIdInput: unknown) {
  * PRESERVED on updates — saving a draft never un-lists a published business.
  */
 export async function saveMyDirectoryProfile(businessIdInput: unknown, raw: Record<string, unknown>) {
-  const businessId = await resolveBusiness(businessIdInput);
-  const data = normalizeDirectoryInput(raw);
+    // F4: directory issuance is a direction/management action reserved for
+    // OWNER/ADMIN/MANAGER. STAFF may view the draft (GET) but cannot edit,
+    // submit or unlist it — that keeps listing control out of read-only roles.
+    const businessId = await requireBusinessRole(
+      validateBusinessId(businessIdInput),
+      [...DIRECTORY_WRITE_ROLES]
+    ).then((ctx) => ctx.business.id);
+    const data = normalizeDirectoryInput(raw);
 
   const input = {
     businessId,
@@ -464,9 +488,14 @@ export async function saveMyDirectoryProfile(businessIdInput: unknown, raw: Reco
  * upper bound, so a business can never hold more listings than it is granted.
  */
 export async function submitMyDirectoryProfile(businessIdInput: unknown) {
-  const businessId = await resolveBusiness(businessIdInput);
+    // F4: submit (take live / request moderation) is a direction-management
+    // action reserved for OWNER/ADMIN/MANAGER (STAFF -> 403).
+    const businessId = await requireBusinessRole(
+      validateBusinessId(businessIdInput),
+      [...DIRECTORY_WRITE_ROLES]
+    ).then((ctx) => ctx.business.id);
 
-  return prisma.$transaction(async (tx) => {
+    return prisma.$transaction(async (tx) => {
     const existing = await tx.businessDirectoryProfile.findUnique({
       where: { businessId },
     });
@@ -496,8 +525,13 @@ export async function submitMyDirectoryProfile(businessIdInput: unknown) {
  * the public directory (NOT_LISTED, isListed=false). Draft details are kept.
  */
 export async function unlistMyDirectoryProfile(businessIdInput: unknown) {
-  const businessId = await resolveBusiness(businessIdInput);
-  const existing = await prisma.businessDirectoryProfile.findUnique({
+    // F4: unlist (take off the public directory) is a direction-management
+    // action reserved for OWNER/ADMIN/MANAGER (STAFF -> 403).
+    const businessId = await requireBusinessRole(
+      validateBusinessId(businessIdInput),
+      [...DIRECTORY_WRITE_ROLES]
+    ).then((ctx) => ctx.business.id);
+    const existing = await prisma.businessDirectoryProfile.findUnique({
     where: { businessId },
   });
   if (!existing) throw new ResourceNotFoundError("No listing to unlist");
