@@ -17,6 +17,11 @@ enum BusinessStatus {
   SUSPENDED
 }
 
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+}
+
 enum BusinessMemberRole {
   OWNER
   ADMIN
@@ -72,6 +77,7 @@ model User {
   email         String
   emailVerified Boolean   @default(false)
   image         String?
+  status        UserStatus @default(ACTIVE)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
   sessions      Session[]
@@ -84,28 +90,68 @@ model User {
   @@map("user")
 }
 
+// Platform-level administrator tiers for the Admin console. Stored on the
+// PlatformAdmin row (NOT on the Better Auth User) so a customer user never
+// gains admin powers by signing in. SUPER_ADMIN is the full-power tier;
+// SUPPORT_ADMIN is a restricted assistant tier reserved for future
+// /api/admin/* routes.
+enum AdminRole {
+  SUPER_ADMIN
+  SUPPORT_ADMIN
+}
+
 // ---------------------------------------------------------------------------
 // PLATFORM ADMIN — a platform-level moderator identity for the Business
 // Directory moderation API (Phase 3H).
 //
 // Deliberately a SEPARATE table from the Better Auth `User`: we do NOT pollute
 // the auth model with a `role` column. The presence of a row here (userId)
-// grants directory-moderation powers; absence means the user has no admin
-// rights even if they are a member of many businesses. Real server-side
-// authorization — never client-supplied, always resolved from the session.
+// grants admin powers; its `role` (SUPER_ADMIN by default) which tier.
+// Absence means the user has no admin rights even if they are a member of many
+// businesses. Real server-side authorization — never client-supplied, always
+// resolved from the session. Existing rows without a role default to
+// SUPER_ADMIN (schema default), so no migration backfill is required.
 // NOTE: the existing `bizledger-admin` demo app has NO backend (mock/localStorage
 // data). It must not fake moderation auth; the real moderation UI that we may
 // add later consumes these authenticated server APIs via `requirePlatformAdmin`.
 // ---------------------------------------------------------------------------
 model PlatformAdmin {
-  id        String   @id @default(cuid())
-  userId    String   @unique
-  createdAt DateTime @default(now())
+  id        String    @id @default(cuid())
+  userId    String    @unique
+  role      AdminRole @default(SUPER_ADMIN)
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  // Phase 8A — immutable audit trail of Administrator actions. Rows are only
+  // ever INSERTed (by admin-audit-service); the application/API never updates
+  // or deletes them. `onDelete: Restrict` guarantees the trail survives even
+  // if the admin row is later removed, and keeps the audit chain non-repudiable.
+  logs PlatformAdminLog[]
+
   @@index([userId])
   @@map("platform_admin")
+}
+
+// Phase 8A — Immutable Platform-Administrator audit log (PlatformAdminLog).
+model PlatformAdminLog {
+  id           String   @id @default(cuid())
+  actorAdminId String
+  action       String
+  targetType   String
+  targetId     String
+  reason       String?
+  before       Json?
+  after        Json?
+  createdAt    DateTime @default(now())
+
+  actorPlatformAdmin PlatformAdmin @relation(fields: [actorAdminId], references: [id], onDelete: Restrict)
+
+  @@index([actorAdminId])
+  @@index([targetType, targetId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("platform_admin_log")
 }
 
 model Session {
@@ -163,7 +209,7 @@ model Business {
   legalName     String?
   email         String?
   phone         String?
-  gstin         String?
+  gstin         String?       @unique
   gstRegistered Boolean        @default(false)
   addressLine1  String?
   addressLine2  String?
@@ -172,6 +218,12 @@ model Business {
   stateCode     String?
   pincode       String?
   country       String?
+  // Full company-profile payload (bank/UPI/terms/prefix/logo etc.) — the
+  // richer field set that has no dedicated Business column. Stored as a single
+  // JSON blob so the whole profile round-trips faithfully and new fields need
+  // no migration. The scalar columns above (name/gstin/address/...) stay in
+  // sync from this blob on every update.
+  companyProfileJson Json?
   status        BusinessStatus @default(ACTIVE)
   createdAt     DateTime       @default(now())
   updatedAt     DateTime       @updatedAt
@@ -886,7 +938,9 @@ model Expense {
   vehicleId          String?
   vehicleRegistration String?
   createdBy          String?
+  createdById        String?
   approvedBy         String?
+  approvedById       String?
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
@@ -1034,6 +1088,7 @@ model PlanCatalog {
   period                  String                @default("month")
   businessNetworkIncluded Boolean               @default(false)
   limits                  Json
+  featureEntitlements     Json?
   active                  Boolean               @default(true)
   createdAt               DateTime              @default(now())
   updatedAt               DateTime              @updatedAt
@@ -1219,4 +1274,27 @@ model BillingInvoice {
   @@unique([invoiceNumber])
   @@index([businessId, createdAt])
   @@map("billing_invoice")
+}
+
+// ---------------------------------------------------------------------------
+// RATE LIMIT — shared sliding-window counter for both Better Auth (storage:
+// "database") and the app-route rate limiter (src/lib/rate-limit.ts).
+//
+// Keys are namespaced to avoid collisions:
+//   Better Auth:  createRateLimitKey(ip, path) → "{ip}:{path}"
+//   App limiter:  "app:{bucket}:{ip}"          → "app:team-invite:{ip}"
+//
+// lastRequest is a Unix-epoch millisecond timestamp stored as BigInt (fits
+// current epoch ~1.7e12). The Better Auth adapter converts BigInt→Number on
+// read. Old rows are periodically pruned by Better Auth's own cleanup or by
+// the app limiter's background sweep.
+// ---------------------------------------------------------------------------
+model RateLimit {
+  id          String @id @default(cuid())
+  key         String
+  count       Int
+  lastRequest BigInt
+
+  @@unique([key])
+  @@map("rate_limit")
 }
