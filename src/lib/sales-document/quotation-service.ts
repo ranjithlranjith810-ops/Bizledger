@@ -22,6 +22,7 @@ import {
   ResourceNotFoundError,
   ConflictError,
 } from "@/lib/business/api-error";
+import { assertFeature } from "@/lib/billing/entitlements-server";
 import { allocateDocumentNumber } from "@/lib/sequence/sequence-service";
 import { buildDocumentNumber } from "@/lib/invoice";
 import {
@@ -284,6 +285,10 @@ export async function createQuotation(
 
   const created = await prisma.$transaction(
     async (tx) => {
+      // Phase 9C-4: the registered `quotations` feature gate is enforced
+      // server-side inside this transaction (business-row lock → resolve
+      // effective plan → deny only when the plan EXPLICITLY sets it false/0).
+      await assertFeature(tx, businessId, "quotations");
       const allocated = await allocateDocumentNumber(
         businessId,
         fyId,
