@@ -27,7 +27,11 @@ import {
   ConflictError,
 } from "@/lib/business/api-error";
 import { rejectProtectedKeys } from "@/lib/sales-document/shared";
-import { assertFinancialYearActive } from "@/lib/financial-year/financial-year-service";
+import {
+  assertFinancialYearActive,
+  assertDocumentDateInFinancialYear,
+  financialYearForBusinessDate,
+} from "@/lib/financial-year/financial-year-service";
 import { allocateDocumentNumber } from "@/lib/sequence/sequence-service";
 import { INDIAN_STATES } from "@/lib/india";
 import {
@@ -606,6 +610,22 @@ export async function createInvoice(
   if (!customer) throw new ResourceNotFoundError("Customer not found");
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
   assertFinancialYearActive(fy);
+  // F11 — date-owned FY authority: derive the FY from the invoice date and
+  // verify it matches the client-supplied financialYearId. Never silently
+  // replace the requested year; a mismatch is rejected with a 400.
+  {
+    const derived = await financialYearForBusinessDate(businessId, dateObj);
+    if (!derived) {
+      throw new ValidationError(
+        `Invoice date ${invoiceDate} does not fall within any configured financial year; correct the invoice date or create the financial year first`,
+      );
+    }
+    if (derived.id !== fy.id) {
+      throw new ValidationError(
+        `The financial year is derived from the invoice date: ${invoiceDate} belongs to ${derived.name}, not the requested ${fy.name}`,
+      );
+    }
+  }
   if (found.length !== productIds.length) {
     throw new ResourceNotFoundError("One or more products were not found");
   }
@@ -978,6 +998,15 @@ export async function updateInvoice(
     if (!s) throw new ValidationError("invoiceDate is required");
     const d = new Date(s);
     if (Number.isNaN(d.getTime())) throw new ValidationError("invoiceDate is not a valid date");
+    // F11 — the invoice's financial-year binding is immutable; a changed date
+    // must stay inside it. Only Draft invoices can reach here (issued/finalized
+    // invoiceDate edits are rejected above as state conflicts).
+    await assertDocumentDateInFinancialYear(
+      businessId,
+      existing.financialYearId,
+      d,
+      "Invoice",
+    );
     data.invoiceDate = d;
   }
   if (raw.dueDate !== undefined) {

@@ -43,7 +43,11 @@ import {
 } from "@/lib/sales-document/shared";
 import type { QuotationStatusT, PricingModeT } from "@/lib/sales-document/shared";
 import type { Prisma } from "@/generated/prisma/client";
-import { assertFinancialYearActive } from "@/lib/financial-year/financial-year-service";
+import {
+  assertFinancialYearActive,
+  assertDocumentDateInFinancialYear,
+  financialYearForBusinessDate,
+} from "@/lib/financial-year/financial-year-service";
 
 
 function normalizeStatus(status: string): QuotationStatusT {
@@ -265,6 +269,20 @@ export async function createQuotation(
   if (!customer) throw new ResourceNotFoundError("Customer not found");
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
   assertFinancialYearActive(fy);
+  // F11 — date-owned FY authority (same rule as invoices).
+  {
+    const derived = await financialYearForBusinessDate(businessId, quotationDate);
+    if (!derived) {
+      throw new ValidationError(
+        `Quotation date ${new Date(quotationDate).toISOString().slice(0, 10)} does not fall within any configured financial year; correct the date or create the financial year first`,
+      );
+    }
+    if (derived.id !== fy.id) {
+      throw new ValidationError(
+        `The financial year is derived from the quotation date: it belongs to ${derived.name}, not the requested ${fy.name}`,
+      );
+    }
+  }
   if (found.length !== productIds.length) {
     throw new ResourceNotFoundError("One or more products were not found");
   }
@@ -523,6 +541,14 @@ export async function updateQuotation(
   if (raw.quotationDate !== undefined || raw.date !== undefined) {
     const s = str(raw.quotationDate ?? raw.date);
     const d = requiredIsoDate(s, "quotationDate");
+    // F11 — the quotation's financial-year binding is immutable; a changed date
+    // must stay inside it (no cross-FY draft moves).
+    await assertDocumentDateInFinancialYear(
+      businessId,
+      existing.financialYearId,
+      d,
+      "Quotation",
+    );
     data.quotationDate = d;
   }
   if (raw.validUntil !== undefined) {
