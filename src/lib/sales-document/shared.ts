@@ -5,6 +5,7 @@
 // sales document family behaves identically at the API boundary.
 
 import { ValidationError } from "@/lib/business/api-error";
+import { checkImageDataUrl } from "@/lib/image-data-url";
 import { INDIAN_STATES } from "@/lib/india";
 import { calculateInvoiceTotals, round2, resolveTaxType } from "@/lib/invoice";
 
@@ -256,44 +257,78 @@ export function computeDocumentTotals(
 }
 
 // ---------------------------------------------------------------- snapshots
-// Build the historical seller (company) snapshot from the JSON the client sends
-// (same contract the Invoice service accepts). Purely a render snapshot — it
-// never feeds tax decisions.
+/**
+ * The seller (company) fields captured on a document, split by how each is
+ * validated. The image pair is stored as an inline base64 data URL (see
+ * src/lib/image-data-url.ts) and is deliberately NOT run through the generic
+ * MAX_STRING short-text cap.
+ */
+const COMPANY_SNAPSHOT_TEXT_FIELDS = [
+  "companyName",
+  "businessType",
+  "ownerName",
+  "mobile",
+  "email",
+  "website",
+  "streetAddress",
+  "addressLine1",
+  "addressLine2",
+  "city",
+  "state",
+  "pincode",
+  "country",
+  "gstin",
+  "pan",
+  "udyamNo",
+  "bankName",
+  "accountNumber",
+  "ifscCode",
+  "upiId",
+  "invoiceTerms",
+  "paymentTerms",
+  "gstSupportInfo",
+] as const;
+
+const COMPANY_SNAPSHOT_IMAGE_FIELDS = ["logoUrl", "digitalSignatureUrl"] as const;
+
+/**
+ * The AUTHORITATIVE company profile for a business, read from the row the
+ * server already loaded for the permission check.
+ *
+ * Document snapshots are built from this instead of from a client-supplied
+ * `company` object, for the same reason customer snapshots are built from the
+ * customer master row: the persisted document must record who the seller
+ * actually is, so a caller cannot forge companyName / gstin / address /
+ * signature on a create request.
+ */
+export function companyProfileRecord(business: {
+  companyProfileJson?: unknown;
+} | null | undefined): Record<string, unknown> | null {
+  const json = business?.companyProfileJson;
+  if (!json || typeof json !== "object" || Array.isArray(json)) return null;
+  return json as Record<string, unknown>;
+}
+
+/**
+ * Build the historical seller (company) snapshot from the JSON the caller
+ * supplies - which for every document service is `companyProfileRecord(business)`,
+ * i.e. the authoritative stored profile. Purely a render snapshot - it never
+ * feeds tax decisions.
+ */
 export function buildCompanySnapshot(
   raw: Record<string, unknown> | null,
 ): Record<string, string> {
   if (!raw || typeof raw !== "object") return {};
-  const s = (k: string) => shortText(raw[k], `company.${k}`);
   const out: Record<string, string> = {};
-  for (const k of [
-    "companyName",
-    "businessType",
-    "ownerName",
-    "mobile",
-    "email",
-    "website",
-    "streetAddress",
-    "addressLine1",
-    "addressLine2",
-    "city",
-    "state",
-    "pincode",
-    "country",
-    "gstin",
-    "pan",
-    "udyamNo",
-    "bankName",
-    "accountNumber",
-    "ifscCode",
-    "upiId",
-    "invoiceTerms",
-    "paymentTerms",
-    "gstSupportInfo",
-    "logoUrl",
-    "digitalSignatureUrl",
-  ]) {
-    const v = s(k);
+  for (const k of COMPANY_SNAPSHOT_TEXT_FIELDS) {
+    const v = shortText(raw[k], `company.${k}`);
     if (v !== undefined) out[k] = v;
+  }
+  // Image payloads: validated as image data URLs and passed through verbatim.
+  for (const k of COMPANY_SNAPSHOT_IMAGE_FIELDS) {
+    const { value, error } = checkImageDataUrl(raw[k]);
+    if (error) throw new ValidationError(`company.${k} ${error}`);
+    if (value !== undefined) out[k] = value;
   }
   return out;
 }

@@ -36,6 +36,7 @@ import {
   normalizeItems,
   computeDocumentTotals,
   buildCompanySnapshot,
+  companyProfileRecord,
   buildCustomerSnapshot,
   sellerStateCode,
   rejectProtectedKeys,
@@ -296,9 +297,7 @@ export async function createQuotation(
   }
   const productById = Object.fromEntries(found.map((p) => [p.id, p]));
 
-  const companySnapshot = buildCompanySnapshot(
-    raw.company as Record<string, unknown> | null,
-  );
+  const companySnapshot = buildCompanySnapshot(companyProfileRecord(business));
   const customerSnapshot = buildCustomerSnapshot(customer);
 
   const created = await prisma.$transaction(
@@ -577,8 +576,10 @@ export async function updateQuotation(
     if (raw.company !== null && typeof raw.company !== "object") {
       throw new ValidationError("company must be a company snapshot object or null");
     }
+    // A refresh is still opt-in, but the snapshot is always rebuilt from the
+    // authoritative stored profile - never from the request body.
     data.companySnapshot = buildCompanySnapshot(
-      (raw.company ?? null) as Record<string, unknown> | null,
+      companyProfileRecord(business),
     ) as Prisma.InputJsonValue;
   }
 

@@ -26,7 +26,11 @@ import {
   ResourceNotFoundError,
   ConflictError,
 } from "@/lib/business/api-error";
-import { rejectProtectedKeys } from "@/lib/sales-document/shared";
+import {
+  buildCompanySnapshot,
+  companyProfileRecord,
+  rejectProtectedKeys,
+} from "@/lib/sales-document/shared";
 import {
   assertFinancialYearActive,
   assertDocumentDateInFinancialYear,
@@ -269,44 +273,12 @@ function sellerStateCode(business: {
   return matched ? matched.code : "";
 }
 
-function buildCompanySnapshot(
-  raw: Record<string, unknown> | null,
-): Record<string, string> {
-  if (!raw || typeof raw !== "object") return {};
-  const s = (k: string) => shortText(raw[k], `company.${k}`);
-  const out: Record<string, string> = {};
-  for (const k of [
-    "companyName",
-    "businessType",
-    "ownerName",
-    "mobile",
-    "email",
-    "website",
-    "streetAddress",
-    "addressLine1",
-    "addressLine2",
-    "city",
-    "state",
-    "pincode",
-    "country",
-    "gstin",
-    "pan",
-    "udyamNo",
-    "bankName",
-    "accountNumber",
-    "ifscCode",
-    "upiId",
-    "invoiceTerms",
-    "paymentTerms",
-    "gstSupportInfo",
-    "logoUrl",
-    "digitalSignatureUrl",
-  ]) {
-    const v = s(k);
-    if (v !== undefined) out[k] = v;
-  }
-  return out;
-}
+// The seller (company) snapshot is built by the shared helper imported above
+// (buildCompanySnapshot + companyProfileRecord from @/lib/sales-document/shared)
+// so the Invoice, Quotation and Estimate services cannot drift apart. It is fed
+// the authoritative stored profile, never a client-supplied object, and it
+// validates logoUrl / digitalSignatureUrl as image data URLs rather than
+// through the short-text cap.
 
 // Build the customer snapshot from the CURRENT customer master row (server-side,
 // authoritative, tenant-scoped). Includes every field the invoice PDF renders.
@@ -647,9 +619,7 @@ export async function createInvoice(
   }
   const productById = Object.fromEntries(found.map((p) => [p.id, p]));
 
-  const companySnapshot = buildCompanySnapshot(
-    (raw.company as Record<string, unknown> | null),
-  );
+  const companySnapshot = buildCompanySnapshot(companyProfileRecord(business));
   const customerSnapshot = buildCustomerSnapshot(customer);
   const vehicleSnapshot = buildVehicleSnapshot(
     payload.vehicle as Record<string, unknown> | null,
@@ -1044,8 +1014,10 @@ export async function updateInvoice(
     if (raw.company !== null && typeof raw.company !== "object") {
       throw new ValidationError("company must be a company snapshot object or null");
     }
+    // A refresh is still opt-in, but the snapshot is always rebuilt from the
+    // authoritative stored profile - never from the request body.
     data.companySnapshot = buildCompanySnapshot(
-      (raw.company ?? null) as Record<string, unknown> | null,
+      companyProfileRecord(business),
     ) as Prisma.InputJsonValue;
   }
   if (raw.vehicle !== undefined) {
