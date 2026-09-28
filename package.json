@@ -21,7 +21,9 @@
     "razorpay": "^2.9.8",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
+    "resend": "^6.28.1",
     "server-only": "^0.0.1",
+    "standardwebhooks": "1.1.1",
     "tailwind-merge": "^3.0.1"
   },
   "devDependencies": {
