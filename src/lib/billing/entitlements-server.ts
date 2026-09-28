@@ -1,20 +1,37 @@
-// Server-side entitlement enforcement (Security Hardening 1 — F3).
+// Server-side entitlement enforcement (Security Hardening 1 — F3, extended by
+// Phase 8E with PlanCatalog-backed limits and by Phase 9C-4 with
+// feature-entitlement enforcement).
 //
 // The browser is NEVER the security boundary for plan limits. This module
 // resolves the business's effective plan from the DATABASE (ACTIVE
-// BusinessSubscription → PLAN_CATALOG; absence = Free/Base plan) and counts
-// current usage from database state before every governed create.
+// BusinessSubscription → plan_catalog limits + featureEntitlements, static
+// PLAN_CATALOG as the fallback; absence = Free/Base plan) and counts current
+// usage from database state before every governed create.
 //
 // RACE SAFETY: `assertCreateAllowed` takes an exclusive row lock on the
 // Business row (`SELECT ... FOR UPDATE`) INSIDE the caller's transaction, so
 // concurrent creations for the same business serialize — a stale pre-insert
 // count can never let two requests both slip past a plan ceiling. Callers run
 // the check + insert inside one transaction (`withEntitlementCheck`).
+// `assertFeature` takes the same lock; it is a feature gate, not a count gate,
+// so the lock is carried for consistency with the numeric path rather than
+// because a feature read has a count race.
 //
-// ERROR CONTRACT: denial throws `EntitlementDeniedError`, mapped by
-// `handleApiError` to HTTP 403 with a stable machine-readable body
-// ({ code: "ENTITLEMENT_LIMIT", kind, limit, used }). No subscription/payment
-// internals are leaked.
+// ERROR CONTRACT:
+//   - limit denials throw `EntitlementDeniedError`, mapped by `handleApiError`
+//     to HTTP 403 with a stable machine-readable body
+//     ({ code: "ENTITLEMENT_LIMIT", kind, limit, used }).
+//   - feature denials throw `FeatureDeniedError`, mapped to HTTP 403 with
+//     { code: "ENTITLEMENT_FEATURE", feature }.
+// No subscription/payment internals are leaked.
+//
+// FEATURE REGISTRY (Phase 9C-4): a behavior can only be granted by a key that
+// is EXPLICITLY registered in `REGISTERED_FEATURES`. Any other key stored in a
+// plan's `featureEntitlements` is preserved in the plan data (the Admin console
+// round-trips it) but grants NO behavior and crashes nothing. A registered
+// feature denies only when the effective plan EXPLICITLY sets it to `false` or
+// `0`; absence/null leaves today's behavior untouched, so canonical plans
+// (featureEntitlements = NULL) never change.
 
 import "server-only";
 
@@ -35,10 +52,15 @@ import type {
 
 export type EntitlementKind = EntitlementLimitKind;
 
-const WINDOW_MS: Record<"month" | "year", number> = {
-  month: 30 * 86400000,
-  year: 365 * 86400000,
-};
+/** Structural subset of a PlanCatalog row the entitlement resolver needs. */
+export interface CatalogPlanRow {
+  id: string;
+  name: string;
+  period: string;
+  businessNetworkIncluded: boolean;
+  limits: unknown;
+  featureEntitlements: unknown;
+}
 
 /** Minimal transactional surface the entitlement guard requires. Real callers
  * pass a Prisma `$transaction` client (which satisfies this structurally). */
@@ -51,7 +73,7 @@ export interface EntitlementDb {
     findFirst(args: unknown): Promise<{ planId: string; period: string; renewsAt: Date | null } | null>;
   };
   planCatalog: {
-    findFirst(args: unknown): Promise<{ featureEntitlements: unknown } | null>;
+    findFirst(args: unknown): Promise<CatalogPlanRow | null>;
   };
   customer: { count(args: unknown): Promise<number> };
   product: { count(args: unknown): Promise<number> };
@@ -70,6 +92,35 @@ export class EntitlementDeniedError extends Error {
     this.name = "EntitlementDeniedError";
   }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 8E — PlanCatalog-backed limits.
+//
+// Plan *limits* come from the DATABASE (plan_catalog) so changes published
+// through the admin console actually affect enforcement. The static PLAN_CATALOG
+// stays as the fallback (and for the base Free plan) so a missing/inactive
+// catalog row never locks a paying customer out or invents prices.
+//
+// Resolution order for the plan governing a business (inside the ACTIVE/GRACE
+// window):
+//   1. PlanCatalog row with the subscription's planId (active) -> its `limits`
+//      merge over the STATIC plan's shape (known-key, deterministic merge).
+//   2. No active DB row -> static PLAN_CATALOG entry by id (legacy/historical).
+//   3. Neither (custom id never seen) -> Free plan, as before.
+//
+// The DB limits format is validated at admin write time (full known key set,
+// non-negative integers or "Unlimited"), but the merge below re-validates every
+// value defensively and falls back to the static plan's value — or
+// "Unlimited" — for a missing/invalid key, so a malformed row can NEVER lock a
+// customer out (fails open to the catalog default, never to a 0 ceiling).
+// ---------------------------------------------------------------------------
+const PLAN_LIMIT_KEYS = [
+  "customers",
+  "teamMembers",
+  "products",
+  "invoicesPerMonth",
+  "directoryListings",
+] as const;
 
 // ---------------------------------------------------------------------------
 // Phase 9C-4 - Feature entitlement registry (A-class prerequisite).
@@ -113,7 +164,7 @@ function validFeatureValue(value: unknown): FeatureEntitlementValue | null {
  * entries are dropped; absent/null JSON yields an empty map (i.e. "the plan
  * says nothing about any feature", which stays allowed). */
 export function featuresFromCatalogRow(
-  row: { featureEntitlements: unknown },
+  row: CatalogPlanRow,
 ): FeatureEntitlements {
   if (!row.featureEntitlements || typeof row.featureEntitlements !== "object") {
     return {};
@@ -138,18 +189,92 @@ export function hasFeature(
   return !(value === false || value === 0);
 }
 
-/** Resolves the effective plan row's EXPLICIT feature entitlements. A missing or
- * inactive row yields {} (nothing is explicitly disabled, so nothing is
- * denied). Read strictly for feature state - it never influences a numeric cap. */
-async function resolveFeatureEntitlements(
+/** Pure accessor: the configured value for a feature key, or null when the
+ * plan makes no explicit choice for it. */
+export function getFeatureLimit(
+  features: FeatureEntitlements,
+  key: string,
+): FeatureEntitlementValue | null {
+  return key in features ? (features[key] ?? null) : null;
+}
+
+/** Feature gate for a feature-gated mutation. Called inside the caller's
+ * transaction BEFORE the mutation and throws `FeatureDeniedError` only when the
+ * effective plan EXPLICITLY disables the registered feature; everything else
+ * passes (backward compatible).
+ *
+ * The row lock matches `assertCreateAllowed` for consistency. Unlike the numeric
+ * path there is no count race to close here — a feature read returns the same
+ * answer to every concurrent request — so the lock is not load-bearing for
+ * correctness. Gates that only need the flag should prefer `hasFeature`. */
+export async function assertFeature(
   db: EntitlementDb,
-  planId: string,
-): Promise<FeatureEntitlements> {
-  const row = await db.planCatalog.findFirst({
-    where: { id: planId, active: true },
-    select: { featureEntitlements: true },
-  });
-  return row ? featuresFromCatalogRow(row) : {};
+  businessId: string,
+  feature: string,
+): Promise<void> {
+  await db.$queryRaw`SELECT "id" FROM "business" WHERE "id" = ${businessId} FOR UPDATE`;
+  const { features } = await resolveEffectivePlan(db, businessId);
+  if (!hasFeature(features, feature)) {
+    throw new FeatureDeniedError(feature);
+  }
+}
+
+function validLimitValue(value: unknown): number | "Unlimited" | null {
+  if (value === "Unlimited") return "Unlimited";
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  return null;
+}
+
+/** Merges a PlanCatalog row into a SubscriptionPlan-shaped object, plus the
+ * plan's featureEntitlements map (see `featuresFromCatalogRow`). */
+export function planFromCatalogRow(row: CatalogPlanRow): {
+  plan: SubscriptionPlan;
+  features: FeatureEntitlements;
+} {
+  const staticPlan = getPlanById(PLAN_CATALOG, row.id as SubscriptionPlanId);
+  const dbLimits =
+    row.limits && typeof row.limits === "object"
+      ? (row.limits as Record<string, unknown>)
+      : {};
+
+  // Phase 9C-4 safe-limit rule: a malformed limit on a CANONICAL plan (id has
+  // a static catalog entry) fails open to the static default — a garbage row
+  // never locks a customer out. But a limit that is MISSING/INVALID on an
+  // UNKNOWN custom plan id must NEVER fall through to "Unlimited" (that would
+  // accidentally grant an uncapped resource) — it fails CLOSED to 0.
+  const pick = (key: (typeof PLAN_LIMIT_KEYS)[number]): number | "Unlimited" => {
+    const dbValue = validLimitValue(dbLimits[key]);
+    if (dbValue !== null) return dbValue;
+    if (staticPlan) {
+      const staticValue = staticPlan.limits?.[key];
+      if (staticValue !== undefined) return staticValue as number | "Unlimited";
+    }
+    return 0;
+  };
+
+  return {
+    plan: {
+      id: row.id as SubscriptionPlanId,
+      name: row.name,
+      price: staticPlan?.price ?? 0,
+      period:
+        (row.period === "month" || row.period === "year") ? row.period : "month",
+      description: staticPlan?.description ?? row.name,
+      ...(staticPlan?.popular !== undefined ? { popular: staticPlan.popular } : {}),
+      features: staticPlan?.features ?? [],
+      businessNetworkIncluded: row.businessNetworkIncluded,
+      limits: {
+        customers: pick("customers"),
+        teamMembers: pick("teamMembers"),
+        products: pick("products"),
+        invoicesPerMonth: pick("invoicesPerMonth"),
+        directoryListings: pick("directoryListings"),
+      },
+    },
+    features: featuresFromCatalogRow(row),
+  };
 }
 
 export interface EntitlementDecision {
@@ -188,26 +313,39 @@ export async function resolveEffectivePlan(
   if (row) {
     const lifecycle = computeSubscriptionLifecycle(row.renewsAt, new Date());
     if (lifecycle.status === "ACTIVE" || lifecycle.status === "GRACE_PERIOD") {
-      // Phase 9C-4: read the effective plan row's EXPLICIT feature
-      // entitlements. Plan LIMITS below are still resolved exactly as before
-      // (static PLAN_CATALOG, Free fallback) - this read only ADDS feature
-      // state and can never change a numeric cap. The read happens even when
-      // planId is a custom id absent from the static catalog, so a plan's
-      // deliberate off-switch still applies to it.
-      const features = await resolveFeatureEntitlements(db, row.planId);
-      const plan = getPlanById(PLAN_CATALOG, row.planId as SubscriptionPlanId);
-      if (plan) {
+      // Phase 8E/9C-4: ONE plan_catalog read is authoritative for BOTH the
+      // numeric limits (Phase 8E) and the explicit feature entitlements
+      // (Phase 9C-4). Feature semantics are unchanged by the merge: the same
+      // active-row lookup and the same normalizer/predicate as before, so a
+      // custom planId absent from the static catalog still receives its
+      // deliberate feature off-switch AND its DB numeric limits.
+      const dbPlan = await db.planCatalog.findFirst({
+        where: { id: row.planId, active: true },
+        select: {
+          id: true,
+          name: true,
+          period: true,
+          businessNetworkIncluded: true,
+          limits: true,
+          featureEntitlements: true,
+        },
+      });
+      if (dbPlan) {
+        const { plan, features } = planFromCatalogRow(dbPlan);
         return {
           plan,
           period: row.period === "year" ? "year" : "month",
           features,
         };
       }
-      return {
-        plan: getPlanById(PLAN_CATALOG, FREE_PLAN_ID) as SubscriptionPlan,
-        period: "month",
-        features,
-      };
+      const plan = getPlanById(PLAN_CATALOG, row.planId as SubscriptionPlanId);
+      if (plan) {
+        return {
+          plan,
+          period: row.period === "year" ? "year" : "month",
+          features: {},
+        };
+      }
     }
   }
   return {
@@ -217,10 +355,14 @@ export async function resolveEffectivePlan(
   };
 }
 
-/** Current DB-side usage for a resource kind, within the subscription period
- * window where applicable (rolling 30/365-day window for invoices, anchored on
- * the server-mint `createdAt` so back-dated invoice dates cannot dodge the
- * ceiling). */
+/** Current DB-side usage for a resource kind. Invoices are metered over the
+ * current UTC calendar month, excluding Cancelled; every other kind is a
+ * lifetime total. Both are anchored on the server-mint `createdAt` so
+ * back-dated invoice dates cannot dodge the ceiling.
+ *
+ * `period` is retained in the signature for call-site compatibility; the
+ * calendar-month invoice window is intentionally NOT derived from it, because
+ * the governed limit is `invoicesPerMonth` regardless of billing cadence. */
 export async function countUsage(
   db: EntitlementDb,
   businessId: string,
@@ -242,9 +384,31 @@ export async function countUsage(
         },
       });
     case "invoices": {
-      const cutoff = new Date(Date.now() - WINDOW_MS[period]);
+      // Phase 9C-4: `invoicesPerMonth` is a CALENDAR-MONTH quota, so the
+      // window is the current UTC calendar month. Deliberately independent of
+      // the subscription's billing `period`: an annual subscriber is still
+      // capped at `invoicesPerMonth` per calendar month, which the previous
+      // rolling window got wrong (it counted 365 days for annual plans).
+      //
+      // Boundaries are built with Date.UTC so they never depend on the
+      // server's local timezone, and `lt nextMonthStart` is an EXCLUSIVE
+      // upper bound so exactly one instant can never be double-counted or
+      // slip through a 31/30/28-day month length.
+      const now = new Date();
+      const monthStart = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
+      );
+      const nextMonthStart = new Date(
+        Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
+      );
       return db.invoice.count({
-        where: { businessId, createdAt: { gte: cutoff } },
+        where: {
+          businessId,
+          createdAt: { gte: monthStart, lt: nextMonthStart },
+          // A cancelled invoice is not a metered invoice: it must not consume
+          // the monthly allowance.
+          status: { not: "Cancelled" },
+        },
       });
     }
     case "directoryListing":
@@ -254,6 +418,30 @@ export async function countUsage(
       // union ever grows in the client bundle.
       return 0;
   }
+}
+
+/** Pure limit decision: throws `EntitlementDeniedError` when `used >= limit`;
+ * otherwise returns the decision (remaining = slots left AFTER this insert). */
+export function assertWithinLimit(
+  plan: SubscriptionPlan,
+  kind: EntitlementKind,
+  limit: number | "Unlimited",
+  used: number,
+): EntitlementDecision {
+  if (limit === "Unlimited" || limit === -1) {
+    return { allowed: true, kind, limit, used: 0, remaining: "Unlimited" };
+  }
+  const cap = limit as number;
+  if (used >= cap) {
+    throw new EntitlementDeniedError(kind, cap, used);
+  }
+  return {
+    allowed: true,
+    kind,
+    limit: cap,
+    used,
+    remaining: cap - used - 1,
+  };
 }
 
 /**
@@ -279,20 +467,8 @@ export async function assertCreateAllowed(
     return { allowed: true, kind, limit, used: 0, remaining: "Unlimited" };
   }
 
-  const cap = limit as number;
   const used = await countUsage(db, businessId, kind, period);
-
-  if (used >= cap) {
-    throw new EntitlementDeniedError(kind, cap, used);
-  }
-
-  return {
-    allowed: true,
-    kind,
-    limit: cap,
-    used,
-    remaining: cap - used - 1,
-  };
+  return assertWithinLimit(plan, kind, limit, used);
 }
 
 /** Helper for single-write creates: runs the entitlement guard + the caller's
