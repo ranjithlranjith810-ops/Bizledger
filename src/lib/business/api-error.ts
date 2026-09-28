@@ -17,7 +17,10 @@ import {
   RazorpayApiError,
   RazorpayConfigError,
 } from "@/lib/billing/razorpay";
-import { EntitlementDeniedError } from "@/lib/billing/entitlements-server";
+import {
+  EntitlementDeniedError,
+  FeatureDeniedError,
+} from "@/lib/billing/entitlements-server";
 
 /**
  * Request-payload validation failure. Mapped to 400 Bad Request.
@@ -106,6 +109,18 @@ export function handleApiError(error: unknown) {
         kind: error.kind,
         limit: error.limit,
         used: error.used,
+      },
+      { status: 403 },
+    );
+  }
+  // Feature-entitlement denial (Phase 9C-4). 403 with a stable, machine-readable
+  // payload naming the registered feature; no plan internals are disclosed.
+  if (error instanceof FeatureDeniedError) {
+    return NextResponse.json(
+      {
+        error: "Feature not enabled on this plan",
+        code: "ENTITLEMENT_FEATURE",
+        feature: error.feature,
       },
       { status: 403 },
     );

@@ -50,6 +50,9 @@ export interface EntitlementDb {
   businessSubscription: {
     findFirst(args: unknown): Promise<{ planId: string; period: string; renewsAt: Date | null } | null>;
   };
+  planCatalog: {
+    findFirst(args: unknown): Promise<{ featureEntitlements: unknown } | null>;
+  };
   customer: { count(args: unknown): Promise<number> };
   product: { count(args: unknown): Promise<number> };
   businessMember: { count(args: unknown): Promise<number> };
@@ -66,6 +69,87 @@ export class EntitlementDeniedError extends Error {
     super("Plan limit reached for the active subscription");
     this.name = "EntitlementDeniedError";
   }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 9C-4 - Feature entitlement registry (A-class prerequisite).
+//
+// A behavior can only be gated by a key EXPLICITLY registered here. Semantics of
+// a registered feature on the effective plan:
+//   - false or 0                     -> DENIED
+//   - true, >0, or "Unlimited"       -> ALLOWED
+//   - absent or null                 -> ALLOWED (the plan makes no explicit
+//                                       choice, so today's behavior is
+//                                       unchanged and canonical plans, which
+//                                       store featureEntitlements = SQL NULL,
+//                                       keep working exactly as before)
+//
+// This is deliberately a pure "is it EXPLICITLY disabled?" predicate: absent is
+// NOT the same as false, and an unregistered key is never consulted by a caller
+// so it can neither grant nor deny anything.
+// ---------------------------------------------------------------------------
+export class FeatureDeniedError extends Error {
+  constructor(public feature: string) {
+    super(`Feature "${feature}" is not enabled for the active subscription`);
+    this.name = "FeatureDeniedError";
+  }
+}
+
+export const REGISTERED_FEATURES = ["quotations", "businessDirectory"] as const;
+
+export type FeatureEntitlementValue = boolean | number | "Unlimited";
+export type FeatureEntitlements = Record<string, FeatureEntitlementValue>;
+
+function validFeatureValue(value: unknown): FeatureEntitlementValue | null {
+  if (typeof value === "boolean") return value;
+  if (value === "Unlimited") return "Unlimited";
+  if (typeof value === "number" && Number.isInteger(value) && value >= 0) {
+    return value;
+  }
+  return null;
+}
+
+/** Defensively normalizes a stored featureEntitlements JSON column. Invalid
+ * entries are dropped; absent/null JSON yields an empty map (i.e. "the plan
+ * says nothing about any feature", which stays allowed). */
+export function featuresFromCatalogRow(
+  row: { featureEntitlements: unknown },
+): FeatureEntitlements {
+  if (!row.featureEntitlements || typeof row.featureEntitlements !== "object") {
+    return {};
+  }
+  const out: FeatureEntitlements = {};
+  for (const [key, value] of Object.entries(
+    row.featureEntitlements as Record<string, unknown>,
+  )) {
+    const parsed = validFeatureValue(value);
+    if (parsed !== null) out[key] = parsed;
+  }
+  return out;
+}
+
+/** Pure feature check: true unless the effective plan EXPLICITLY disables the
+ * key with false/0. */
+export function hasFeature(
+  features: FeatureEntitlements,
+  key: string,
+): boolean {
+  const value = features[key];
+  return !(value === false || value === 0);
+}
+
+/** Resolves the effective plan row's EXPLICIT feature entitlements. A missing or
+ * inactive row yields {} (nothing is explicitly disabled, so nothing is
+ * denied). Read strictly for feature state - it never influences a numeric cap. */
+async function resolveFeatureEntitlements(
+  db: EntitlementDb,
+  planId: string,
+): Promise<FeatureEntitlements> {
+  const row = await db.planCatalog.findFirst({
+    where: { id: planId, active: true },
+    select: { featureEntitlements: true },
+  });
+  return row ? featuresFromCatalogRow(row) : {};
 }
 
 export interface EntitlementDecision {
@@ -91,7 +175,11 @@ export interface EntitlementDecision {
 export async function resolveEffectivePlan(
   db: EntitlementDb,
   businessId: string,
-): Promise<{ plan: SubscriptionPlan; period: "month" | "year" }> {
+): Promise<{
+  plan: SubscriptionPlan;
+  period: "month" | "year";
+  features: FeatureEntitlements;
+}> {
   const row = await db.businessSubscription.findFirst({
     where: { businessId, status: "ACTIVE" },
     orderBy: { createdAt: "desc" },
@@ -100,15 +188,32 @@ export async function resolveEffectivePlan(
   if (row) {
     const lifecycle = computeSubscriptionLifecycle(row.renewsAt, new Date());
     if (lifecycle.status === "ACTIVE" || lifecycle.status === "GRACE_PERIOD") {
+      // Phase 9C-4: read the effective plan row's EXPLICIT feature
+      // entitlements. Plan LIMITS below are still resolved exactly as before
+      // (static PLAN_CATALOG, Free fallback) - this read only ADDS feature
+      // state and can never change a numeric cap. The read happens even when
+      // planId is a custom id absent from the static catalog, so a plan's
+      // deliberate off-switch still applies to it.
+      const features = await resolveFeatureEntitlements(db, row.planId);
       const plan = getPlanById(PLAN_CATALOG, row.planId as SubscriptionPlanId);
       if (plan) {
-        return { plan, period: row.period === "year" ? "year" : "month" };
+        return {
+          plan,
+          period: row.period === "year" ? "year" : "month",
+          features,
+        };
       }
+      return {
+        plan: getPlanById(PLAN_CATALOG, FREE_PLAN_ID) as SubscriptionPlan,
+        period: "month",
+        features,
+      };
     }
   }
   return {
     plan: getPlanById(PLAN_CATALOG, FREE_PLAN_ID) as SubscriptionPlan,
     period: "month",
+    features: {},
   };
 }
 
