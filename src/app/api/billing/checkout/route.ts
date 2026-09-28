@@ -5,6 +5,7 @@ import {
 } from "@/lib/business/business-service";
 import { createCheckoutForBusiness } from "@/lib/billing/checkout-service";
 import { handleApiError, ValidationError } from "@/lib/business/api-error";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 // POST /api/billing/checkout — secure checkout / Razorpay Test Mode order.
 //
@@ -22,6 +23,8 @@ import { handleApiError, ValidationError } from "@/lib/business/api-error";
 //               plan/period, monetary strings. No secrets, no raw rows.
 export async function POST(request: NextRequest) {
   try {
+    const limited = await enforceRateLimit(request, "billing-checkout");
+    if (limited) return limited;
     const body: Record<string, unknown> | null = await request
       .json()
       .catch(() => null);

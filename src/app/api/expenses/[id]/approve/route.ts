@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { decideExpenseApproval } from "@/lib/expense/expense-service";
 import { handleApiError } from "@/lib/business/api-error";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 // PATCH /api/expenses/[id]/approve?businessId=... -- explicit server-authorized
 // approval operation (F5). Body: { decision: "APPROVE" | "REJECT" }. Requires
@@ -12,6 +13,8 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
+    const limited = await enforceRateLimit(request, "expense-approve");
+    if (limited) return limited;
     const businessId = request.nextUrl.searchParams.get("businessId") ?? "";
     const { id } = await params;
     const body = await request.json().catch(() => ({}));

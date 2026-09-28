@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { transitionInvoiceStatus } from "@/lib/invoice/invoice-service";
 import { handleApiError } from "@/lib/business/api-error";
+import { enforceRateLimit } from "@/lib/rate-limit";
 
 // PATCH /api/invoices/[id]/status?businessId=... -- the ONLY lifecycle path
 // that changes invoice status (F4). Allowed edges are server-authoritative
@@ -11,6 +12,8 @@ export async function PATCH(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
+    const limited = await enforceRateLimit(request, "invoice-status");
+    if (limited) return limited;
     const businessId = request.nextUrl.searchParams.get("businessId") ?? "";
     const { id } = await params;
     const body = await request.json().catch(() => ({}));
