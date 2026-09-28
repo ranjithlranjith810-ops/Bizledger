@@ -1,6 +1,7 @@
 "use client";
 
 import { http } from "@/lib/api-client";
+import { localDateString } from "@/lib/dates";
 import type { PurchaseOrder, CompanyProfile, PricingMode, InvoiceItem, PurchaseOrderVendor } from "@/types";
 
 export interface PurchaseOrderBackendItemInput {
@@ -106,7 +107,7 @@ export function toBackendInput(
       hsnSac: it.hsnSac || undefined,
     })),
     vendor: po.vendor ? { ...po.vendor } : null,
-    date: po.date || new Date().toISOString().split("T")[0],
+    date: po.date || localDateString(),
     deliveryDate: po.deliveryDate || undefined,
     deliveryAddress: po.deliveryAddress || undefined,
     deliveryMode: po.deliveryMode || undefined,

@@ -1,6 +1,7 @@
 "use client";
 
 import { http } from "@/lib/api-client";
+import { localDateString } from "@/lib/dates";
 import type { Estimate, CompanyProfile, PricingMode, InvoiceItem } from "@/types";
 
 export interface EstimateBackendItemInput {
@@ -110,7 +111,7 @@ export function toBackendInput(
       gstRate: it.gstRate,
       hsnSac: it.hsnSac || undefined,
     })),
-    date: estimate.date || new Date().toISOString().split("T")[0],
+    date: estimate.date || localDateString(),
     validUntil: estimate.validUntil || undefined,
     scope: estimate.scope || undefined,
     status: estimate.status,

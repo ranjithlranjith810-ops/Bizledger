@@ -1,6 +1,7 @@
 "use client";
 
 import { http } from "@/lib/api-client";
+import { localDateString } from "@/lib/dates";
 import type { Quotation, CompanyProfile, PricingMode, InvoiceItem } from "@/types";
 
 export interface QuotationBackendItemInput {
@@ -108,7 +109,7 @@ export function toBackendInput(
       gstRate: it.gstRate,
       hsnSac: it.hsnSac || undefined,
     })),
-    date: quotation.date || new Date().toISOString().split("T")[0],
+    date: quotation.date || localDateString(),
     validUntil: quotation.validUntil || undefined,
     status: quotation.status,
     pricingMode: quotation.pricingMode,
