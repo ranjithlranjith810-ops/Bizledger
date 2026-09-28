@@ -73,6 +73,35 @@ export function matchFinancialYear(
   return years.find((fy) => fy.id === current.id || (isoKey(fy.startDate) === cStart && isoKey(fy.endDate) === cEnd));
 }
 
+// Convert an FY boundary (ISO string or Date) to its UTC date key.
+function boundaryKey(v: string | Date): number {
+  return v instanceof Date ? dateKey(v) : isoKey(v);
+}
+
+// True when `ref` (a Date or date-string) falls inside an FY's INCLUSIVE
+// [startDate, endDate] range. Comparisons use the same UTC date keys as the
+// reconciliation rule, so the UTC-stored FY boundaries behave identically in
+// every timezone (a document dated 31 Mar is in that FY; one dated 1 Apr is
+// not).
+export function dateInFinancialYear(
+  fy: { startDate: string | Date; endDate: string | Date },
+  ref: Date | string = new Date(),
+): boolean {
+  const refKey = ref instanceof Date ? dateKey(ref) : isoKey(ref);
+  return refKey >= boundaryKey(fy.startDate) && refKey <= boundaryKey(fy.endDate);
+}
+
+// The FIRST existing FY whose inclusive [startDate, endDate] range contains
+// `ref`. Server document paths use this (fed from real FinancialYear rows) to
+// derive the financial year from the authoritative document date. Returns
+// undefined when no configured FY covers the date.
+export function financialYearContainingDate(
+  years: FinancialYearSettings[],
+  ref: Date | string = new Date(),
+): FinancialYearSettings | undefined {
+  return years.find((fy) => dateInFinancialYear(fy, ref));
+}
+
 // Pure reconciliation. Returns the reconciled year list + the FY id that should
 // be active for refDate, plus flags describing what happened (so the caller can
 // fire a rollover notification).

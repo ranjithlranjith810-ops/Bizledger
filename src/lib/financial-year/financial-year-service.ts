@@ -18,6 +18,10 @@ import {
   ResourceNotFoundError,
   DuplicateResourceError,
 } from "@/lib/business/api-error";
+import {
+  dateInFinancialYear,
+  financialYearContainingDate,
+} from "@/lib/financialYear";
 import type { Prisma } from "@/generated/prisma/client";
 
 // Prisma unique-constraint violation code.
@@ -174,6 +178,58 @@ export function assertFinancialYearActive(fy: { isActive: boolean }): void {
 }
 
 /**
+ * F11 — date-owned financial-year authority. A document date must fall INSIDE
+ * the financial year it is pinned to (inclusive boundaries: startDate <= date
+ * <= endDate). The document date is authoritative; the client-supplied
+ * financialYearId is verified against it, never taken alone, and never
+ * silently replaced.
+ */
+export function assertDateInFinancialYear(
+  date: Date,
+  fy: {
+    id: string;
+    name: string;
+    startDate: string | Date;
+    endDate: string | Date;
+  },
+  docLabel: string,
+): void {
+  if (!dateInFinancialYear(fy, date)) {
+    throw new ValidationError(
+      `${docLabel} date ${date.toISOString().slice(0, 10)} does not belong to ${fy.name} (${boundaryIso(
+        fy.startDate,
+      ).slice(0, 10)} to ${boundaryIso(fy.endDate).slice(0, 10)}); the financial year is derived from the document date`,
+    );
+  }
+}
+
+// Normalize an FY boundary (Date | ISO string) to an ISO-YYYY-MM-DD string.
+function boundaryIso(v: string | Date): string {
+  return (v instanceof Date ? v : new Date(v)).toISOString();
+}
+
+/**
+ * Async date/FY guard for DRAFT document edits. The document's financial year
+ * binding is immutable (PROTECTED_KEYS), so a changed document date must stay
+ * inside that same year. Rejects cross-FY date changes with a 400 — the draft
+ * is never moved, renumbered, or rewritten.
+ */
+export async function assertDocumentDateInFinancialYear(
+  businessIdInput: unknown,
+  financialYearIdInput: unknown,
+  date: Date,
+  docLabel: string,
+): Promise<void> {
+  const businessId = validateBusinessId(businessIdInput);
+  const fy = await prisma.financialYear.findFirst({
+    where: { id: validateId(financialYearIdInput), businessId },
+    select: { id: true, name: true, startDate: true, endDate: true },
+  });
+  if (!fy) throw new ResourceNotFoundError("Financial year not found");
+  assertDateInFinancialYear(date, fy, docLabel);
+}
+
+/**
  * Create a financial year in the member's verified business. Activates it when
  * it is the business's FIRST financial year. Enforces the single-active
  * invariant transactionally (a partial unique DB index on the business also
@@ -276,9 +332,44 @@ export async function currentFinancialYear(businessIdInput: unknown) {
 }
 
 /**
+ * FY-for-date authority. Returns the EXISTING FinancialYear (DB row) whose
+ * INCLUSIVE [startDate, endDate] range contains `date` — or null when no
+ * configured year covers it. Document services call this to derive the
+ * financial year from the authoritative document date, then verify the
+ * client-supplied financialYearId against the result.
+ */
+export async function financialYearForBusinessDate(
+  businessIdInput: unknown,
+  date: Date,
+) {
+  const businessId = validateBusinessId(businessIdInput);
+  await requireBusinessPermission(businessId, "invoices", "view");
+
+  const contained = await prisma.financialYear.findFirst({
+    where: { businessId, startDate: { lte: date }, endDate: { gte: date } },
+  });
+  if (!contained) return null;
+  return financialYearContainingDate(
+    [
+      {
+        id: contained.id,
+        name: contained.name,
+        startDate: contained.startDate.toISOString(),
+        endDate: contained.endDate.toISOString(),
+      },
+    ],
+    date,
+  );
+}
+
+/**
  * Activate a single financial year for the member's business. Transactionally
  * deactivates every other year, then marks the requested year active. The
  * partial unique DB index is the hard backstop for the single-active invariant.
+ * A FUTURE financial year (start date later than today) cannot be activated
+ * yet — documents are pinned to the year the date actually falls in, so
+ * pre-activating a not-yet-started year would let the client mispost documents
+ * into it. Historical years remain freely activatable.
  */
 export async function activateFinancialYear(
   businessIdInput: unknown,
@@ -290,6 +381,12 @@ export async function activateFinancialYear(
 
   const fy = await prisma.financialYear.findFirst({ where: { id, businessId } });
   if (!fy) throw new ResourceNotFoundError("Financial year not found");
+
+  if (fy.startDate.getTime() > Date.now()) {
+    throw new ValidationError(
+      `${fy.name} cannot be activated yet — it starts on ${fy.startDate.toISOString().slice(0, 10)}. A financial year may only be activated once it has started.`,
+    );
+  }
 
   // PRISMA: composite unique on (businessId, name) plus single-active invariant.
   return prisma.$transaction(async (tx) => {
