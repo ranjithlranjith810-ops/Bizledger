@@ -4,6 +4,9 @@ import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { PurchaseOrder, InvoiceItem, PricingMode } from "@/types";
 import { calculateLineTotals, calculateInvoiceTotals, buildDocumentNumber } from "@/lib/invoice";
+import { financialYearForDate, matchFinancialYear } from "@/lib/financialYear";
+import { localDateString, parseLocalDate } from "@/lib/dates";
+import { fyShortName } from "@/lib/utils";
 import { X, Check, Ship } from "lucide-react";
 import { LineItemsEditor, DocLineDraft, TotalsLabels } from "@/components/shared/LineItemsEditor";
 
@@ -23,10 +26,10 @@ interface AddPurchaseOrderModalProps {
 
 function addDays(dateStr: string, days: number): string {
   if (!dateStr) return "";
-  const d = new Date(`${dateStr}T00:00:00`);
-  if (isNaN(d.getTime())) return "";
+  const d = parseLocalDate(dateStr);
+  if (!d) return "";
   d.setDate(d.getDate() + days);
-  return d.toISOString().split("T")[0];
+  return localDateString(d);
 }
 
 export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
@@ -40,13 +43,13 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
     setOpenModal,
     companyProfile,
     getActiveFinancialYear,
-    purchaseOrderSequence,
+    financialYears,
+    documentSequenceFor,
     mintDocumentNumber,
   } = useApp();
 
   const isEdit = !!po;
   const activeFy = getActiveFinancialYear();
-  const fyName = activeFy?.name || "";
 
   const companyAddress = [
     companyProfile.addressLine1,
@@ -59,10 +62,34 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
     .filter(Boolean)
     .join(", ");
 
-  const today = new Date().toISOString().split("T")[0];
+  const today = localDateString();
+  const [date, setDate] = useState<string>(po?.date || today);
+
+  // F11 — the financial year is derived from the DATE (the date is
+  // authoritative; the server re-derives and verifies it). The preview number
+  // uses the FY the date falls in and that year's counter, so it can never
+  // visually suggest a mismatched fiscal year.
+  const derivedFy = financialYearForDate(parseLocalDate(date) ?? new Date());
+  const derivedFyRow = matchFinancialYear(financialYears, derivedFy);
+  const previewFy = derivedFyRow ?? derivedFy;
+  const fyMismatchWarning =
+    !derivedFyRow
+      ? `This date falls outside every configured financial year (it belongs to ${fyShortName(
+          derivedFy.name,
+        )}). The financial year is derived from the document date, so saving will be rejected.`
+      : derivedFyRow.id !== (activeFy?.id ?? null)
+        ? `This date belongs to ${fyShortName(
+            derivedFy.name,
+          )}, but the active financial year is ${activeFy ? fyShortName(activeFy.name) : "unset"}. The financial year is derived from the document date — saving will be rejected.`
+        : null;
+
   const displayedNumber = isEdit
     ? po?.poNumber || ""
-    : buildDocumentNumber("purchaseOrder", fyName, purchaseOrderSequence);
+    : buildDocumentNumber(
+        "purchaseOrder",
+        previewFy.name,
+        documentSequenceFor(previewFy.id, "purchaseOrder")
+      );
 
   const [vendorName, setVendorName] = useState<string>(po?.vendor.name || "");
   const [vendorContact, setVendorContact] = useState<string>(
@@ -74,7 +101,6 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
   const [vendorAddress, setVendorAddress] = useState<string>(
     po?.vendor.address || companyAddress
   );
-  const [date, setDate] = useState<string>(po?.date || today);
   const [deliveryDate, setDeliveryDate] = useState<string>(
     po?.deliveryDate || addDays(today, 14)
   );
@@ -330,6 +356,20 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
                 onChange={(e) => setDate(e.target.value)}
                 className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
               />
+              {!isEdit && (
+                <p className="mt-1 text-[11px] text-gray-500">
+                  Financial Year:{" "}
+                  <span className="font-semibold text-gray-700">
+                    {fyShortName(previewFy.name)}
+                  </span>
+                  <span className="text-gray-400"> (from the document date)</span>
+                </p>
+              )}
+              {fyMismatchWarning && !isEdit && (
+                <p className="mt-1 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
+                  {fyMismatchWarning}
+                </p>
+              )}
             </div>
             <div>
               <label className="block font-semibold text-gray-700 mb-1">

@@ -4,6 +4,9 @@ import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { Quotation, Estimate, InvoiceItem, PricingMode } from "@/types";
 import { calculateLineTotals, calculateInvoiceTotals, buildDocumentNumber } from "@/lib/invoice";
+import { financialYearForDate, matchFinancialYear } from "@/lib/financialYear";
+import { localDateString, parseLocalDate } from "@/lib/dates";
+import { fyShortName } from "@/lib/utils";
 import { X, Check, FileText } from "lucide-react";
 import { SearchablePicker } from "@/components/invoices/SearchablePicker";
 import { LineItemsEditor, DocLineDraft, TotalsLabels } from "@/components/shared/LineItemsEditor";
@@ -17,9 +20,10 @@ interface SalesDocumentModalProps {
 }
 
 function addDays(dateStr: string, days: number): string {
-  const d = new Date(`${dateStr}T00:00:00`);
+  const d = parseLocalDate(dateStr);
+  if (!d) return dateStr;
   d.setDate(d.getDate() + days);
-  return d.toISOString().split("T")[0];
+  return localDateString(d);
 }
 
 const STATUS_OPTIONS = ["Draft", "Sent", "Accepted", "Rejected", "Expired"];
@@ -39,35 +43,60 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
     setOpenModal,
     companyProfile,
     getActiveFinancialYear,
-    quotationSequence,
-    estimateSequence,
+    financialYears,
+    documentSequenceFor,
     mintDocumentNumber,
   } = useApp();
 
   const isEdit = !!doc;
   const isQuote = kind === "quotation";
   const activeFy = getActiveFinancialYear();
-  const fyName = activeFy?.name || "";
-
-  // Preview document number: a NEW doc uses the current per-type sequence and
-  // the ACTIVE financial year; an edited doc keeps its existing number.
-  const displayedNumber = isEdit
-    ? isQuote
-      ? (doc as Quotation).quotationNumber || ""
-      : (doc as Estimate).estimateNumber || ""
-    : isQuote
-      ? buildDocumentNumber("quotation", fyName, quotationSequence)
-      : buildDocumentNumber("estimate", fyName, estimateSequence);
 
   const [customerId, setCustomerId] = useState<string>(
     doc?.customerId || ""
   );
   const [date, setDate] = useState<string>(
-    doc?.date || new Date().toISOString().split("T")[0]
+    doc?.date || localDateString()
   );
   const [validUntil, setValidUntil] = useState<string>(
     (doc as Quotation | Estimate)?.validUntil || addDays(date, 30)
   );
+
+  // F11 — the financial year is derived from the DATE (the date is
+  // authoritative; the server re-derives and verifies it). The preview number
+  // uses the FY the date falls in and that year's counter, so it can never
+  // visually suggest a mismatched fiscal year.
+  const derivedFy = financialYearForDate(parseLocalDate(date) ?? new Date());
+  const derivedFyRow = matchFinancialYear(financialYears, derivedFy);
+  const previewFy = derivedFyRow ?? derivedFy;
+  const fyMismatchWarning =
+    !derivedFyRow
+      ? `This date falls outside every configured financial year (it belongs to ${fyShortName(
+          derivedFy.name,
+        )}). The financial year is derived from the document date, so saving will be rejected.`
+      : derivedFyRow.id !== (activeFy?.id ?? null)
+        ? `This date belongs to ${fyShortName(
+            derivedFy.name,
+          )}, but the active financial year is ${activeFy ? fyShortName(activeFy.name) : "unset"}. The financial year is derived from the document date — saving will be rejected.`
+        : null;
+
+  // Preview document number: a NEW doc uses the per-FY sequence of the year the
+  // date falls in; an edited doc keeps its existing number.
+  const displayedNumber = isEdit
+    ? isQuote
+      ? (doc as Quotation).quotationNumber || ""
+      : (doc as Estimate).estimateNumber || ""
+    : isQuote
+      ? buildDocumentNumber(
+          "quotation",
+          previewFy.name,
+          documentSequenceFor(previewFy.id, "quotation")
+        )
+      : buildDocumentNumber(
+          "estimate",
+          previewFy.name,
+          documentSequenceFor(previewFy.id, "estimate")
+        );
   const [scope, setScope] = useState<string>(
     (doc as Estimate)?.scope || ""
   );
@@ -330,6 +359,20 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
                 onChange={(e) => setDate(e.target.value)}
                 className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
               />
+              {!isEdit && (
+                <p className="mt-1 text-[11px] text-gray-500">
+                  Financial Year:{" "}
+                  <span className="font-semibold text-gray-700">
+                    {fyShortName(previewFy.name)}
+                  </span>
+                  <span className="text-gray-400"> (from the document date)</span>
+                </p>
+              )}
+              {fyMismatchWarning && !isEdit && (
+                <p className="mt-1 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
+                  {fyMismatchWarning}
+                </p>
+              )}
             </div>
 
             <div>

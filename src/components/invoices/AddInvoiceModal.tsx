@@ -12,6 +12,9 @@ import {
 } from "@/lib/invoice";
 import { stateWithCode, INDIAN_STATES } from "@/lib/india";
 import { getEWayBillComplianceStatus } from "@/lib/compliance";
+import { financialYearForDate, matchFinancialYear } from "@/lib/financialYear";
+import { localDateString, parseLocalDate } from "@/lib/dates";
+import { fyShortName } from "@/lib/utils";
 import {
   validateName,
   validateGstin,
@@ -36,9 +39,10 @@ interface LineDraft {
 }
 
 function addDays(dateStr: string, days: number): string {
-  const d = new Date(`${dateStr}T00:00:00`);
+  const d = parseLocalDate(dateStr);
+  if (!d) return dateStr;
   d.setDate(d.getDate() + days);
-  return d.toISOString().split("T")[0];
+  return localDateString(d);
 }
 
 interface AddInvoiceModalProps {
@@ -59,7 +63,8 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     setOpenModal,
     companyProfile,
     getActiveFinancialYear,
-    invoiceSequence,
+    financialYears,
+    documentSequenceFor,
     mintDocumentNumber,
     canCreateResource,
   } = useApp();
@@ -67,7 +72,6 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
   const isEdit = !!invoice;
 
   const activeFy = getActiveFinancialYear();
-  const fyName = activeFy?.name || "";
   const [complianceError, setComplianceError] = useState<string | null>(null);
 
   const validateContact = (cust: { name: string; gstin?: string }): string | null => {
@@ -84,8 +88,29 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     invoice?.customerId || ""
   );
   const [date, setDate] = useState<string>(
-    invoice?.date || new Date().toISOString().split("T")[0]
+    invoice?.date || localDateString()
   );
+
+  // F11 — the financial year is derived from the DOCUMENT DATE (the date is
+  // authoritative; the server re-derives and verifies it). The number preview
+  // therefore uses the FY containing the selected date and that year's counter,
+  // so it can never visually suggest a mismatched fiscal year.
+  const derivedFy = financialYearForDate(parseLocalDate(date) ?? new Date());
+  const derivedFyRow = matchFinancialYear(financialYears, derivedFy);
+  const previewFy = derivedFyRow ?? derivedFy;
+  // Cross-year warning: when the date's FY is not the active FY (or no
+  // configured FY covers the date), the create will be rejected server-side.
+  const activeFyIdUi = activeFy?.id ?? null;
+  const fyMismatchWarning =
+    !derivedFyRow
+      ? `This date falls outside every configured financial year (it belongs to ${fyShortName(
+          derivedFy.name,
+        )}). The financial year is derived from the invoice date, so saving will be rejected.`
+      : derivedFyRow.id !== activeFyIdUi
+        ? `This date belongs to ${fyShortName(
+            derivedFy.name,
+          )}, but the active financial year is ${activeFy ? fyShortName(activeFy.name) : "unset"}. The financial year is derived from the invoice date and cannot be changed separately — saving will be rejected.`
+        : null;
   const [placeOfSupply, setPlaceOfSupply] = useState<string>(
     invoice?.placeOfSupply || "Tamil Nadu (33)"
   );
@@ -137,14 +162,14 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
 
   const selectedCustomer = customers.find((c) => c.id === customerId);
 
-  // Auto-number for a NEW invoice uses the account-scoped sequence; an edited
-  // invoice keeps its existing number.
+  // Auto-number for a NEW invoice uses the per-FY sequence of the year the date
+  // falls in; an edited invoice keeps its existing number.
   const displayedInvoiceNumber = isEdit
     ? invoice?.invoiceNumber || ""
     : buildInvoiceNumber(
         companyProfile.invoicePrefix || "INV",
-        fyName,
-        invoiceSequence
+        previewFy.name,
+        documentSequenceFor(previewFy.id, "invoice")
       );
 
   const handleCustomerSelect = (id: string) => {
@@ -457,6 +482,20 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
                 onChange={(e) => setDate(e.target.value)}
                 className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
               />
+              {!isEdit && (
+                <p className="mt-1 text-[11px] text-gray-500">
+                  Financial Year:{" "}
+                  <span className="font-semibold text-gray-700">
+                    {fyShortName(previewFy.name)}
+                  </span>
+                  <span className="text-gray-400"> (from the invoice date)</span>
+                </p>
+              )}
+              {fyMismatchWarning && !isEdit && (
+                <p className="mt-1 text-[11px] text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-2 py-1.5">
+                  {fyMismatchWarning}
+                </p>
+              )}
             </div>
 
             <div className="sm:col-span-2">

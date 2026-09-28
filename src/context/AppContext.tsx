@@ -588,6 +588,11 @@ export const AppProvider: React.FC<{
   const quotationSequence = getSequence(docSequences, activeFyId, "quotation");
   const estimateSequence = getSequence(docSequences, activeFyId, "estimate");
   const purchaseOrderSequence = getSequence(docSequences, activeFyId, "purchaseOrder");
+  // Read-only per-FY sequence read so a date-derived number preview can use the
+  // counter of the year the DATE falls in (stays internally consistent; the
+  // authoritative number is always minted server-side at submit).
+  const documentSequenceFor = (fyId: string | null, kind: SequenceKind): number =>
+    getSequence(docSequences, fyId, kind);
 
   // Most-recently deleted entity, kept in memory so the user can Undo a
   // customer / product / invoice deletion from its toast before leaving.
@@ -2558,6 +2563,7 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     setActiveFinancialYear,
     ensureFinancialYearRollover,
     mintDocumentNumber,
+    documentSequenceFor,
     onboarding,
     setOnboardingStep,
     completeOnboarding,

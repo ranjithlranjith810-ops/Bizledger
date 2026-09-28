@@ -647,6 +647,11 @@ export interface AppContextType {
   setActiveFinancialYear: (id: string) => void;
   ensureFinancialYearRollover: () => void;
   mintDocumentNumber: (prefix: string, kind: SequenceKind) => string;
+  /** Per-FY sequence read (preview only): the current counter value for an
+   *  arbitrary financial year + kind. Lets a date-derived number preview stay
+   *  consistent with its year so the UI can never visually suggest a
+   *  mismatched fiscal year. Never allocates. */
+  documentSequenceFor: (fyId: string | null, kind: SequenceKind) => number;
   onboarding: OnboardingState;
   setOnboardingStep: (step: number) => void;
   completeOnboarding: () => Promise<void>;
