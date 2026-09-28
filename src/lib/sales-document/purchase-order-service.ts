@@ -308,10 +308,10 @@ export async function createPurchaseOrder(
               const prod = it.productId ? productById[it.productId] : undefined;
               return {
                 productId: it.productId,
-                productName: prod ? prod.name : it.productName,
-                sku: (prod && prod.sku) || it.sku,
-                hsnSac: (prod && prod.hsnSac) || it.hsnSac,
-                unit: (prod && prod.unit) || it.unit,
+                productName: it.productName || (prod ? prod.name : it.productName),
+                sku: it.sku || (prod ? prod.sku : null),
+                hsnSac: it.hsnSac || (prod ? prod.hsnSac : null),
+                unit: it.unit || (prod ? prod.unit : "Pcs"),
                 quantity: it.quantity,
                 rate: it.rate,
                 pricingMode,
@@ -535,10 +535,10 @@ export async function updatePurchaseOrder(
               const prod = it.productId ? productById[it.productId] : undefined;
               return {
                 productId: it.productId,
-                productName: prod ? prod.name : it.productName,
-                sku: (prod && prod.sku) || it.sku,
-                hsnSac: (prod && prod.hsnSac) || it.hsnSac,
-                unit: (prod && prod.unit) || it.unit,
+                productName: it.productName || (prod ? prod.name : it.productName),
+                sku: it.sku || (prod ? prod.sku : null),
+                hsnSac: it.hsnSac || (prod ? prod.hsnSac : null),
+                unit: it.unit || (prod ? prod.unit : "Pcs"),
                 quantity: it.quantity,
                 rate: it.rate,
                 pricingMode,
