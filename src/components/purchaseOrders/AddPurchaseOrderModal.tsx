@@ -139,7 +139,9 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
     else setOpenModal(null);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Fix C: async so the modal closes only after the persisted purchase order
+  // exists (see AddInvoiceModal.handleSubmit).
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!vendorName.trim()) return;
     if (items.length === 0) return;
@@ -208,10 +210,12 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
 
     if (isEdit && po) {
       updatePurchaseOrder({ ...po, ...snapshot, poNumber: po.poNumber });
+      handleClose();
     } else {
-      addPurchaseOrder(snapshot);
+      // Fix C: only close when the server returned a persisted purchase order.
+      const created = await addPurchaseOrder(snapshot);
+      if (created) handleClose();
     }
-    handleClose();
   };
 
   const totalsLabels: TotalsLabels = {

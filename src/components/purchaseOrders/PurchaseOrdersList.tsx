@@ -6,6 +6,7 @@ import { useApp } from "@/context/AppContext";
 import { PurchaseOrder } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
 import { matchesSearch } from "@/lib/search";
+import { isPersistedId } from "@/lib/optimistic-id";
 import { Plus, Search, Eye, Pencil } from "lucide-react";
 import { AddPurchaseOrderModal } from "@/components/purchaseOrders/AddPurchaseOrderModal";
 
@@ -47,6 +48,10 @@ export const PurchaseOrdersList: React.FC = () => {
   });
 
   const openPo = (p: PurchaseOrder) => {
+    // Fix C: a row that is still optimistic has no database id. Navigating to
+    // it would land on a URL the detail page can never resolve. Wait for the
+    // create to reconcile instead of routing to a temp id.
+    if (!isPersistedId(p.id)) return;
     router.push(`/purchase-orders/${p.id}`);
   };
 

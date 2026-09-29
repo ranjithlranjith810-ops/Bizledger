@@ -702,25 +702,25 @@ addCustomer: (customer: Omit<Customer, 'id'>) => boolean;
   addProduct: (product: Omit<Product, 'id'>) => boolean;
   updateProduct: (product: Product) => void;
   deleteProduct: (id: string) => void;
-  addInvoice: (invoice: Omit<Invoice, 'id'>) => boolean;
+  addInvoice: (invoice: Omit<Invoice, 'id'>) => Promise<Invoice | null>;
   updateInvoice: (invoice: Invoice) => void;
   updateInvoiceStatus: (id: string, status: InvoiceStatus) => void;
   deleteInvoice: (id: string) => void;
   invoiceSequence: number;
   advanceInvoiceSequence: () => number;
-  addQuotation: (quotation: Omit<Quotation, 'id' | 'createdAt'>) => void;
+  addQuotation: (quotation: Omit<Quotation, 'id' | 'createdAt'>) => Promise<Quotation | null>;
   updateQuotation: (quotation: Quotation) => void;
   updateQuotationStatus: (id: string, status: QuotationStatus) => void;
   deleteQuotation: (id: string) => void;
   quotationSequence: number;
   advanceQuotationSequence: () => number;
-  addEstimate: (estimate: Omit<Estimate, 'id' | 'createdAt'>) => void;
+  addEstimate: (estimate: Omit<Estimate, 'id' | 'createdAt'>) => Promise<Estimate | null>;
   updateEstimate: (estimate: Estimate) => void;
   updateEstimateStatus: (id: string, status: EstimateStatus) => void;
   deleteEstimate: (id: string) => void;
   estimateSequence: number;
   advanceEstimateSequence: () => number;
-  addPurchaseOrder: (po: Omit<PurchaseOrder, 'id' | 'createdAt'>) => void;
+  addPurchaseOrder: (po: Omit<PurchaseOrder, 'id' | 'createdAt'>) => Promise<PurchaseOrder | null>;
   updatePurchaseOrder: (po: PurchaseOrder) => void;
   updatePurchaseOrderStatus: (id: string, status: PurchaseOrderStatus) => void;
   deletePurchaseOrder: (id: string) => void;
@@ -729,6 +729,13 @@ addCustomer: (customer: Omit<Customer, 'id'>) => boolean;
   convertQuotationToInvoice: (id: string) => void;
   convertEstimateToQuotation: (id: string) => void;
   convertEstimateToInvoice: (id: string) => void;
+  /**
+   * UI-only: the conversion currently awaiting the server, or null.
+   * `id` is the SOURCE document id, so a detail view only shows the busy
+   * state for the row it is actually rendering. Raised immediately before the
+   * conversion's await and cleared in that request's finally().
+   */
+  convertingDocument: { id: string; target: "quotation" | "invoice" } | null;
   restoreLastDeleted: () => void;
   resetBusinessData: () => void;
   resetEntireSetup: () => void;

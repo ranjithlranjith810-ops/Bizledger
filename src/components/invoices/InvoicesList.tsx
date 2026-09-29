@@ -6,6 +6,7 @@ import { useApp } from "@/context/AppContext";
 import { Invoice } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
 import { matchesSearch } from "@/lib/search";
+import { isPersistedId } from "@/lib/optimistic-id";
 import {
   FileText,
   Plus,
@@ -61,6 +62,8 @@ export const InvoicesList: React.FC = () => {
   });
 
   const openInvoice = (inv: Invoice) => {
+    // Fix C: never route to an optimistic temp id (see EstimatesList).
+    if (!isPersistedId(inv.id)) return;
     router.push(`/invoices/${inv.id}`);
   };
 

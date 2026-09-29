@@ -6,6 +6,7 @@ import { useApp } from "@/context/AppContext";
 import { Estimate } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
 import { matchesSearch } from "@/lib/search";
+import { isPersistedId } from "@/lib/optimistic-id";
 import { Plus, Search, Eye, Pencil } from "lucide-react";
 import { SalesDocumentModal } from "@/components/shared/SalesDocumentModal";
 
@@ -46,6 +47,10 @@ export const EstimatesList: React.FC = () => {
   });
 
   const openEstimate = (e: Estimate) => {
+    // Fix C: a row that is still optimistic has no database id. Navigating to
+    // it would land on a URL the detail page can never resolve. Wait for the
+    // create to reconcile instead of routing to a temp id.
+    if (!isPersistedId(e.id)) return;
     router.push(`/estimates/${e.id}`);
   };
 

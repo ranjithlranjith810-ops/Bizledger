@@ -133,7 +133,10 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
     else setOpenModal(null);
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Fix C: async so the wizard cannot close over a row that is still
+  // optimistic - the caller receives the persisted record and the modal stays
+  // open (with the existing error toast) if the create failed.
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedCustomer) return;
     if (items.length === 0) return;
@@ -220,10 +223,12 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
         // Submit-time mint (rollover idempotent) so the stored number is the
         // reconciled one even across the 31-Mar -> 1-Apr boundary.
         const finalNumber = mintDocumentNumber(companyProfile.invoicePrefix || "QT", "quotation");
-        addQuotation({
+        // Fix C: await the persisted record; close only once it exists.
+        const created = await addQuotation({
           ...snapBase,
           quotationNumber: finalNumber,
         });
+        if (!created) return;
       }
     } else {
       if (isEdit && doc) {
@@ -234,10 +239,13 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
         });
       } else {
         const finalNumber = mintDocumentNumber(companyProfile.invoicePrefix || "EST", "estimate");
-        addEstimate({
+        // Fix C: await the persisted record; close only once it exists so the
+        // user can never reopen this document against an optimistic id.
+        const created = await addEstimate({
           ...snapBase,
           estimateNumber: finalNumber,
         });
+        if (!created) return;
       }
     }
     handleClose();

@@ -52,6 +52,7 @@ import { invoicesApi, toBackendInput as invoiceToBackendInput, fromBackendInvoic
 import { quotationsApi, toBackendInput as quotationToBackendInput, fromBackendQuotation } from "@/lib/api/quotations";
 import { estimatesApi, toBackendInput as estimateToBackendInput, fromBackendEstimate } from "@/lib/api/estimates";
 import { purchaseOrdersApi, toBackendInput as poToBackendInput, fromBackendPurchaseOrder } from "@/lib/api/purchaseOrders";
+import { isPersistedId } from "@/lib/optimistic-id";
 import { expensesApi, toBackendInput as expenseToBackendInput, toBackendUpdateInput as expenseToBackendUpdateInput, fromBackendExpense } from "@/lib/api/expenses";
 import { vehiclesApi, toBackendInput as vehicleToBackendInput, fromBackendVehicle } from "@/lib/api/vehicles";
 import { teamApi, toBackendInput as teamToBackendInput, fromBackendMember } from "@/lib/api/team";
@@ -530,6 +531,16 @@ export const AppProvider: React.FC<{
   const [estimates, setEstimates] = useState<Estimate[]>(() =>
     readStorage<Estimate[]>(activeAccountId ? dataKey(activeAccountId, "estimates") : "", [])()
   );
+
+  // Which conversion request is in flight right now, if any. Purely UI state:
+  // it is raised immediately before the conversion awaits the server and
+  // lowered in that same request's finally(), so it tracks the real request
+  // and never outlasts it. `id` is the SOURCE document, so a stale row cannot
+  // light up the buttons of a different document.
+  const [convertingDocument, setConvertingDocument] = useState<{
+    id: string;
+    target: "quotation" | "invoice";
+  } | null>(null);
 
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>(() =>
     readStorage<PurchaseOrder[]>(activeAccountId ? dataKey(activeAccountId, "purchaseOrders") : "", [])()
@@ -1178,14 +1189,16 @@ export const AppProvider: React.FC<{
     return found;
   };
 
-const addInvoice = (invData: Omit<Invoice, "id">) => {
+const addInvoice = async (
+    invData: Omit<Invoice, "id">,
+  ): Promise<Invoice | null> => {
     const used = countCurrentPeriodInvoices(invoices, subscription);
     const gate = checkEntitlement(activePlan, "invoices", used);
     if (!gate.allowed) {
       notifyEntitlementBlocked("invoices", gate);
-      return false;
+      return null;
     }
-    const tempId = `inv-${Date.now()}`;
+    const tempId = makeId("inv");
     const optimistic: Invoice = {
       ...invData,
       id: tempId,
@@ -1195,43 +1208,53 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     // mints the number atomically and recomputes the GST split server-side.
     // When it succeeds the optimistic row is swapped for the authoritative one;
     // when it fails the optimistic row is reverted.
-    if (businessId && activeFyId) {
-      void (async () => {
-        try {
-          const { invoice: created } = await invoicesApi.create(
-            businessId,
-            invoiceToBackendInput(optimistic, {
-              financialYearId: activeFyId,
-              prefix: companyProfile.invoicePrefix || "INV",
-              company: companyProfile,
-            }),
-          );
-          if (created?.id) {
-            setInvoices((prev) =>
-              prev.map((inv) =>
-                inv.id === tempId ? fromBackendInvoice(created) : inv,
-              ),
-            );
-          }
-        } catch {
-          setInvoices((prev) => prev.filter((inv) => inv.id !== tempId));
-          addNotification({
-            type: "error",
-            title: "Could Not Save Invoice",
-            message:
-              "The invoice could not be saved to the server. Your invoice was not saved.",
-            icon: "error",
-          });
-        }
-      })();
+    const revert = () =>
+      setInvoices((prev) => prev.filter((inv) => inv.id !== tempId));
+    const failed = () =>
+      addNotification({
+        type: "error",
+        title: "Could Not Save Invoice",
+        message:
+          "The invoice could not be saved to the server. Your invoice was not saved.",
+        icon: "error",
+      });
+
+    if (!businessId || !activeFyId) {
+      revert();
+      failed();
+      return null;
     }
-    addNotification({
-      type: "success",
-      title: "Invoice Created",
-      message: `Invoice ${optimistic.invoiceNumber} generated for ${optimistic.customerName}.`,
-      icon: "description",
-    });
-    return true;
+
+    try {
+      const { invoice: created } = await invoicesApi.create(
+        businessId,
+        invoiceToBackendInput(optimistic, {
+          financialYearId: activeFyId,
+          prefix: companyProfile.invoicePrefix || "INV",
+          company: companyProfile,
+        }),
+      );
+      if (!created?.id) {
+        revert();
+        failed();
+        return null;
+      }
+      const persisted = fromBackendInvoice(created);
+      setInvoices((prev) =>
+        prev.map((inv) => (inv.id === tempId ? persisted : inv)),
+      );
+      addNotification({
+        type: "success",
+        title: "Invoice Created",
+        message: `Invoice ${persisted.invoiceNumber} generated for ${persisted.customerName}.`,
+        icon: "description",
+      });
+      return persisted;
+    } catch {
+      revert();
+      failed();
+      return null;
+    }
   };
 
   const updateInvoice = (invoice: Invoice) => {
@@ -1275,50 +1298,63 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
   // ------------------------------------------------------------------
   // QUOTATIONS
   // ------------------------------------------------------------------
-  const addQuotation = (quotationData: Omit<Quotation, "id" | "createdAt">) => {
-    const tempId = `quot-${Date.now()}`;
+  const addQuotation = async (
+    quotationData: Omit<Quotation, "id" | "createdAt">,
+  ): Promise<Quotation | null> => {
+    const tempId = makeId("quot");
     const optimistic: Quotation = {
       ...quotationData,
       id: tempId,
       createdAt: new Date().toISOString(),
     };
     setQuotations((prev) => [optimistic, ...prev]);
-    if (businessId && activeFyId) {
-      void (async () => {
-        try {
-          const { quotation: created } = await quotationsApi.create(
-            businessId,
-            quotationToBackendInput(optimistic, {
-              financialYearId: activeFyId,
-              prefix: "QT",
-              company: companyProfile,
-            }),
-          );
-          if (created?.id) {
-            setQuotations((prev) =>
-              prev.map((q) =>
-                q.id === tempId ? fromBackendQuotation(created) : q,
-              ),
-            );
-          }
-        } catch {
-          setQuotations((prev) => prev.filter((q) => q.id !== tempId));
-          addNotification({
-            type: "error",
-            title: "Could Not Save Quotation",
-            message:
-              "The quotation could not be saved to the server. Your quotation was not saved.",
-            icon: "error",
-          });
-        }
-      })();
+    const revert = () =>
+      setQuotations((prev) => prev.filter((q) => q.id !== tempId));
+    const failed = () =>
+      addNotification({
+        type: "error",
+        title: "Could Not Save Quotation",
+        message:
+          "The quotation could not be saved to the server. Your quotation was not saved.",
+        icon: "error",
+      });
+
+    if (!businessId || !activeFyId) {
+      revert();
+      failed();
+      return null;
     }
-    addNotification({
-      type: "success",
-      title: "Quotation Created",
-      message: `Quotation ${optimistic.quotationNumber} prepared for ${optimistic.customerName}.`,
-      icon: "request_quote",
-    });
+
+    try {
+      const { quotation: created } = await quotationsApi.create(
+        businessId,
+        quotationToBackendInput(optimistic, {
+          financialYearId: activeFyId,
+          prefix: "QT",
+          company: companyProfile,
+        }),
+      );
+      if (!created?.id) {
+        revert();
+        failed();
+        return null;
+      }
+      const persisted = fromBackendQuotation(created);
+      setQuotations((prev) =>
+        prev.map((q) => (q.id === tempId ? persisted : q)),
+      );
+      addNotification({
+        type: "success",
+        title: "Quotation Created",
+        message: `Quotation ${persisted.quotationNumber} prepared for ${persisted.customerName}.`,
+        icon: "request_quote",
+      });
+      return persisted;
+    } catch {
+      revert();
+      failed();
+      return null;
+    }
   };
 
   const updateQuotation = (quotation: Quotation) => {
@@ -1367,6 +1403,15 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
   // in the same transaction (sourceDocument), so the stored invoice and the
   // converted-quotation reference always agree.
   const convertQuotationToInvoice = (id: string) => {
+    // Fix C: never let a client-minted optimistic id reach the server, which
+    // would resolve it to a 404 (sourceDocument.id) and surface as a bogus
+    // "Could Not Convert" failure. The row is still reconciling; the user can
+    // retry once the create has resolved.
+    if (!isPersistedId(id)) return;
+    // A second click while this document is already being converted would
+    // create a duplicate (and, from one source, both a quotation AND an
+    // invoice). Scoped by source id so an unrelated document is not blocked.
+    if (convertingDocument && convertingDocument.id === id) return;
     const quotation = quotations.find((q) => q.id === id);
     if (!quotation || quotation.convertedInvoiceId) return;
     const used = countCurrentPeriodInvoices(invoices, subscription);
@@ -1443,12 +1488,15 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
         company: companyProfile,
       });
       payload.sourceDocument = { type: "quotation", id: quotation.id };
+      setConvertingDocument({ id, target: "invoice" });
       void (async () => {
         try {
           const { invoice } = await invoicesApi.create(businessId, payload);
           persist(fromBackendInvoice(invoice));
         } catch {
           fail();
+        } finally {
+          setConvertingDocument(null);
         }
       })();
     } else {
@@ -1459,50 +1507,65 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
   // ------------------------------------------------------------------
   // ESTIMATES
   // ------------------------------------------------------------------
-  const addEstimate = (estimateData: Omit<Estimate, "id" | "createdAt">) => {
-    const tempId = `est-${Date.now()}`;
+  const addEstimate = async (
+    estimateData: Omit<Estimate, "id" | "createdAt">,
+  ): Promise<Estimate | null> => {
+    const tempId = makeId("est");
     const optimistic: Estimate = {
       ...estimateData,
       id: tempId,
       createdAt: new Date().toISOString(),
     };
     setEstimates((prev) => [optimistic, ...prev]);
-    if (businessId && activeFyId) {
-      void (async () => {
-        try {
-          const { estimate: created } = await estimatesApi.create(
-            businessId,
-            estimateToBackendInput(optimistic, {
-              financialYearId: activeFyId,
-              prefix: "EST",
-              company: companyProfile,
-            }),
-          );
-          if (created?.id) {
-            setEstimates((prev) =>
-              prev.map((e) =>
-                e.id === tempId ? fromBackendEstimate(created) : e,
-              ),
-            );
-          }
-        } catch {
-          setEstimates((prev) => prev.filter((e) => e.id !== tempId));
-          addNotification({
-            type: "error",
-            title: "Could Not Save Estimate",
-            message:
-              "The estimate could not be saved to the server. Your estimate was not saved.",
-            icon: "error",
-          });
-        }
-      })();
+    const revert = () =>
+      setEstimates((prev) => prev.filter((e) => e.id !== tempId));
+    const failed = () =>
+      addNotification({
+        type: "error",
+        title: "Could Not Save Estimate",
+        message:
+          "The estimate could not be saved to the server. Your estimate was not saved.",
+        icon: "error",
+      });
+
+    if (!businessId || !activeFyId) {
+      // The POST could not be issued at all. Reporting success here would leave
+      // a temp-id row in state that can never be opened, so roll it back.
+      revert();
+      failed();
+      return null;
     }
-    addNotification({
-      type: "success",
-      title: "Estimate Created",
-      message: `Estimate ${optimistic.estimateNumber} prepared for ${optimistic.customerName}.`,
-      icon: "receipt",
-    });
+
+    try {
+      const { estimate: created } = await estimatesApi.create(
+        businessId,
+        estimateToBackendInput(optimistic, {
+          financialYearId: activeFyId,
+          prefix: "EST",
+          company: companyProfile,
+        }),
+      );
+      if (!created?.id) {
+        revert();
+        failed();
+        return null;
+      }
+      const persisted = fromBackendEstimate(created);
+      setEstimates((prev) =>
+        prev.map((e) => (e.id === tempId ? persisted : e)),
+      );
+      addNotification({
+        type: "success",
+        title: "Estimate Created",
+        message: `Estimate ${persisted.estimateNumber} prepared for ${persisted.customerName}.`,
+        icon: "receipt",
+      });
+      return persisted;
+    } catch {
+      revert();
+      failed();
+      return null;
+    }
   };
 
   const updateEstimate = (estimate: Estimate) => {
@@ -1549,6 +1612,12 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
   // own QT number; the estimate stays unchanged. The backend mints the number
   // and records the estimate's conversion reference (sourceEstimateId).
   const convertEstimateToQuotation = (id: string) => {
+    // Fix C: guard the optimistic id (see convertQuotationToInvoice).
+    if (!isPersistedId(id)) return;
+    // A second click while this document is already being converted would
+    // create a duplicate (and, from one source, both a quotation AND an
+    // invoice). Scoped by source id so an unrelated document is not blocked.
+    if (convertingDocument && convertingDocument.id === id) return;
     const estimate = estimates.find((e) => e.id === id);
     if (!estimate || estimate.convertedQuotationId) return;
     const tempId = makeId("quot");
@@ -1614,12 +1683,15 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
         company: companyProfile,
       });
       payload.sourceEstimateId = estimate.id;
+      setConvertingDocument({ id, target: "quotation" });
       void (async () => {
         try {
           const { quotation } = await quotationsApi.create(businessId, payload);
           persist(fromBackendQuotation(quotation));
         } catch {
           fail();
+        } finally {
+          setConvertingDocument(null);
         }
       })();
     } else {
@@ -1631,6 +1703,12 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
   // own INV number; the estimate stays unchanged. The backend mints the number
   // and marks the estimate Accepted + converted (sourceDocument) atomically.
   const convertEstimateToInvoice = (id: string) => {
+    // Fix C: guard the optimistic id (see convertQuotationToInvoice).
+    if (!isPersistedId(id)) return;
+    // A second click while this document is already being converted would
+    // create a duplicate (and, from one source, both a quotation AND an
+    // invoice). Scoped by source id so an unrelated document is not blocked.
+    if (convertingDocument && convertingDocument.id === id) return;
     const estimate = estimates.find((e) => e.id === id);
     if (!estimate || estimate.convertedInvoiceId) return;
     const used = countCurrentPeriodInvoices(invoices, subscription);
@@ -1707,12 +1785,15 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
         company: companyProfile,
       });
       payload.sourceDocument = { type: "estimate", id: estimate.id };
+      setConvertingDocument({ id, target: "invoice" });
       void (async () => {
         try {
           const { invoice } = await invoicesApi.create(businessId, payload);
           persist(fromBackendInvoice(invoice));
         } catch {
           fail();
+        } finally {
+          setConvertingDocument(null);
         }
       })();
     } else {
@@ -1723,50 +1804,63 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
   // ------------------------------------------------------------------
   // PURCHASE ORDERS
   // ------------------------------------------------------------------
-  const addPurchaseOrder = (poData: Omit<PurchaseOrder, "id" | "createdAt">) => {
-    const tempId = `po-${Date.now()}`;
+  const addPurchaseOrder = async (
+    poData: Omit<PurchaseOrder, "id" | "createdAt">,
+  ): Promise<PurchaseOrder | null> => {
+    const tempId = makeId("po");
     const optimistic: PurchaseOrder = {
       ...poData,
       id: tempId,
       createdAt: new Date().toISOString(),
     };
     setPurchaseOrders((prev) => [optimistic, ...prev]);
-    if (businessId && activeFyId) {
-      void (async () => {
-        try {
-          const { purchaseOrder: created } = await purchaseOrdersApi.create(
-            businessId,
-            poToBackendInput(optimistic, {
-              financialYearId: activeFyId,
-              prefix: "PO",
-              company: companyProfile,
-            }),
-          );
-          if (created?.id) {
-            setPurchaseOrders((prev) =>
-              prev.map((p) =>
-                p.id === tempId ? fromBackendPurchaseOrder(created) : p,
-              ),
-            );
-          }
-        } catch {
-          setPurchaseOrders((prev) => prev.filter((p) => p.id !== tempId));
-          addNotification({
-            type: "error",
-            title: "Could Not Save Purchase Order",
-            message:
-              "The purchase order could not be saved to the server. No purchase order was created.",
-            icon: "error",
-          });
-        }
-      })();
+    const revert = () =>
+      setPurchaseOrders((prev) => prev.filter((p) => p.id !== tempId));
+    const failed = () =>
+      addNotification({
+        type: "error",
+        title: "Could Not Save Purchase Order",
+        message:
+          "The purchase order could not be saved to the server. No purchase order was created.",
+        icon: "error",
+      });
+
+    if (!businessId || !activeFyId) {
+      revert();
+      failed();
+      return null;
     }
-    addNotification({
-      type: "success",
-      title: "Purchase Order Created",
-      message: `Purchase Order ${optimistic.poNumber} issued to ${optimistic.vendor.name}.`,
-      icon: "shopping_cart_checkout",
-    });
+
+    try {
+      const { purchaseOrder: created } = await purchaseOrdersApi.create(
+        businessId,
+        poToBackendInput(optimistic, {
+          financialYearId: activeFyId,
+          prefix: "PO",
+          company: companyProfile,
+        }),
+      );
+      if (!created?.id) {
+        revert();
+        failed();
+        return null;
+      }
+      const persisted = fromBackendPurchaseOrder(created);
+      setPurchaseOrders((prev) =>
+        prev.map((p) => (p.id === tempId ? persisted : p)),
+      );
+      addNotification({
+        type: "success",
+        title: "Purchase Order Created",
+        message: `Purchase Order ${persisted.poNumber} issued to ${persisted.vendor.name}.`,
+        icon: "shopping_cart_checkout",
+      });
+      return persisted;
+    } catch {
+      revert();
+      failed();
+      return null;
+    }
   };
 
   const updatePurchaseOrder = (po: PurchaseOrder) => {
@@ -2637,6 +2731,9 @@ const addInvoice = (invData: Omit<Invoice, "id">) => {
     convertQuotationToInvoice,
     convertEstimateToQuotation,
     convertEstimateToInvoice,
+    // UI-only: which conversion request is in flight, for the detail view's
+    // button spinner + processing overlay.
+    convertingDocument,
     restoreLastDeleted,
     resetBusinessData,
     resetEntireSetup,

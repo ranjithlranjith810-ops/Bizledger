@@ -246,7 +246,10 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
 
   const compliance = getEWayBillComplianceStatus(totals.grandTotal);
 
-  const handleSubmit = (e: React.FormEvent) => {
+  // Fix C: async so the modal only closes once the server has returned the
+  // persisted invoice. Closing on the optimistic row would let the user act on
+  // a temp id that has no database row behind it.
+  const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!selectedCustomer) return;
     if (items.length === 0) return;
@@ -356,7 +359,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
       updateInvoice({ ...base, id: invoice.id });
       close();
     } else {
-      const created = addInvoice(base);
+      const created = await addInvoice(base);
       if (created) close();
     }
   };
