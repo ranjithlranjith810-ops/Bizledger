@@ -1,3 +1,5 @@
+import type { IconName } from "@/components/ui/Icon";
+
 export type CustomerType = 'business' | 'individual';
 
 export type GSTRegistrationStatus =
@@ -61,11 +63,21 @@ export type TeamRole = 'Owner' | 'Manager' | 'Accountant' | 'Staff';
 
 export type TeamStatus = 'Active' | 'Pending Invitation' | 'Inactive';
 
-export type SubscriptionPlanId = 'base' | 'business' | 'enterprise';
+// Plan ids are opaque, platform-assigned identifiers. The shipped catalog uses
+// 'base' | 'business' | 'enterprise', but admin-created plans carry arbitrary
+// server-generated ids (the customer UI must never reject them at the type
+// level â€” the DB-driven catalog is the source of truth).
+export type SubscriptionPlanId = string;
 
 // Resource kinds gated by subscription plan limits (entitlement engine).
+// Estimates / quotations / purchase orders meter against the SAME numeric
+// ceiling as invoices per plan, but each kind tracks its OWN separate usage
+// counter (creating an estimate never consumes an invoice slot and vice-versa).
 export type EntitlementLimitKind =
   | 'invoices'
+  | 'estimates'
+  | 'quotations'
+  | 'purchaseOrders'
   | 'customers'
   | 'teamMembers'
   | 'products'
@@ -176,7 +188,7 @@ export interface Invoice {
   status: InvoiceStatus;
   pricingMode: PricingMode;
   notes?: string;
-  // Optional e-way bill reference. This is a FIELD for later capture — the app
+  // Optional e-way bill reference. This is a FIELD for later capture â€” the app
   // never fabricates an e-way bill; it only records one once supplied.
   ewayBillNumber?: string;
   ewayBillDate?: string;
@@ -200,7 +212,7 @@ export type PurchaseOrderStatus =
 export type SalesDocumentItem = InvoiceItem;
 
 // ---------------------------------------------------------------------
-// QUOTATION — fixed quoted price offered by the seller to a buyer.
+// QUOTATION â€” fixed quoted price offered by the seller to a buyer.
 // ---------------------------------------------------------------------
 export interface Quotation {
   id: string;
@@ -233,7 +245,7 @@ export interface Quotation {
 }
 
 // ---------------------------------------------------------------------
-// ESTIMATE — approximate expected cost (scope not fully known). NOT a
+// ESTIMATE â€” approximate expected cost (scope not fully known). NOT a
 // quotation and never presented as a fixed price or final invoice.
 // ---------------------------------------------------------------------
 export interface Estimate {
@@ -268,7 +280,7 @@ export interface Estimate {
 }
 
 // ---------------------------------------------------------------------
-// PURCHASE ORDER — official order issued by the buyer to a supplier.
+// PURCHASE ORDER â€” official order issued by the buyer to a supplier.
 // Direction is buyer -> seller (opposite of a sales quotation).
 // ---------------------------------------------------------------------
 export interface PurchaseOrderVendor {
@@ -412,6 +424,13 @@ export interface SubscriptionPlan {
     teamMembers: number | 'Unlimited';
     products: number | 'Unlimited';
     invoicesPerMonth: number | 'Unlimited';
+    // The three document kinds below share the SAME ceiling as the invoice
+    // quota per plan (the pricing policy keeps all four document budgets in
+    // lockstep), but usage is metered SEPARATELY per kind — each has its own
+    // monthly counter. (See entitlements-server countUsage / PricingView.)
+    estimatesPerMonth: number | 'Unlimited';
+    quotationsPerMonth: number | 'Unlimited';
+    purchaseOrdersPerMonth: number | 'Unlimited';
     // Directory listing ceiling. 0 = Business Network not included (feature
     // gated for paid plans only). Any positive value (or "Unlimited") grants
     // access with that many published listings.
@@ -440,10 +459,10 @@ export interface PaymentRecord {
   method: PaymentMethod;
   status: PaymentOutcome;
   description: string;
-  // Refund request state (frontend demo). This records a user's refund request
-  // locally; it does NOT process or grant a refund until a production payment
-  // processor exists. 'none' = no request; 'requested' = user requested a
-  // refund within the refund window; grant/deny get a backend in the next phase.
+  // Refund request state. This records a user's refund request; it does NOT
+  // process or grant a refund on its own. 'none' = no request; 'requested' =
+  // user requested a refund within the refund window; grant/deny are applied by
+  // the payments/support flow.
   refundStatus?: 'none' | 'requested';
   refundReason?: string;
 }
@@ -466,7 +485,7 @@ export interface SubscriptionState {
   currentPlanId: SubscriptionPlanId | null;
   status: SubscriptionStatus;
   billing: SubscriptionBilling;
-  // Pending checkout selection — NOT active until a successful payment.
+  // Pending checkout selection â€” NOT active until a successful payment.
   pendingPlanId: SubscriptionPlanId | null;
   pendingPeriod: 'month' | 'year';
 }
@@ -567,10 +586,11 @@ export interface Product {
 export interface NavItem {
   label: string;
   href: string;
-  icon: string;
+  icon: IconName;
   badge?: string | number;
   activePattern?: RegExp;
 }
+
 
 export interface NavSection {
   title?: string;
@@ -584,7 +604,7 @@ export interface NotificationItem {
   message: string;
   timeAgo: string;
   read: boolean;
-  icon: string;
+  icon: IconName;
   iconColor?: string;
 }
 
@@ -592,20 +612,21 @@ export interface AppNotificationInput {
   type: NotificationItem["type"];
   title: string;
   message: string;
-  icon?: string;
+  icon?: IconName;
   iconColor?: string;
 }
 
+// NOTE: 'invoice' | 'estimate' | 'quotation' | 'purchaseOrder' were removed
+// deliberately. Those four document types are NOT deletable in any status, so
+// they must not even be representable as a delete target â€” the server rejects
+// the DELETE unconditionally and no UI may offer it. Keeping them in this union
+// would leave a compile-time path to a delete affordance that can only fail.
 export type DeleteEntityKind =
   | 'product'
   | 'customer'
-  | 'invoice'
   | 'expense'
   | 'vehicle'
-  | 'team'
-  | 'quotation'
-  | 'estimate'
-  | 'purchaseOrder';
+  | 'team';
 
 export interface DeleteConfirmState {
   kind: DeleteEntityKind;
@@ -613,7 +634,38 @@ export interface DeleteConfirmState {
   name: string;
 }
 
+/**
+ * Financial-domain hydration lifecycle keys. One status entry per domain list
+ * hydrated from the backend so consumers can distinguish loading, successfully
+ * empty, successfully populated, and failed (previous data retained) states.
+ */
+export type DomainHydrationKey =
+  | 'customers'
+  | 'products'
+  | 'invoices'
+  | 'quotations'
+  | 'estimates'
+  | 'purchaseOrders'
+  | 'expenses'
+  | 'vehicles'
+  | 'team'
+  | 'notifications';
+
+export type DomainHydrationStatus = 'loading' | 'ready' | 'error';
+
+/** Result of an invoice create: the persisted record, or a distinguished
+ * failure (duplicate invoice number -> dedicated dialog; anything else -> the
+ * generic failed-toast path). Shared by the context and the create modal. */
+export type InvoiceCreateResult =
+  | { status: 'created'; invoice: Invoice }
+  | { status: 'duplicate' }
+  | { status: 'failed' };
+
 export interface AppContextType {
+  /** Result of an invoice create: the persisted record, or a distinguished
+   * failure (duplicate invoice number -> dedicated dialog; anything else -> the
+   * generic failed-toast path). */
+  addInvoice: (invoice: Omit<Invoice, 'id'>) => Promise<InvoiceCreateResult>;
   activeBusinessId: string | null;
   activeRoute: string;
   setActiveRoute: (route: string) => void;
@@ -652,9 +704,21 @@ export interface AppContextType {
    *  consistent with its year so the UI can never visually suggest a
    *  mismatched fiscal year. Never allocates. */
   documentSequenceFor: (fyId: string | null, kind: SequenceKind) => number;
+  /** True once `syncServerSequence` has confirmed this (fyId, kind) counter with
+   *  the server. A create form must not render a number before this is true:
+   *  the only other value available is the localStorage seed, which starts at 1
+   *  on a fresh browser and can be arbitrarily wrong. */
+  isServerSequenceReady: (fyId: string | null, kind: SequenceKind) => boolean;
+  /** Pull the server's authoritative counter for ONE document kind into the
+   *  local cache so a create form previews the number the server will actually
+   *  allocate. Read-only: it never allocates, and it never blocks the form.
+   *  Call it for the FY a create form is previewing (derived from the document
+   *  date, which can differ from the active financial year) and for the single
+   *  kind that form is about to create. Synthetic FY ids are ignored. */
+  syncServerSequence: (fyId: string | null, kind: SequenceKind) => Promise<void>;
   onboarding: OnboardingState;
   setOnboardingStep: (step: number) => void;
-  completeOnboarding: () => Promise<void>;
+  completeOnboarding: () => Promise<string | null>;
   currentPlanId: SubscriptionPlanId | null;
   subscription: SubscriptionState;
   pendingPlanId: SubscriptionPlanId | null;
@@ -666,8 +730,23 @@ export interface AppContextType {
   activePlan: SubscriptionPlan | null;
   subscriptionStatus: "loading" | "ready" | "error";
   retrySubscription: () => void;
+  // DB-driven plan catalog lifecycle (server /api/billing/plans). `plans`
+  // falls back to the static catalog on failure; `planCatalogStatus` lets the
+  // pricing UI surface loading / offline-fallback honestly instead of silently
+  // showing a stale catalog.
+  planCatalogStatus: "loading" | "ready" | "error";
+  retryPlanCatalog: () => void;
+  /** Financial-domain hydration lifecycle. One status per domain so consumers
+   *  can distinguish loading vs successfully-empty vs populated vs failed
+   *  (previous data retained). */
+  domainHydration: Record<DomainHydrationKey, DomainHydrationStatus>;
+  /** User-triggered only: re-runs the existing *.list(businessId) calls. */
+  retryDomains: () => void;
   currentUsage: {
     invoices: number;
+    estimates: number;
+    quotations: number;
+    purchaseOrders: number;
     customers: number;
     teamMembers: number;
     products: number;
@@ -702,28 +781,23 @@ addCustomer: (customer: Omit<Customer, 'id'>) => boolean;
   addProduct: (product: Omit<Product, 'id'>) => boolean;
   updateProduct: (product: Product) => void;
   deleteProduct: (id: string) => void;
-  addInvoice: (invoice: Omit<Invoice, 'id'>) => Promise<Invoice | null>;
-  updateInvoice: (invoice: Invoice) => void;
-  updateInvoiceStatus: (id: string, status: InvoiceStatus) => void;
-  deleteInvoice: (id: string) => void;
+  updateInvoice: (invoice: Invoice) => Promise<boolean>;
+  updateInvoiceStatus: (id: string, status: InvoiceStatus) => Promise<boolean>;
   invoiceSequence: number;
   advanceInvoiceSequence: () => number;
   addQuotation: (quotation: Omit<Quotation, 'id' | 'createdAt'>) => Promise<Quotation | null>;
   updateQuotation: (quotation: Quotation) => void;
-  updateQuotationStatus: (id: string, status: QuotationStatus) => void;
-  deleteQuotation: (id: string) => void;
+  updateQuotationStatus: (id: string, status: QuotationStatus) => Promise<boolean>;
   quotationSequence: number;
   advanceQuotationSequence: () => number;
   addEstimate: (estimate: Omit<Estimate, 'id' | 'createdAt'>) => Promise<Estimate | null>;
   updateEstimate: (estimate: Estimate) => void;
-  updateEstimateStatus: (id: string, status: EstimateStatus) => void;
-  deleteEstimate: (id: string) => void;
+  updateEstimateStatus: (id: string, status: EstimateStatus) => Promise<boolean>;
   estimateSequence: number;
   advanceEstimateSequence: () => number;
   addPurchaseOrder: (po: Omit<PurchaseOrder, 'id' | 'createdAt'>) => Promise<PurchaseOrder | null>;
   updatePurchaseOrder: (po: PurchaseOrder) => void;
-  updatePurchaseOrderStatus: (id: string, status: PurchaseOrderStatus) => void;
-  deletePurchaseOrder: (id: string) => void;
+  updatePurchaseOrderStatus: (id: string, status: PurchaseOrderStatus) => Promise<boolean>;
   purchaseOrderSequence: number;
   advancePurchaseOrderSequence: () => number;
   convertQuotationToInvoice: (id: string) => void;
@@ -736,10 +810,15 @@ addCustomer: (customer: Omit<Customer, 'id'>) => boolean;
    * conversion's await and cleared in that request's finally().
    */
   convertingDocument: { id: string; target: "quotation" | "invoice" } | null;
+  /**
+   * UI-only: the document whose STATUS TRANSITION is currently awaiting the
+   * server, or null. `id` is the document being transitioned, so a detail view
+   * only disables its own status control. Raised immediately before the
+   * transition's await and cleared in that request's finally(). The status is
+   * never set locally — it is replaced from the server response on success.
+   */
+  transitioningDocument: { id: string } | null;
   restoreLastDeleted: () => void;
-  resetBusinessData: () => void;
-  resetEntireSetup: () => void;
-  loadDemoData: () => void;
 }
 
 export interface LocalAccount {
@@ -758,6 +837,10 @@ export interface AuthContextType {
   account: LocalAccount | null;
   isAuthenticated: boolean;
   authPending: boolean;
+  /** True when the initial session fetch failed (network/server). Consumers must
+   *  still resolve to a safe state â€” redirect or recoverable error â€” and must
+   *  never leave an indefinite loading spinner. */
+  authError: boolean;
   lastRoute: string | null;
   createAccount: (input: {
     name: string;
@@ -767,5 +850,15 @@ export interface AuthContextType {
   }) => Promise<AuthResult>;
   login: (input: { email: string; password: string }) => Promise<AuthResult>;
   logout: () => Promise<void>;
+  requestPasswordReset: (input: { email: string }) => Promise<AuthResult>;
+  resetPassword: (input: {
+    token: string;
+    newPassword: string;
+  }) => Promise<AuthResult>;
+  verifyEmail: (input: {
+    token: string;
+    callbackURL?: string;
+  }) => Promise<AuthResult>;
+  sendVerificationEmail: (input: { email: string }) => Promise<AuthResult>;
   setLastRoute: (route: string) => void;
 }

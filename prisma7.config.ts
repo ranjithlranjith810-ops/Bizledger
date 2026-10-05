@@ -13,7 +13,10 @@ export default defineConfig({
   schema: "prisma/schema.prisma",
   migrations: {
     path: "prisma/migrations",
-    seed: "tsx prisma/seed.ts",
+    // `--conditions=react-server` is required: plan-service.ts imports
+    // `server-only`, whose package export map throws outside a React Server
+    // Component context. Without it `prisma db seed` fails before running.
+    seed: "tsx --conditions=react-server prisma/seed.ts",
   },
   datasource: {
     // Migrations must use the direct connection (DIRECT_URL) — Supabase's

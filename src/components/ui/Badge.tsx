@@ -1,10 +1,11 @@
 import React from "react";
+import { Icon, type IconName } from "./Icon";
 
 export interface BadgeProps {
   children: React.ReactNode;
   variant?: 'primary' | 'secondary' | 'success' | 'warning' | 'error' | 'neutral';
   size?: 'sm' | 'md';
-  icon?: string;
+  icon?: IconName;
   className?: string;
 }
 
@@ -33,7 +34,7 @@ export const Badge: React.FC<BadgeProps> = ({
     <span
       className={`inline-flex items-center font-medium rounded-full ${sizeStyles[size]} ${variantStyles[variant]} ${className}`}
     >
-      {icon && <span className="material-symbols-outlined text-[14px]">{icon}</span>}
+      {icon && <Icon name={icon} className="text-[14px]" />}
       <span>{children}</span>
     </span>
   );

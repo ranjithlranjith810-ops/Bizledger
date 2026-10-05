@@ -16,6 +16,7 @@ import "server-only";
 
 import { prisma } from "@/lib/prisma";
 import { PLAN_CATALOG } from "@/lib/plans";
+import { catalogLimits } from "@/lib/billing/entitlements-server";
 import type { Prisma } from "@/generated/prisma/client";
 
 /**
@@ -39,6 +40,12 @@ export interface PlanDto {
  * converted to a response DTO — raw PlanCatalog records never leave the
  * service layer. Deliberately no relations, DB metadata, timestamps,
  * subscription/payment history or internal ids.
+ *
+ * `limits` is NOT the raw persisted JSON: it goes through the shared
+ * `catalogLimits` resolver (the same one the entitlement engine enforces), so
+ * catalog rows written before the document kinds existed still advertise the
+ * document limits — they inherit `invoicesPerMonth`, the common four-document
+ * ceiling. The pricing page therefore displays exactly what the server enforces.
  */
 export async function toPlanDto(row: {
   id: string;
@@ -56,7 +63,7 @@ export async function toPlanDto(row: {
     price: Number(row.price),
     period: row.period,
     businessNetworkIncluded: row.businessNetworkIncluded,
-    limits: row.limits as Record<string, unknown>,
+    limits: catalogLimits(row),
   };
 }
 

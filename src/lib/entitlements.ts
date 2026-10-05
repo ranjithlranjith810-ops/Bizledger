@@ -8,7 +8,6 @@
 //   checkEntitlement()      pure decision (allowed? remaining? reason)
 //   assertEntitlement()     enforcement helper returning a normalized result
 import {
-  Invoice,
   SubscriptionPlan,
   SubscriptionState,
   SubscriptionPlanId,
@@ -48,12 +47,18 @@ export function getLimit(plan: SubscriptionPlan, kind: LimitKind): number | "Unl
 
 // Single-reliable usage resolver for every entitlement resource. Callers pass
 // the raw counts they already track (or have AppContext build them); this keeps
-// one shape for customers / products / team / invoices / directory.
+// one shape for customers / products / team / invoices / estimates / quotations
+// / purchase orders / directory.
 export interface UsageCounts {
   customers: number;
   products: number;
   teamMembers: number;
   invoicesInPeriod: number;
+  // The three document kinds share the invoice ceiling value but meter their
+  // own SEPARATE monthly counters (see the AppContext usage snapshot).
+  estimatesInPeriod: number;
+  quotationsInPeriod: number;
+  purchaseOrdersInPeriod: number;
   directoryListings: number;
 }
 
@@ -62,6 +67,9 @@ export interface ResourceUsage {
   products: number;
   teamMembers: number;
   invoices: number;
+  estimates: number;
+  quotations: number;
+  purchaseOrders: number;
   directoryListings: number;
 }
 
@@ -71,6 +79,9 @@ export function getUsage(counts: UsageCounts): ResourceUsage {
     products: counts.products,
     teamMembers: counts.teamMembers,
     invoices: counts.invoicesInPeriod,
+    estimates: counts.estimatesInPeriod,
+    quotations: counts.quotationsInPeriod,
+    purchaseOrders: counts.purchaseOrdersInPeriod,
     directoryListings: counts.directoryListings,
   };
 }
@@ -81,6 +92,12 @@ export function usageForKind(usage: ResourceUsage, kind: LimitKind): number {
   switch (kind) {
     case "invoices":
       return usage.invoices;
+    case "estimates":
+      return usage.estimates;
+    case "quotations":
+      return usage.quotations;
+    case "purchaseOrders":
+      return usage.purchaseOrders;
     case "customers":
       return usage.customers;
     case "teamMembers":
@@ -92,21 +109,29 @@ export function usageForKind(usage: ResourceUsage, kind: LimitKind): number {
   }
 }
 
-// How many invoices fall inside the current billing period. Usage resets
+// A sales document with an ISO `date` — the shared client-side shape of
+// Invoice / Quotation / Estimate / PurchaseOrder for period-window counting.
+type DatedDocument = { date: string };
+
+// How many documents fall inside the current billing period. Usage resets
 // together with the subscription billing cycle (a rolling window sized by the
 // period) rather than introducing a second counter — so a "monthly" plan counts
 // the trailing 30 days, a "yearly" plan counts the trailing 365 days. `now` is
 // injectable so unit tests can drive boundary/reset scenarios deterministically.
+// The SAME window is applied to every document kind (invoices, estimates,
+// quotations, purchase orders) so the pricing gauges stay in step with each
+// other; the server remains the authoritative enforcer of the calendar-month
+// quotas in entitlements-server countUsage.
 export function countCurrentPeriodInvoices(
-  invoices: Invoice[],
+  docs: DatedDocument[],
   state: SubscriptionState | null,
   now = Date.now()
 ): number {
   const period = state?.billing?.period ?? "month";
   const windowMs = period === "year" ? 365 * MS_DAY : DEFAULT_PERIOD_MS;
   const cutoff = now - windowMs;
-  return invoices.reduce((n, inv) => {
-    const t = Date.parse(inv.date);
+  return docs.reduce((n, doc) => {
+    const t = Date.parse(doc.date);
     // Unparseable dates are treated as minted "now" and therefore current-period.
     if (Number.isNaN(t)) return n + 1;
     return n + (t >= cutoff && t <= now ? 1 : 0);
@@ -164,7 +189,9 @@ export function checkEntitlement(
     kind,
     limit: cap,
     used,
-    remaining: allowed ? cap - used - 1 : 0,
+    // Exact remaining slots: one used item against a ceiling of five leaves
+    // four remaining (Math.max(limit - used, 0) — never an extra -1).
+    remaining: Math.max(cap - used, 0),
     reason: allowed ? "ok" : "limit",
   };
 }

@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import { formatINR } from "@/lib/billing";
 import { useBillingHistory } from "@/lib/api/billing";
+import { Icon } from "../ui/Icon";
 
 const fmtDate = (iso: string) =>
   new Date(iso).toLocaleDateString("en-IN", {
@@ -139,7 +140,7 @@ export const BillingHistoryView: React.FC = () => {
         ) : history.status === "loading" || history.status === "idle" ? (
           <div className="p-8 text-center">
             <div className="inline-flex items-center gap-2 text-xs text-gray-400">
-              <span className="material-symbols-outlined animate-spin text-base">progress_activity</span>
+              <Icon name="progress_activity" className="animate-spin text-base" />
               Loading billing history…
             </div>
           </div>

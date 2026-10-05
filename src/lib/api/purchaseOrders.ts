@@ -185,6 +185,18 @@ export const purchaseOrdersApi = {
     http.patch<{ purchaseOrder: PurchaseOrderBackendJson }>(`/api/purchase-orders/${id}`, input, {
       businessId,
     }),
+  // Authoritative lifecycle move. `status` is a requested destination; the
+  // server reads the current status from the DB and rejects an illegal edge.
+  transitionStatus: (
+    businessId: string,
+    id: string,
+    status: PurchaseOrder["status"],
+  ) =>
+    http.patch<{ purchaseOrder: PurchaseOrderBackendJson }>(
+      `/api/purchase-orders/${id}/status`,
+      { status },
+      { businessId },
+    ),
   remove: (businessId: string, id: string) =>
     http.del<{ id: string }>(`/api/purchase-orders/${id}`, { businessId }),
 };

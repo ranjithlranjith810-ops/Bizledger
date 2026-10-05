@@ -36,7 +36,16 @@ function catRow(overrides: Partial<CatalogPlanRow>): CatalogPlanRow {
     name: "Custom",
     period: "month",
     businessNetworkIncluded: false,
-    limits: { customers: 4, teamMembers: 2, products: 8, invoicesPerMonth: 6, directoryListings: 1 },
+    limits: {
+      customers: 4,
+      teamMembers: 2,
+      products: 8,
+      invoicesPerMonth: 6,
+      estimatesPerMonth: 6,
+      quotationsPerMonth: 6,
+      purchaseOrdersPerMonth: 6,
+      directoryListings: 1,
+    },
     featureEntitlements: null,
     ...overrides,
   };
@@ -81,16 +90,46 @@ function testPlanFromRow() {
   check("L1 custom plan limits preserved",   custom.plan.limits.customers === 3 && custom.plan.limits.products === "Unlimited");
   check("L2 custom missing key → 0 (never Unlimited)",
     custom.plan.limits.invoicesPerMonth === 0 && custom.plan.limits.directoryListings === 0);
+  check("L2a custom missing document keys → inherit the invoice limit (0 when invoice is absent)",
+    custom.plan.limits.estimatesPerMonth === 0 &&
+      custom.plan.limits.quotationsPerMonth === 0 &&
+      custom.plan.limits.purchaseOrdersPerMonth === 0);
+
+  const inherit = planFromCatalogRow(catRow({ limits: { customers: 3, invoicesPerMonth: 6 } }));
+  check("L6 custom missing document keys inherit the invoice limit exactly",
+    inherit.plan.limits.invoicesPerMonth === 6 &&
+      inherit.plan.limits.estimatesPerMonth === 6 &&
+      inherit.plan.limits.quotationsPerMonth === 6 &&
+      inherit.plan.limits.purchaseOrdersPerMonth === 6);
+
+  const inheritUnlimited = planFromCatalogRow(catRow({ limits: { invoicesPerMonth: "Unlimited" } }));
+  check("L7 custom Unlimited invoice limit is the common four-document limit",
+    inheritUnlimited.plan.limits.estimatesPerMonth === "Unlimited" &&
+      inheritUnlimited.plan.limits.quotationsPerMonth === "Unlimited" &&
+      inheritUnlimited.plan.limits.purchaseOrdersPerMonth === "Unlimited");
+
+  const override = planFromCatalogRow(catRow({ limits: { customers: 3, invoicesPerMonth: 6, estimatesPerMonth: 9 } }));
+  check("L8 an explicit document key overrides the invoice inheritance",
+    override.plan.limits.estimatesPerMonth === 9 && override.plan.limits.quotationsPerMonth === 6);
 
   const malformed = planFromCatalogRow(catRow({ limits: { customers: 10, products: "all" } }));
   check("L3 malformed value → 0",             malformed.plan.limits.products === 0);
 
   const base = planFromCatalogRow(catRow({ id: "base", limits: {} }));
   check("L4 canonical base fallback to static", base.plan.limits.customers === 2 && base.plan.limits.teamMembers === 0);
+  check("L4a base document limits fall back to the static invoice ceiling",
+    base.plan.limits.invoicesPerMonth === 5 &&
+      base.plan.limits.estimatesPerMonth === 5 &&
+      base.plan.limits.quotationsPerMonth === 5 &&
+      base.plan.limits.purchaseOrdersPerMonth === 5);
 
   const biz = planFromCatalogRow(catRow({ id: "business", limits: { invoicesPerMonth: "Unlimited" } }));
   check("L5 business canonical keeps DB Unlimited + fallback rest",
     biz.plan.limits.invoicesPerMonth === "Unlimited" && biz.plan.limits.customers === 150 && biz.plan.limits.teamMembers === 3);
+  check("L5a business document limits mirror the invoice ceiling exactly (Unlimited)",
+    biz.plan.limits.estimatesPerMonth === "Unlimited" &&
+      biz.plan.limits.quotationsPerMonth === "Unlimited" &&
+      biz.plan.limits.purchaseOrdersPerMonth === "Unlimited");
 }
 
 // -----------------------------------------------------------------------
@@ -103,7 +142,7 @@ function testAssertWithinLimit() {
   check("T1 Unlimited → allowed", unlimited.allowed === true);
 
   const under = testWithin(p, "customers", 5, 3);
-  check("T2 under → allowed, remaining=1",  under.allowed === true && under.remaining === 1);
+  check("T2 under → allowed, remaining=2",  under.allowed === true && under.remaining === 2);
 
   const exact = testWithin(p, "customers", 5, 5);
   check("T3 exact → throws EntitlementDeniedError",
@@ -142,6 +181,11 @@ async function testInvoiceWindow() {
   // Property holder (not a flow-analyzed `let`) so TS keeps the declared
   // `InvoiceWhere | null` type across the deferred async closure write.
   const probe: { where: InvoiceWhere | null } = { where: null };
+  const probes: { estimates: InvoiceWhere | null; quotations: InvoiceWhere | null; purchaseOrders: InvoiceWhere | null } = {
+    estimates: null,
+    quotations: null,
+    purchaseOrders: null,
+  };
   const fakeDb: EntitlementDb = {
     $queryRaw: QUERY_RAW_UNUSED,
     businessSubscription: { findFirst: async () => ({ planId: "base", period: "month", renewsAt: new Date(Date.now() + 30*86400000) }) },
@@ -157,6 +201,24 @@ async function testInvoiceWindow() {
         return 0;
       },
     },
+    estimate: {
+      count: async (args: unknown) => {
+        probes.estimates = (args as { where?: InvoiceWhere }).where ?? null;
+        return 0;
+      },
+    },
+    quotation: {
+      count: async (args: unknown) => {
+        probes.quotations = (args as { where?: InvoiceWhere }).where ?? null;
+        return 0;
+      },
+    },
+    purchaseOrder: {
+      count: async (args: unknown) => {
+        probes.purchaseOrders = (args as { where?: InvoiceWhere }).where ?? null;
+        return 0;
+      },
+    },
   };
   await countUsage(fakeDb, "bizX", "invoices", "month");
   const w = probe.where;
@@ -167,6 +229,23 @@ async function testInvoiceWindow() {
   check("W2 invoice where lt  = monthEnd",          w?.createdAt?.lt?.getTime()  === monthEnd.getTime());
   check("W3 invoice where status not Cancelled",    w?.status?.not === "Cancelled");
   check("W4 invoice where businessId set",          w?.businessId === "bizX");
+
+  await countUsage(fakeDb, "bizX", "estimates", "month");
+  check("W5 estimate window gte = monthStart", probes.estimates?.createdAt?.gte?.getTime() === monthStart.getTime());
+  check("W6 estimate window lt  = monthEnd",    probes.estimates?.createdAt?.lt?.getTime()  === monthEnd.getTime());
+  check("W7 estimate excludes NO status",        probes.estimates?.status === undefined);
+  check("W8 estimate where businessId set",      probes.estimates?.businessId === "bizX");
+
+  await countUsage(fakeDb, "bizX", "quotations", "month");
+  check("W9  quotation window gte = monthStart", probes.quotations?.createdAt?.gte?.getTime() === monthStart.getTime());
+  check("W10 quotation window lt  = monthEnd",    probes.quotations?.createdAt?.lt?.getTime()  === monthEnd.getTime());
+  check("W11 quotation excludes NO status",        probes.quotations?.status === undefined);
+
+  await countUsage(fakeDb, "bizX", "purchaseOrders", "month");
+  check("W12 PO window gte = monthStart",      probes.purchaseOrders?.createdAt?.gte?.getTime() === monthStart.getTime());
+  check("W13 PO window lt  = monthEnd",         probes.purchaseOrders?.createdAt?.lt?.getTime()  === monthEnd.getTime());
+  check("W14 PO where status not Cancelled",    probes.purchaseOrders?.status?.not === "Cancelled");
+  check("W15 PO where businessId set",          probes.purchaseOrders?.businessId === "bizX");
 }
 
 // -----------------------------------------------------------------------
@@ -196,6 +275,9 @@ async function testAssertFeature() {
     customer: { count: async () => 0 }, product: { count: async () => 0 },
     businessMember: { count: async () => 0 }, businessDirectoryProfile: { count: async () => 0 },
     invoice: { count: async () => 0 },
+    estimate: { count: async () => 0 },
+    quotation: { count: async () => 0 },
+    purchaseOrder: { count: async () => 0 },
   });
 
   const { assertFeature } = await import("@/lib/billing/entitlements-server");

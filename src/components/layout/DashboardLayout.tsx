@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { SideNavBar } from "@/components/layout/SideNavBar";
 import { TopNavBar } from "@/components/layout/TopNavBar";
@@ -15,10 +15,11 @@ import { AddVehicleExpenseModal } from "@/components/vehicles/AddVehicleExpenseM
 import { AddTeamMemberModal } from "@/components/team/AddTeamMemberModal";
 import { AppLegalFooter } from "@/components/legal/AppLegalFooter";
 import { useApp } from "@/context/AppContext";
+import { Icon, type IconName } from "../ui/Icon";
 
 interface QuickAction {
   label: string;
-  icon: string;
+  icon: IconName;
   href?: string;
   modal?: string;
 }
@@ -39,8 +40,28 @@ export const DashboardLayout: React.FC<{ children: React.ReactNode }> = ({ child
   const [collapsed, setCollapsed] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [quickOpen, setQuickOpen] = useState(false);
+  const quickMenuRef = useRef<HTMLDivElement | null>(null);
   const router = useRouter();
   const { setOpenModal, openModal } = useApp();
+
+  // Escape closes the quick-action menu and returns focus to its trigger.
+  useEffect(() => {
+    if (!quickOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setQuickOpen(false);
+      document.getElementById("btn-topbar-quick-action")?.focus();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [quickOpen]);
+
+  // Move keyboard focus into the menu once it opens so the keyboard user does
+  // not stay on the trigger while focus-dependent styling changes underneath.
+  useEffect(() => {
+    if (!quickOpen) return;
+    quickMenuRef.current?.querySelector<HTMLElement>("button")?.focus();
+  }, [quickOpen]);
 
   // Shared sidebar state: the same hamburger toggles desktop collapse on wide
   // screens and the mobile drawer on narrow screens. There is ONE set of nav
@@ -63,9 +84,16 @@ export const DashboardLayout: React.FC<{ children: React.ReactNode }> = ({ child
         <TopNavBar
           onToggleSidebar={handleToggleSidebar}
           onQuickAction={() => setQuickOpen((o) => !o)}
+          quickActionOpen={quickOpen}
         />
 
-        <main className="flex-1 overflow-y-auto p-4 sm:p-6 md:p-8 pb-24 lg:pb-8">
+        {/* Bottom padding is set per-side instead of via the `p-*` shorthand.
+            `p-4 sm:p-6 md:p-8 pb-24 lg:pb-8` let the later `sm:`/`md:`
+            shorthands clobber `pb-24`, so the fixed mobile nav covered the last
+            rows of content. The clearance is now the nav's height
+            (h-16 = 4rem) plus the home-indicator safe area plus breathing room,
+            and it is only released at lg where the nav is hidden. */}
+        <main className="flex-1 overflow-y-auto px-4 pt-4 pb-[calc(5rem+env(safe-area-inset-bottom))] sm:px-6 sm:pt-6 md:px-8 md:pt-8 lg:pb-8">
           <div className="max-w-7xl mx-auto">
             {children}
             <AppLegalFooter />
@@ -79,11 +107,17 @@ export const DashboardLayout: React.FC<{ children: React.ReactNode }> = ({ child
       {/* Quick Action Dropdown */}
       {quickOpen && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setQuickOpen(false)} />
-          <div className="fixed top-16 right-4 z-50 w-56 bg-surface-container-lowest border border-outline-variant/30 rounded-xl shadow-2xl p-2 animate-[fadeIn_0.15s_ease-out]">
+          <div className="fixed inset-0 z-40" aria-hidden="true" onClick={() => setQuickOpen(false)} />
+          <div
+            ref={quickMenuRef}
+            role="menu"
+            aria-label="Quick actions"
+            className="fixed top-16 right-4 z-50 w-56 bg-surface-container-lowest border border-outline-variant/30 rounded-xl shadow-2xl p-2 animate-[fadeIn_0.15s_ease-out]"
+          >
             {QUICK_ACTIONS.map((action) => (
               <button
                 key={action.label}
+                role="menuitem"
                 onClick={() => {
                   setQuickOpen(false);
                   if (action.modal) {
@@ -95,7 +129,7 @@ export const DashboardLayout: React.FC<{ children: React.ReactNode }> = ({ child
                 }}
                 className="w-full flex items-center gap-3 px-3 py-2 rounded-md text-xs font-medium text-on-surface hover:bg-surface-container-low transition-colors"
               >
-                <span className="material-symbols-outlined text-[18px] text-primary">{action.icon}</span>
+                <Icon name={action.icon} className="text-[18px] text-primary" />
                 {action.label}
               </button>
             ))}

@@ -2,6 +2,7 @@
 
 import React, { useRef, useState, useEffect } from "react";
 import { Search, Check, ChevronDown } from "lucide-react";
+import { Icon } from "../ui/Icon";
 
 export interface SearchablePickerProps<T> {
   items: T[];
@@ -103,7 +104,7 @@ export function SearchablePicker<T extends { id: string }>({
                     }}
                     className="mt-2 inline-flex items-center gap-1 text-xs font-semibold text-[#93000b] hover:bg-rose-50 border border-rose-200 px-3 py-1.5 rounded-lg transition-colors"
                   >
-                    <span className="material-symbols-outlined text-[14px]">add</span>
+                    <Icon name="add" className="text-[14px]" />
                     {emptyActionLabel}
                   </button>
                 )}

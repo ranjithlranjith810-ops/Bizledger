@@ -22,7 +22,7 @@ const SECTIONS = [
       rows: [
         { label: "Public", value: "Business name, category, description, address, contact person, phone(s), email, and website you choose to include." },
         { label: "Private", value: "Anything you do not add to your listing remains inside your own ledger and is not published." },
-        { label: "Verification", value: "GST verification is a backend feature planned later; during the demo, a provided GSTIN is labelled \"GSTIN Provided\" only." },
+        { label: "Verification", value: "GST verification is a backend feature planned later; until it is live, a provided GSTIN is labelled \"GSTIN Provided\" only." },
       ],
     },
   },

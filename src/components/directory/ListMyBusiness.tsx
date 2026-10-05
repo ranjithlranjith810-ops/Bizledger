@@ -27,6 +27,7 @@ import { Select } from "@/components/ui/Select";
 import { Button } from "@/components/ui/Button";
 import { BusinessNetworkGate } from "@/components/directory/BusinessNetworkGate";
 import { validateBusinessListingForm } from "@/lib/validation";
+import { Icon } from "../ui/Icon";
 
 const STATUS_STYLES: Record<string, { label: string; cls: string; icon: React.ReactNode }> = {
   "Published": { label: "Live in Directory", cls: "bg-emerald-50 text-emerald-700 border-emerald-200", icon: <BadgeCheck className="w-3.5 h-3.5" /> },
@@ -279,7 +280,7 @@ export const ListMyBusiness: React.FC = () => {
       <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs p-6 space-y-5">
         {error && (
           <div className="flex items-start gap-2 bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 text-xs">
-            <span className="material-symbols-outlined text-[18px]">error</span>
+            <Icon name="error" className="text-[18px]" />
             <span>{error}</span>
           </div>
         )}
@@ -426,7 +427,7 @@ export const ListMyBusiness: React.FC = () => {
         </div>
 
         <p className="text-[11px] text-gray-500 flex items-center gap-1">
-          <span className="material-symbols-outlined text-[14px]">info</span>
+          <Icon name="info" className="text-[14px]" />
           GST status will be shown as &quot;GSTIN Provided&quot;. Verification happens in a backend step.
         </p>
 

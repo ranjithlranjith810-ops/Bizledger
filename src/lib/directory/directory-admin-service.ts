@@ -15,24 +15,28 @@
 //     does not permit                   -> 409 (ConflictError)
 //   - unknown listing id                -> 404 (ResourceNotFoundError)
 //
-// NOTE — ADMIN MODERATION UI BACKEND AUTH DEPENDENCY: the current
-// `bizledger-admin` demo app has NO backend (it reads localStorage/mock data
-// and fakes auth for demonstration). It must NOT pretend to authorize
-// moderation. Any real moderation UI that we add consumes THESE server APIs,
-// which enforce PlatformAdmin auth on the server. The existing admin app is
-// left untouched.
+// NOTE — THE ADMIN MODERATION UI consumes THESE server APIs: every view/mutation
+// is authorization-gated HERE (PlatformAdmin auth + role resolved from the
+// session, never trusted from the browser), and (Phase 9C-5A) every moderation
+// decision writes an immutable platform_admin_log row in the SAME transaction
+// as the status transition.
 
 import { prisma } from "@/lib/prisma";
-import { requireUser } from "@/lib/business/tenant";
 import {
   ResourceNotFoundError,
   ValidationError,
   ConflictError,
 } from "@/lib/business/api-error";
-import { ForbiddenError } from "@/lib/business/business-service";
 import { createNotification } from "@/lib/notification/notification-service";
 import { toMineJson } from "@/lib/directory/directory-service";
+import { requirePlatformAdmin } from "@/lib/admin/admin-auth";
+import { writePlatformAdminLog } from "@/lib/admin/admin-audit-service";
 import type { DirectoryStatus } from "@/generated/prisma/client";
+
+// Historical import surface: the other admin services import the role gates
+// from this module ("@/lib/directory/directory-admin-service"). Re-export the
+// relocated gates so those imports keep working unchanged.
+export { requirePlatformAdmin, requirePlatformAdminRole } from "@/lib/admin/admin-auth";
 
 const STR = (v: unknown): string | undefined => {
   if (v == null) return undefined;
@@ -42,18 +46,6 @@ const STR = (v: unknown): string | undefined => {
 
 const ADMIN_ACTIONS = ["approve", "reject", "suspend", "restore"] as const;
 export type DirectoryAdminAction = (typeof ADMIN_ACTIONS)[number];
-
-/**
- * Authorization gate for platform-level moderation. Resolves the session and
- * requires a PlatformAdmin record for the signed-in user. 401 if not signed
- * in; 403 if signed in but not a platform admin.
- */
-export async function requirePlatformAdmin() {
-  const { user } = await requireUser();
-  const admin = await prisma.platformAdmin.findUnique({ where: { userId: user.id } });
-  if (!admin) throw new ForbiddenError("Administrator access required");
-  return { user, admin };
-}
 
 const LABEL_TO_STATUS: Record<string, DirectoryStatus> = {
   "Not Listed": "NOT_LISTED",
@@ -106,6 +98,15 @@ const TRANSITIONS: Record<
   restore: { from: ["SUSPENDED", "REJECTED"], to: "PUBLISHED", isListed: true },
 };
 
+// Phase 9C-5A — stable machine-readable audit action names for directory
+// moderation (UPPER_SNAKE, conform to the audit-service ACTION_PATTERN).
+const DIRECTORY_AUDIT_ACTION: Record<DirectoryAdminAction, string> = {
+  approve: "DIRECTORY_APPROVE",
+  reject: "DIRECTORY_REJECT",
+  suspend: "DIRECTORY_SUSPEND",
+  restore: "DIRECTORY_RESTORE",
+};
+
 /**
  * POST /api/directory/admin/[id]/approve|reject|suspend|restore — one
  * state-machine step, always gated by requirePlatformAdmin.
@@ -137,9 +138,29 @@ export async function moderateDirectoryListing(
     );
   }
 
-  const updated = await prisma.businessDirectoryProfile.update({
-    where: { id },
-    data: { status: t.to, isListed: t.isListed },
+  // Phase 9C-5A — the status transition and its immutable audit row commit
+  // ATOMICALLY. writePlatformAdminLog resolves the acting PlatformAdmin from
+  // the server session (never the request), sanitizes the before/after
+  // snapshots, and enforces the SUPER_ADMIN floor again before inserting
+  // inside this transaction — so an audit failure rolls back the moderation.
+  const beforeSnapshot = { status: profile.status, isListed: profile.isListed };
+
+  const updated = await prisma.$transaction(async (tx) => {
+    const row = await tx.businessDirectoryProfile.update({
+      where: { id },
+      data: { status: t.to, isListed: t.isListed },
+    });
+    await writePlatformAdminLog(
+      {
+        action: DIRECTORY_AUDIT_ACTION[action as DirectoryAdminAction],
+        targetType: "directory",
+        targetId: row.id,
+        before: beforeSnapshot,
+        after: { status: row.status, isListed: row.isListed },
+      },
+      { tx, minRole: "SUPER_ADMIN" },
+    );
+    return row;
   });
 
   // Notify the listing's OWNER (the business's active OWNER membership).

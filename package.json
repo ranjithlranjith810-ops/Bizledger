@@ -2,11 +2,32 @@
   "name": "bizledger",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=22.18.0 <23"
+  },
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint"
+    "typecheck": "tsc --noEmit",
+    "lint": "next lint",
+    "prisma:generate": "prisma generate",
+    "postinstall": "prisma generate",
+    "prebuild": "prisma generate",
+    "test:email": "tsx src/__tests__/email-validation.test.ts",
+    "test:bootstrap-guard": "tsx src/__tests__/bootstrap-admin-guard.test.ts",
+    "test:invoice": "tsx src/__tests__/invoice-persistence-regression.test.ts",
+    "test:sales-doc": "tsx src/__tests__/sales-doc-api-regression.test.ts",
+    "test:sales-doc-edit": "tsx src/__tests__/sales-document-edit-persistence.test.ts",
+    "test:company-profile": "tsx src/__tests__/company-profile-address.test.ts",
+    "test:role-grant": "tsx src/__tests__/role-grant-escalation.test.ts",
+    "test:directory": "tsx src/__tests__/directory-production-safety.test.ts",
+    "test:entitlements-core": "tsx --conditions react-server src/__tests__/entitlements-core.test.ts",
+    "test:doc-entitlement-conversion": "tsx --conditions react-server src/__tests__/document-entitlement-conversion.test.ts",
+    "test:doc-lifecycle-rules": "tsx --conditions react-server src/__tests__/document-lifecycle-rules.test.ts",
+    "test:company-snapshot-signature": "tsx --conditions react-server src/__tests__/company-snapshot-signature.test.ts",
+    "test:directory-feature-entitlement": "tsx --conditions react-server src/__tests__/directory-feature-entitlement.test.ts",
+    "test:resend-webhook-config": "tsx --conditions react-server src/__tests__/resend-webhook-config.test.ts"
   },
   "dependencies": {
     "@better-auth/prisma-adapter": "^1.7.2",
@@ -18,6 +39,7 @@
     "lucide-react": "^0.546.0",
     "motion": "^12.23.24",
     "next": "^15.1.0",
+    "pdf-lib": "^1.17.1",
     "razorpay": "^2.9.8",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
@@ -27,6 +49,7 @@
     "tailwind-merge": "^3.0.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@types/canvas-confetti": "^1.9.0",
     "@types/node": "^22.14.0",
     "@types/react": "^19.0.0",
@@ -38,6 +61,9 @@
     "tailwindcss": "^3.4.17",
     "tsx": "^4.23.13",
     "typescript": "^5.8.2"
+  },
+  "overrides": {
+    "mysql2": "^3.24.4"
   },
   "allowScripts": {
     "@prisma/engines@7.10.0": true,

@@ -248,7 +248,9 @@ function toExpenseJson(e: {
   vehicleId: string | null;
   vehicleRegistration: string | null;
   createdBy: string | null;
+  createdById: string | null;
   approvedBy: string | null;
+  approvedById: string | null;
   createdAt: Date;
   updatedAt: Date;
 }) {
@@ -272,7 +274,9 @@ function toExpenseJson(e: {
     vehicleId: e.vehicleId,
     vehicleRegistration: e.vehicleRegistration,
     createdBy: e.createdBy,
+    createdById: e.createdById,
     approvedBy: e.approvedBy,
+    approvedById: e.approvedById,
     createdAt: e.createdAt.toISOString(),
     updatedAt: e.updatedAt.toISOString(),
   };
@@ -322,8 +326,15 @@ export async function createExpense(businessIdInput: unknown, raw: Record<string
     data: {
       businessId,
       ...(data as Omit<Prisma.ExpenseUncheckedCreateInput, "businessId">),
+      // F2: provenance is recorded as BOTH the display name (existing API
+      // contract) and the immutable user id. The id is the authoritative
+      // self-approval signal — a name change cannot relabel an expense and
+      // same-name users cannot impersonate each other. The body never reaches
+      // these fields (they are not part of the whitelist).
       createdBy: ctx.user.name,
+      createdById: ctx.user.id,
       approvedBy: null,
+      approvedById: null,
       ...(vehicleRegistration
         ? { vehicleRegistration }
         : { vehicleRegistration: (data.vehicleRegistration as string | null) ?? null }),
@@ -341,6 +352,7 @@ export async function listExpenses(
 
   const where: Prisma.ExpenseWhereInput = { businessId };
   const q = String(opts?.q ?? "").trim().toLowerCase();
+  if (q.length > 200) throw new ValidationError("Search query is too long");
   if (q) {
     where.OR = [
       { expenseNumber: { contains: q, mode: "insensitive" } },
@@ -471,18 +483,22 @@ export async function decideExpenseApproval(
 
   const existing = await prisma.expense.findFirst({
     where: { id, businessId },
-    select: { id: true, status: true, createdBy: true },
+    select: { id: true, status: true, createdBy: true, createdById: true },
   });
   if (!existing) throw new ResourceNotFoundError("Expense not found");
 
-  // F5 — self-approval prevention. The creator is server-recorded, so a creator
-  // can never approve (or overturn) their own expense — an independent reviewer
-  // must act.
-  if (
-    existing.createdBy &&
-    ctx.user.name &&
-    existing.createdBy === ctx.user.name
-  ) {
+  // F2 — self-approval prevention, keyed on the IMMUTABLE creator user id
+  // (createdById), never the display name. A name change cannot relabel an
+  // expense and two members sharing a name cannot block each other. Legacy
+  // rows created before createdById existed fall back to the old name
+  // comparison (best-effort, only when the id column is empty).
+  const isSelfCreated =
+    existing.createdById !== null
+      ? existing.createdById === ctx.user.id
+      : !!existing.createdBy &&
+        !!ctx.user.name &&
+        existing.createdBy === ctx.user.name;
+  if (isSelfCreated) {
     throw new ForbiddenError(
       "You cannot approve or reject an expense you created",
     );
@@ -497,7 +513,13 @@ export async function decideExpenseApproval(
 
   const updated = await prisma.expense.update({
     where: { id },
-    data: { status: targetStatus, approvedBy: ctx.user.name },
+    data: {
+      status: targetStatus,
+      // F2: the approver is recorded by both name (existing API contract) and
+      // immutable user id so future self-approval checks stay id-based.
+      approvedBy: ctx.user.name,
+      approvedById: ctx.user.id,
+    },
   });
   return toExpenseJson(updated);
 }

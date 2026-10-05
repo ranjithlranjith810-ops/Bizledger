@@ -38,7 +38,12 @@ export const ToastContainer: React.FC = () => {
   if (notifications.length === 0) return null;
 
   return (
-    <div className="fixed bottom-5 right-5 z-[60] flex flex-col gap-2 max-w-sm w-full pointer-events-none">
+    <div
+      role="status"
+      aria-live="polite"
+      aria-atomic="false"
+      className="fixed bottom-5 right-5 z-[60] flex flex-col gap-2 max-w-sm w-full pointer-events-none"
+    >
       {notifications.map((n) => {
         const isRemoved = isRemovedToast(n.title);
         return (
@@ -70,6 +75,7 @@ export const ToastContainer: React.FC = () => {
             </div>
             <button
               onClick={() => removeNotification(n.id)}
+              aria-label="Dismiss notification"
               className="text-white/60 hover:text-white p-0.5 rounded transition-colors"
             >
               <X className="w-3.5 h-3.5" />

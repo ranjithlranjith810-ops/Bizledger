@@ -7,8 +7,9 @@ import { Estimate } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
 import { matchesSearch } from "@/lib/search";
 import { isPersistedId } from "@/lib/optimistic-id";
-import { Plus, Search, Eye, Pencil } from "lucide-react";
-import { SalesDocumentModal } from "@/components/shared/SalesDocumentModal";
+import { Button } from "@/components/ui/Button";
+import { Plus, Search, Eye } from "lucide-react";
+import { Icon } from "../ui/Icon";
 
 const STATUS_COLORS: Record<string, string> = {
   Draft: "bg-gray-100 text-gray-700 border-gray-200",
@@ -19,12 +20,25 @@ const STATUS_COLORS: Record<string, string> = {
 };
 
 export const EstimatesList: React.FC = () => {
-  const { estimates, setOpenModal, getActiveFinancialYear } = useApp();
+  const {
+    estimates,
+    setOpenModal,
+    getActiveFinancialYear,
+    domainHydration,
+    retryDomains,
+  } = useApp();
   const router = useRouter();
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("All");
-  const [editing, setEditing] = useState<Estimate | null>(null);
+
+  // Hydration lifecycle. A failed request must never read as a successful
+  // empty state: the "No estimates yet" empty state only renders when the
+  // domain is "ready" AND the collection is genuinely empty.
+  const estimatesHydration = domainHydration.estimates;
+  const estimatesLoading = estimatesHydration === "loading";
+  const estimatesError = estimatesHydration === "error";
+  const hasEstimates = estimates.length > 0;
 
   const activeFy = getActiveFinancialYear();
   const fyStart = activeFy?.startDate || "";
@@ -85,164 +99,217 @@ export const EstimatesList: React.FC = () => {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <div className="bg-white p-4 rounded-xl border border-[#eceef0] shadow-xs">
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-gray-500">
-              Total Estimated (Incl. GST)
-            </span>
-            <div className="w-8 h-8 rounded-lg bg-gray-100 text-gray-700 flex items-center justify-center">
-              <span className="material-symbols-outlined text-[18px]">
-                insights
-              </span>
+      {estimatesLoading ? (
+        /* Polished loading state — muted metric placeholder + the project's
+           standard Material spinner, so the page never flashes blank. */
+        <>
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="bg-white p-4 rounded-xl border border-[#eceef0] shadow-xs">
+              <div className="flex items-center justify-between">
+                <div className="w-28 h-3 rounded bg-[#f2f4f6]" />
+                <div className="w-8 h-8 rounded-lg bg-[#f2f4f6]" />
+              </div>
+              <div className="mt-2 h-7 w-28 rounded bg-[#f2f4f6]" />
+              <div className="mt-2 h-3 w-20 rounded bg-[#f2f4f6]" />
             </div>
           </div>
-          <div className="mt-2">
-            <span className="text-2xl font-bold text-gray-900 font-mono">
-              ₹{totalEstimated.toLocaleString("en-IN")}
-            </span>
+          <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs py-12 flex flex-col items-center gap-3">
+            <Icon name="progress_activity" className="animate-spin text-[26px] text-[#93000b]" />
+            <p className="text-xs font-semibold text-[#515f74]">Loading estimate data…</p>
           </div>
-          <div className="mt-2 text-[11px] text-gray-500">
-            {fyEstimates.length} estimates
-          </div>
-        </div>
-      </div>
-
-      <div className="bg-white p-4 rounded-xl border border-[#eceef0] shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-        <div className="relative flex-1 max-w-md">
-          <Search className="w-4 h-4 text-gray-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
-          <input
-            type="text"
-            placeholder="Search estimate number, customer, or GSTIN..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full pl-9 pr-4 py-2 text-xs bg-[#f2f4f6] border border-transparent focus:border-[#93000b] focus:bg-white rounded-lg outline-none transition-all"
-          />
-        </div>
-        <div className="flex items-center gap-1.5 text-xs overflow-x-auto pb-1">
-          {["All", "Draft", "Sent", "Accepted", "Rejected", "Expired"].map(
-            (s) => (
-              <button
-                key={s}
-                onClick={() => setStatusFilter(s)}
-                className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap ${
-                  statusFilter === s
-                    ? "bg-[#93000b] text-white shadow-xs"
-                    : "bg-[#f2f4f6] text-gray-600 hover:bg-gray-200"
-                }`}
+        </>
+      ) : (
+        <>
+          {/* Non-destructive error: never replaces existing (last-known) data. */}
+          {estimatesError && (
+            <div className="flex items-center justify-between gap-4 px-4 py-3 rounded-xl border border-rose-100 bg-[#fef2f2]">
+              <div className="flex items-center gap-3 min-w-0">
+                <Icon name="cloud_off" className="text-[20px] text-[#93000b] shrink-0" />
+                <div className="min-w-0">
+                  <p className="text-xs font-bold text-[#93000b]">
+                    Couldn&apos;t refresh estimate data
+                  </p>
+                  <p className="text-[11px] text-[#93000b]">
+                    Showing the last known figures — your existing data is safe.
+                  </p>
+                </div>
+              </div>
+              <Button
+                variant="outline"
+                size="sm"
+                icon="refresh"
+                onClick={retryDomains}
+                className="shrink-0"
               >
-                {s}
-              </button>
-            )
+                Retry
+              </Button>
+            </div>
           )}
-        </div>
-      </div>
 
-      <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left text-xs">
-            <thead className="bg-[#f7f9fb] border-b border-[#eceef0] text-gray-500 uppercase tracking-wider text-[11px] font-semibold">
-              <tr>
-                <th className="py-3 px-4">Estimate #</th>
-                <th className="py-3 px-4">Customer & GSTIN</th>
-                <th className="py-3 px-4">Date</th>
-                <th className="py-3 px-4">Valid Until</th>
-                <th className="py-3 px-4 text-right">Subtotal</th>
-                <th className="py-3 px-4 text-right">Tax (GST)</th>
-                <th className="py-3 px-4 text-right">Total (₹)</th>
-                <th className="py-3 px-4">Status</th>
-                <th className="py-3 px-4 text-center">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-[#eceef0]">
-              {filtered.length === 0 ? (
-                <tr>
-                  <td colSpan={9} className="py-8 text-center text-gray-400">
-                    <span className="material-symbols-outlined text-[30px] text-gray-300 block mx-auto mb-1.5">
-                      insights
-                    </span>
-                    {estimates.length === 0
-                      ? "No estimates yet — create your first."
-                      : "No estimates match your filter criteria."}
-                  </td>
-                </tr>
-              ) : (
-                filtered.map((e) => (
-                  <tr
-                    key={e.id}
-                    onClick={() => openEstimate(e)}
-                    className="hover:bg-[#f7f9fb] transition-colors cursor-pointer"
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+            <div className="bg-white p-4 rounded-xl border border-[#eceef0] shadow-xs">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium text-gray-500">
+                  Total Estimated (Incl. GST)
+                </span>
+                <div className="w-8 h-8 rounded-lg bg-gray-100 text-gray-700 flex items-center justify-center">
+                  <Icon name="insights" className="text-[18px]" />
+                </div>
+              </div>
+              <div className="mt-2">
+                <span className="text-2xl font-bold text-gray-900 font-mono">
+                  ₹{totalEstimated.toLocaleString("en-IN")}
+                </span>
+              </div>
+              <div className="mt-2 text-[11px] text-gray-500">
+                {fyEstimates.length} estimates
+              </div>
+            </div>
+          </div>
+
+          <div className="bg-white p-4 rounded-xl border border-[#eceef0] shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="relative flex-1 max-w-md">
+              <Search className="w-4 h-4 text-gray-400 absolute left-3.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                placeholder="Search estimate number, customer, or GSTIN..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                className="w-full pl-9 pr-4 py-2 text-xs bg-[#f2f4f6] border border-transparent focus:border-[#93000b] focus:bg-white rounded-lg outline-none transition-all"
+              />
+            </div>
+            <div className="flex items-center gap-1.5 text-xs overflow-x-auto pb-1">
+              {["All", "Draft", "Sent", "Accepted", "Rejected", "Expired"].map(
+                (s) => (
+                  <button
+                    key={s}
+                    onClick={() => setStatusFilter(s)}
+                    className={`px-3 py-1.5 rounded-lg font-medium transition-all whitespace-nowrap ${
+                      statusFilter === s
+                        ? "bg-[#93000b] text-white shadow-xs"
+                        : "bg-[#f2f4f6] text-gray-600 hover:bg-gray-200"
+                    }`}
                   >
-                    <td className="py-3.5 px-4 font-mono font-bold text-gray-900 whitespace-nowrap">
-                      {e.estimateNumber}
-                    </td>
-                    <td className="py-3.5 px-4 max-w-xs">
-                      <div className="font-semibold text-gray-900 truncate">
-                        {e.customerName}
-                      </div>
-                      <div className="text-[10px] font-mono text-gray-400 truncate">
-                        GST: {e.customerGstin || "-"}
-                      </div>
-                    </td>
-                    <td className="py-3.5 px-4 text-gray-600 whitespace-nowrap">
-                      {e.date}
-                    </td>
-                    <td className="py-3.5 px-4 text-gray-500 whitespace-nowrap">
-                      {e.validUntil}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-mono text-gray-600">
-                      ₹{e.subtotal.toLocaleString("en-IN")}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-mono text-gray-600">
-                      ₹{e.totalTax.toLocaleString("en-IN")}
-                    </td>
-                    <td className="py-3.5 px-4 text-right font-mono font-bold text-gray-900 whitespace-nowrap">
-                      ₹{e.grandTotal.toLocaleString("en-IN")}
-                    </td>
-                    <td className="py-3.5 px-4 whitespace-nowrap">
-                      <span
-                        className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${
-                          STATUS_COLORS[e.status] || STATUS_COLORS.Draft
-                        }`}
-                      >
-                        {e.status}
-                      </span>
-                    </td>
-                    <td
-                      className="py-3.5 px-4 text-center whitespace-nowrap"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      <div className="flex items-center justify-center gap-1.5">
-                        <button
-                          onClick={() => openEstimate(e)}
-                          className="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-200 rounded-lg transition-colors"
-                          title="View Estimate"
-                        >
-                          <Eye className="w-4 h-4" />
-                        </button>
-                        <button
-                          onClick={() => setEditing(e)}
-                          className="p-1.5 text-gray-500 hover:text-[#166534] hover:bg-[#f0fdf4] rounded-lg transition-colors"
-                          title="Edit Estimate"
-                        >
-                          <Pencil className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
+                    {s}
+                  </button>
+                )
               )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+            </div>
+          </div>
 
-      {editing && (
-        <SalesDocumentModal
-          kind="estimate"
-          doc={editing}
-          onClose={() => setEditing(null)}
-        />
+          <div className="bg-white rounded-xl border border-[#eceef0] shadow-xs overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-[#f7f9fb] border-b border-[#eceef0] text-gray-500 uppercase tracking-wider text-[11px] font-semibold">
+                  <tr>
+                    <th className="py-3 px-4">Estimate #</th>
+                    <th className="py-3 px-4">Customer & GSTIN</th>
+                    <th className="py-3 px-4">Date</th>
+                    <th className="py-3 px-4">Valid Until</th>
+                    <th className="py-3 px-4 text-right">Subtotal</th>
+                    <th className="py-3 px-4 text-right">Tax (GST)</th>
+                    <th className="py-3 px-4 text-right">Total (₹)</th>
+                    <th className="py-3 px-4">Status</th>
+                    <th className="py-3 px-4 text-center">Actions</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[#eceef0]">
+                  {estimatesError && !hasEstimates ? (
+                    <tr>
+                      <td colSpan={9} className="py-10">
+                        <div className="flex flex-col items-center justify-center gap-3 px-4">
+                          <Icon name="cloud_off" className="text-[28px] text-[#93000b]" />
+                          <p className="text-sm font-semibold text-[#191c1e]">
+                            Couldn&apos;t load estimate data
+                          </p>
+                          <p className="text-xs text-[#515f74] max-w-sm text-center leading-relaxed">
+                            The estimate list couldn&apos;t be refreshed. Retry
+                            when you&apos;re ready — no data was lost.
+                          </p>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            icon="refresh"
+                            onClick={retryDomains}
+                          >
+                            Retry
+                          </Button>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : filtered.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="py-8 text-center text-gray-400">
+                        <Icon name="insights" className="text-[30px] text-gray-300 block mx-auto mb-1.5" />
+                        {estimates.length === 0
+                          ? "No estimates yet — create your first."
+                          : "No estimates match your filter criteria."}
+                      </td>
+                    </tr>
+                  ) : (
+                    filtered.map((e) => (
+                      <tr
+                        key={e.id}
+                        onClick={() => openEstimate(e)}
+                        className="hover:bg-[#f7f9fb] transition-colors cursor-pointer"
+                      >
+                        <td className="py-3.5 px-4 font-mono font-bold text-gray-900 whitespace-nowrap">
+                          {e.estimateNumber}
+                        </td>
+                        <td className="py-3.5 px-4 max-w-xs">
+                          <div className="font-semibold text-gray-900 truncate">
+                            {e.customerName}
+                          </div>
+                          <div className="text-[10px] font-mono text-gray-400 truncate">
+                            GST: {e.customerGstin || "-"}
+                          </div>
+                        </td>
+                        <td className="py-3.5 px-4 text-gray-600 whitespace-nowrap">
+                          {e.date}
+                        </td>
+                        <td className="py-3.5 px-4 text-gray-500 whitespace-nowrap">
+                          {e.validUntil}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono text-gray-600">
+                          ₹{e.subtotal.toLocaleString("en-IN")}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono text-gray-600">
+                          ₹{e.totalTax.toLocaleString("en-IN")}
+                        </td>
+                        <td className="py-3.5 px-4 text-right font-mono font-bold text-gray-900 whitespace-nowrap">
+                          ₹{e.grandTotal.toLocaleString("en-IN")}
+                        </td>
+                        <td className="py-3.5 px-4 whitespace-nowrap">
+                          <span
+                            className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${
+                              STATUS_COLORS[e.status] || STATUS_COLORS.Draft
+                            }`}
+                          >
+                            {e.status}
+                          </span>
+                        </td>
+                        <td
+                          className="py-3.5 px-4 text-center whitespace-nowrap"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <div className="flex items-center justify-center gap-1.5">
+                            <button
+                              onClick={() => openEstimate(e)}
+                              className="p-1.5 text-gray-500 hover:text-gray-900 hover:bg-gray-200 rounded-lg transition-colors"
+                              title="View Estimate"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </>
       )}
     </div>
   );

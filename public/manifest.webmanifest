@@ -1,0 +1,22 @@
+{
+  "name": "BizLedger – Premium Furniture Business Accounting",
+  "short_name": "BizLedger",
+  "description": "BizLedger replaces scattered spreadsheets and generic tools with a unified accounting, invoicing, expenses, GST, payments and business financing platform built specifically for furniture manufacturing and sales businesses.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f7f9fb",
+  "theme_color": "#f7f9fb",
+  "lang": "en",
+  "dir": "ltr",
+  "categories": ["business", "finance", "productivity"],
+  "icons": [
+    {
+      "src": "/branding/BIZ-LEDGER LOGO.png",
+      "sizes": "1254x1254",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}

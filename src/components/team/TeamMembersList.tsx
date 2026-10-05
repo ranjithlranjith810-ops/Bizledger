@@ -3,6 +3,7 @@
 import React, { useState, useMemo } from "react";
 import { useApp } from "@/context/AppContext";
 import { matchesSearch } from "@/lib/search";
+import { isUnlimited } from "@/lib/entitlements";
 import { TeamMember, TeamRole } from "@/types";
 import {
   Users,
@@ -16,10 +17,31 @@ import {
 } from "lucide-react";
 
 export const TeamMembersList: React.FC = () => {
-  const { teamMembers, deleteTeamMember, setOpenModal, addNotification } = useApp();
+  const { teamMembers, activePlan, checkEntitlementFor, deleteTeamMember, setOpenModal, addNotification } = useApp();
 
   const [searchQuery, setSearchQuery] = useState("");
   const [roleFilter, setRoleFilter] = useState<string>("All");
+
+  // Seat numbers come from the same entitlement engine the server gate uses
+  // (`assertCreateAllowed`): the effective plan's teamMember ceiling minus the
+  // ADDITIONAL (non-owner) seats already in use. The account owner is not a
+  // paid seat, so the ceiling only bounds additional members.
+  const seatGate = checkEntitlementFor("teamMembers");
+  const seatLimit = seatGate.limit;
+  const seatsUsed = seatGate.used;
+  const planName = activePlan?.name ?? "Free Plan";
+  const seatsRemaining =
+    isUnlimited(seatLimit) ? "Unlimited" : Math.max(0, (seatLimit as number) - seatsUsed);
+
+  const teamLimitText = isUnlimited(seatLimit)
+    ? `on ${planName}`
+    : `${seatLimit} additional seats on ${planName}`;
+
+  const teamRemainingText = isUnlimited(seatsRemaining)
+    ? "Unlimited team members available"
+    : seatsRemaining === 0
+    ? `No additional seats available on ${planName}`
+    : `${seatsRemaining} ${seatsRemaining === 1 ? "seat" : "seats"} remaining`;
 
   const filteredMembers = useMemo(() => {
     return teamMembers.filter((m) => {
@@ -53,10 +75,13 @@ export const TeamMembersList: React.FC = () => {
   };
 
   const handleResendInvite = (member: TeamMember) => {
+    // No resend endpoint exists (email delivery is deferred server-side and a
+    // fresh invite for an existing member is a 409). Surface the truth instead
+    // of a fabricated "Invitation Resent" success toast.
     addNotification({
-      type: "success",
-      title: "Invitation Resent",
-      message: `A fresh login link was dispatched to ${member.email}.`,
+      type: "info",
+      title: "Invitation pending",
+      message: `${member.email} is awaiting acceptance. Invitation delivery is not yet enabled, so there is no re-send action.`,
     });
   };
 
@@ -93,10 +118,12 @@ export const TeamMembersList: React.FC = () => {
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-bold text-[#191c1e] font-mono">{totalCount}</span>
-            <span className="text-xs text-gray-400">/ 10 seats (Pro Plan)</span>
+            <span className="text-xs text-gray-400">
+              {teamLimitText}
+            </span>
           </div>
           <div className="mt-2 text-[11px] text-gray-500">
-            4 remaining seats available
+            {teamRemainingText}
           </div>
         </div>
 
@@ -294,6 +321,7 @@ export const TeamMembersList: React.FC = () => {
                         member.role !== "Owner" && (
                           <button
                             onClick={() => deleteTeamMember(member.id)}
+                            aria-label={`Revoke access for ${member.email}`}
                             className="p-1.5 text-gray-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"
                             title="Revoke Member Access"
                           >

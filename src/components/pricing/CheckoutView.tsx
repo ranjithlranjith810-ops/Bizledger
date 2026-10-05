@@ -229,7 +229,7 @@ export const CheckoutView: React.FC = () => {
                 <Link href="/privacy" className="font-semibold text-[#93000b] hover:underline">Privacy Policy</Link>,{" "}
                 and{" "}
                 <Link href="/refund-policy" className="font-semibold text-[#93000b] hover:underline">Refund &amp; Cancellation Policy</Link>{" "}
-                and understand this is a demo checkout.
+                before proceeding.
               </span>
             </label>
             {consentError && (
@@ -253,7 +253,7 @@ export const CheckoutView: React.FC = () => {
 
             <p className="mt-3 text-[11px] text-gray-400 flex items-center justify-center gap-1">
               <Lock className="w-3 h-3" />
-              This is a demo checkout. No real payment is processed.
+              Payments are processed securely by our payment partner.
             </p>
           </div>
         </div>

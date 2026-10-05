@@ -43,6 +43,14 @@ export const noInjection = (label: string) => (value: string): string | null => 
 export const normalizeCode = (value: string): string => value.trim().toUpperCase();
 export const normalizeProse = (value: string): string => value.trim().replace(/\s+/g, " ");
 
+// Business/document text that is printed on invoices, estimates and ledgers
+// (customer/company names, addresses, cities, item descriptions, notes, terms,
+// bank/business display strings) is stored in UPPERCASE so every printed
+// document is consistent. Never apply to emails, phones, passwords, account
+// numbers, IDs, tokens, URLs, or code — those keep their natural case.
+export const normalizeBusinessText = (value: string): string =>
+  value.trim().replace(/\s+/g, " ").toUpperCase();
+
 // ---- plan-agnostic helpers for building rich validators -----------------------
 
 export function validateName(label: string): FieldRule {
@@ -82,6 +90,15 @@ export function validateInvoicePrefix(): FieldRule {
   };
 }
 
+// Normalizes a GSTIN for comparison/storage: trims surrounding whitespace,
+// uppercases, and removes ACCIDENTAL spaces and hyphens. "ab-cd ef gh 12…" and
+// "ABCDEFGH12…" therefore resolve to the SAME value. A result of "" means no
+// GSTIN was supplied (a business without GST registration stores NULL).
+export function normalizeGstinValue(value: string): string {
+  const v = typeof value === "string" ? value.trim() : "";
+  return v.toUpperCase().replace(/[\s-]/g, "");
+}
+
 export function validateGstin(): FieldRule {
   return {
     validate: (value) => {
@@ -107,7 +124,7 @@ export function validatePan(): FieldRule {
       const v = value.trim().toUpperCase();
       if (!v) return "PAN is required.";
       if (!/^[A-Z]{3}[ABCFGHLJPT][A-Z][0-9]{4}[A-Z]{1}$/.test(v)) {
-        return "PAN format is invalid (e.g. ABCDE1234F).";
+        return "PAN format is invalid (e.g. ABCPE1234F).";
       }
       return null;
     },
@@ -273,6 +290,7 @@ export function validateCompanyProfileForm(values: {
   name: string;
   gstin: string;
   pan: string;
+  gstRegistered?: string;
   email: string;
   phone: string;
   state: string;
@@ -281,9 +299,15 @@ export function validateCompanyProfileForm(values: {
   pincode: string;
   invoicePrefix: string;
 }): Record<string, string> {
+  // 10.2-D: mirrors OnboardingWizard.validateTaxStep — GSTIN is ONLY required for
+  // businesses that state they are GST registered or on the Composite scheme.
+  // A business that is Not GST Registered is not forced to enter a GSTIN.
+  // PAN stays mandatory for every business (same rule as the wizard & validator).
+  const requiresGstin =
+    values.gstRegistered === "registered" || values.gstRegistered === "composite";
   const raw: [string, string | null][] = [
     ["name", validateName("Business name").validate(values.name)],
-    ["gstin", validateGstin().validate(values.gstin)],
+    ["gstin", requiresGstin ? validateGstin().validate(values.gstin) : null],
     ["pan", validatePan().validate(values.pan)],
     ["email", validateEmail().validate(values.email)],
     ["phone", validatePhone("Phone").validate(values.phone)],

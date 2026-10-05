@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import {
   ArrowLeft,
   Printer,
+  Download,
   AlertTriangle,
   CheckCircle2,
   Calendar,
@@ -17,6 +18,7 @@ import {
 import { formatINR } from "@/lib/billing";
 import { billingApi, BillingPaymentDetail } from "@/lib/api/billing";
 import { useApp } from "@/context/AppContext";
+import { Icon } from "../ui/Icon";
 
 const fmtDate = (iso: string | null | undefined) =>
   iso
@@ -68,6 +70,8 @@ export const PaymentDetailsView: React.FC = () => {
     "loading",
   );
   const [attempt, setAttempt] = useState(0);
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   const invalidParams = !activeBusinessId || !paymentId;
 
@@ -94,6 +98,44 @@ export const PaymentDetailsView: React.FC = () => {
   const handleRetry = () => {
     setStatus("loading");
     setAttempt((n) => n + 1);
+  };
+
+  // Server-rendered PDF download, attachment filename from the server header.
+  const handleDownloadPdf = async () => {
+    if (!activeBusinessId || !paymentId) return;
+    setDownloading(true);
+    setDownloadError(null);
+    try {
+      const url = `/api/billing/invoice/download?businessId=${encodeURIComponent(
+        activeBusinessId,
+      )}&paymentId=${encodeURIComponent(paymentId)}`;
+      const res = await fetch(url, { credentials: "same-origin" });
+      if (!res.ok) {
+        let msg = `Download failed (${res.status})`;
+        try {
+          const body = (await res.json()) as { error?: unknown };
+          if (typeof body.error === "string") msg = body.error;
+        } catch {
+          /* non-JSON error body — keep status fallback */
+        }
+        throw new Error(msg);
+      }
+      const blob = await res.blob();
+      const objectUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = objectUrl;
+      a.download =
+        res.headers.get("content-disposition")?.match(/filename="([^"]+)"/)?.[1] ??
+        "receipt.pdf";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(objectUrl);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : "Download failed");
+    } finally {
+      setDownloading(false);
+    }
   };
 
   if (invalidParams) {
@@ -123,7 +165,7 @@ export const PaymentDetailsView: React.FC = () => {
   if (status === "loading") {
     return (
       <div className="min-h-[50vh] flex items-center justify-center text-xs text-gray-400 gap-2">
-        <span className="material-symbols-outlined animate-spin text-base">progress_activity</span>
+        <Icon name="progress_activity" className="animate-spin text-base" />
         Loading receipt…
       </div>
     );
@@ -202,16 +244,32 @@ export const PaymentDetailsView: React.FC = () => {
             Billing History
           </button>
           {invoice && (
-            <button
-              onClick={() => window.print()}
-              className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2.5 rounded-xl text-xs font-bold shadow-xs transition-colors"
-            >
-              <Printer className="w-4 h-4" />
-              Print / Save as PDF
-            </button>
+            <>
+              <button
+                onClick={() => void handleDownloadPdf()}
+                disabled={downloading}
+                className="flex items-center gap-1.5 bg-white hover:bg-[#f7f9fb] text-gray-700 border border-[#eceef0] px-4 py-2.5 rounded-xl text-xs font-bold shadow-xs transition-colors disabled:opacity-60"
+              >
+                <Download className="w-4 h-4" />
+                {downloading ? "Preparing…" : "Download PDF"}
+              </button>
+              <button
+                onClick={() => window.print()}
+                className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2.5 rounded-xl text-xs font-bold shadow-xs transition-colors"
+              >
+                <Printer className="w-4 h-4" />
+                Print / Save as PDF
+              </button>
+            </>
           )}
         </div>
       </div>
+
+      {downloadError && (
+        <div className="print:hidden rounded-xl border border-rose-200 bg-rose-50 px-4 py-3 text-xs text-[#93000b]">
+          Could not download the receipt: {downloadError}. Please try again.
+        </div>
+      )}
 
       {/* Payment Status */}
       <div className="bg-white rounded-2xl border border-[#eceef0] shadow-xs overflow-hidden">
@@ -378,9 +436,9 @@ export const PaymentDetailsView: React.FC = () => {
 };
 
 function FileNotFound() {
-  return <span className="material-symbols-outlined text-2xl">description</span>;
+  return <Icon name="description" className="text-2xl" />;
 }
 
 function ClockIcon() {
-  return <span className="material-symbols-outlined text-2xl">schedule</span>;
+  return <Icon name="schedule" className="text-2xl" />;
 }

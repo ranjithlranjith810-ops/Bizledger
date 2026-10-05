@@ -204,9 +204,9 @@ export const SubscriptionBillingView: React.FC = () => {
           still governs for the server-computed grace window. */}
       {isGracePeriod && (
         <div className="bg-amber-50 border border-amber-200 text-amber-900 px-4 py-3 rounded-xl text-xs font-semibold shadow-xs mb-6">
-          Your subscription period has ended — you're in the grace period. Renew by{" "}
+          Your subscription period has ended — you&apos;re in the grace period. Renew by{" "}
           {graceEndsAt ? fmtDate(graceEndsAt) : "the grace deadline"} to keep the{" "}
-          {planDisplayName} plan; afterwards you'll be on the free plan.
+          {planDisplayName} plan; afterwards you&apos;ll be on the free plan.
         </div>
       )}
 
@@ -410,12 +410,9 @@ export const SubscriptionBillingView: React.FC = () => {
 
                 <div className="pt-6">
                   {isCurrent ? (
-                    <button
-                      disabled
-                      className="w-full bg-[#fef2f2] text-[#93000b] py-2.5 rounded-xl text-xs font-bold border border-rose-200 cursor-default"
-                    >
+                    <span className="w-full inline-flex items-center justify-center bg-[#fef2f2] text-[#93000b] py-2.5 rounded-xl text-xs font-bold border border-rose-200">
                       ✓ Current Active Plan
-                    </button>
+                    </span>
                   ) : (
                     <button
                       onClick={() => goCheckout(p.id)}

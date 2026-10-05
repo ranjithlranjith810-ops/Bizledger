@@ -39,8 +39,8 @@ export async function PATCH(
   }
 }
 
-// DELETE /api/purchase-orders/[id]?businessId=... -- delete ONLY a draft PO.
-// Issued purchase orders are 409.
+// DELETE /api/purchase-orders/[id]?businessId=... -- rejected unconditionally
+// (409). There is no purchase order deletion path.
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },

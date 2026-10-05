@@ -108,7 +108,7 @@ export const PaymentSuccessView: React.FC<PaymentSuccessViewProps> = ({
 
         <p className="mt-4 text-[11px] text-gray-400 flex items-center justify-center gap-1">
           <Sparkles className="w-3 h-3" />
-          Demo checkout via Razorpay Test Mode — no real money was charged.
+          Payment was processed via Razorpay; in Test Mode no real money was charged.
         </p>
       </div>
     </div>

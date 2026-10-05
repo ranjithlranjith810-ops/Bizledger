@@ -18,8 +18,13 @@
 //   STAFF → UI "Staff"        (view + create only)
 
 import { ValidationError } from "@/lib/business/api-error";
+import { ROLES, canGrantRole, type Role } from "@/lib/authz/role-grants";
 
-export type AuthzRole = "OWNER" | "ADMIN" | "MANAGER" | "STAFF";
+/** Canonical DB role vocabulary + the role-grant decision helper, re-exported
+ *  from the pure role-grants core so the vocabulary and the grant hierarchy can
+ *  never drift apart. */
+export type AuthzRole = Role;
+export { canGrantRole };
 
 export type AuthzModule =
   | "invoices"
@@ -53,7 +58,7 @@ export const PERMISSION_KEYMAP: Record<AuthzModule, AuthzAction[]> = {
 
 export type ModulePermissions = Record<AuthzModule, Record<AuthzAction, boolean>>;
 
-export const MEMBER_ROLES: AuthzRole[] = ["OWNER", "ADMIN", "MANAGER", "STAFF"];
+export const MEMBER_ROLES: AuthzRole[] = [...ROLES];
 
 function allFalse(): Record<AuthzAction, boolean> {
   return {
@@ -175,4 +180,65 @@ export function canPerform(
   action: AuthzAction,
 ): boolean {
   return Boolean(perms[module]?.[action]);
+}
+
+export interface PermissionEscalation {
+  module: AuthzModule;
+  action: AuthzAction;
+}
+
+/**
+ * Delegation ceiling check for the PERMISSIONS channel of an invite.
+ *
+ * `canGrantRole` bounds the `role` field; this bounds the parallel
+ * `permissions` override. An override may DELEGATE a permission the actor
+ * already holds, but may never grant one it does not — otherwise a business
+ * ADMIN (`settings.edit = false`, `invoices.delete = false`) could mint a seat
+ * that rewrites the company's GSTIN / bank account numbers / subscription, or
+ * that lifts a STAFF seat above its documented "view + create only" baseline.
+ *
+ * Semantics, deliberately asymmetric:
+ *   - requested `true`  where the actor lacks it  → an ESCALATION (rejected)
+ *   - requested `false`                            → a restriction, never an
+ *     escalation, and always permitted (a seat may always be narrowed)
+ *
+ * The target role's own baseline is NOT part of this check and is left intact
+ * by the caller: `canGrantRole` already decides whether the actor may hand out
+ * that role at all, and clamping the merged baseline would wrongly strip, for
+ * example, `MANAGER`'s `vehicles.manage` when the granting actor is an ADMIN.
+ *
+ * Unknown modules/actions and non-boolean values are rejected here with the
+ * same messages `mergePermissions` uses, so an override is validated by exactly
+ * one set of rules whether it is validated here or merged there.
+ */
+export function findPermissionEscalations(
+  override: Record<string, unknown>,
+  ceiling: ModulePermissions,
+): PermissionEscalation[] {
+  // Validate the override container itself first, so a null/array/non-object
+  // fails as a ValidationError (like `mergePermissions`) instead of a TypeError.
+  const container = assertPlainObject(override);
+  const escalations: PermissionEscalation[] = [];
+  for (const [module, moduleOverride] of Object.entries(container)) {
+    if (!(module in PERMISSION_KEYMAP)) {
+      throw new ValidationError(`Unknown permission module '${module}'`);
+    }
+    const moduleValue = assertPlainObject(moduleOverride);
+    const allowed = new Set<AuthzAction>(PERMISSION_KEYMAP[module as AuthzModule]);
+    for (const key of Object.keys(moduleValue)) {
+      if (!allowed.has(key as AuthzAction)) {
+        throw new ValidationError(`Unknown permission '${module}.${key}'`);
+      }
+      if (typeof moduleValue[key] !== "boolean") {
+        throw new ValidationError(`Permission '${module}.${key}' must be a boolean`);
+      }
+      if (
+        moduleValue[key] === true &&
+        !canPerform(ceiling, module as AuthzModule, key as AuthzAction)
+      ) {
+        escalations.push({ module: module as AuthzModule, action: key as AuthzAction });
+      }
+    }
+  }
+  return escalations;
 }

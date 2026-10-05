@@ -3,6 +3,7 @@
 import React, { useMemo, useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { financialYearForDate } from "@/lib/financialYear";
+import { Icon } from "../ui/Icon";
 
 function fmtDate(value: string): string {
   if (!value) return "—";
@@ -96,7 +97,7 @@ export const SettingsFinancialYears: React.FC = () => {
             onClick={startAdd}
             className="inline-flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-xs transition-colors"
           >
-            <span className="material-symbols-outlined text-[16px]">add</span>
+            <Icon name="add" className="text-[16px]" />
             Add Financial Year
           </button>
         )}
@@ -105,7 +106,7 @@ export const SettingsFinancialYears: React.FC = () => {
       {adding && (
         <div className="bg-white p-5 rounded-xl border border-[#eceef0] shadow-xs space-y-4">
           <div className="flex items-center gap-2 font-bold text-[#191c1e] uppercase tracking-wider">
-            <span className="material-symbols-outlined text-[18px] text-[#93000b]">calendar_month</span>
+            <Icon name="calendar_month" className="text-[18px] text-[#93000b]" />
             <span>New Financial Year</span>
           </div>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-xs">

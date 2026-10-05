@@ -1,15 +1,36 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { Quotation, Estimate, InvoiceItem, PricingMode } from "@/types";
 import { calculateLineTotals, calculateInvoiceTotals, buildDocumentNumber } from "@/lib/invoice";
 import { financialYearForDate, matchFinancialYear } from "@/lib/financialYear";
 import { localDateString, parseLocalDate } from "@/lib/dates";
 import { fyShortName } from "@/lib/utils";
-import { X, Check, FileText } from "lucide-react";
+import { X, Check, FileText, GraduationCap } from "lucide-react";
 import { SearchablePicker } from "@/components/invoices/SearchablePicker";
 import { LineItemsEditor, DocLineDraft, TotalsLabels } from "@/components/shared/LineItemsEditor";
+import { normalizeBusinessText } from "@/lib/validation";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
+import { useSubmitGuard } from "@/hooks/useSubmitGuard";
+import { DocumentImmutabilityWarning } from "@/components/documents/DocumentImmutabilityWarning";
+import { DocumentExperienceModal } from "@/components/documents/DocumentExperienceModal";
+import { DocumentCreateConfirmation } from "@/components/documents/DocumentCreateConfirmation";
+import { DocumentSubmitLoading } from "@/components/documents/DocumentSubmitLoading";
+import { DocumentCreateSuccess } from "@/components/documents/DocumentCreateSuccess";
+import {
+  isLearningDismissed,
+  isLearningSeen,
+  markLearningSeen,
+} from "@/lib/document-experience";
+import { openCreatedDocumentPdf } from "@/lib/open-document-pdf";
+import { Icon } from "../ui/Icon";
+import type {
+  DocPdfItem,
+  DocPdfMetaRow,
+  RenderDocumentPdfOptions,
+} from "@/lib/print/document-pdf";
 
 type Kind = "quotation" | "estimate";
 
@@ -45,12 +66,14 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
     getActiveFinancialYear,
     financialYears,
     documentSequenceFor,
-    mintDocumentNumber,
+    isServerSequenceReady,
+    syncServerSequence,
   } = useApp();
 
   const isEdit = !!doc;
   const isQuote = kind === "quotation";
   const activeFy = getActiveFinancialYear();
+  const router = useRouter();
 
   const [customerId, setCustomerId] = useState<string>(
     doc?.customerId || ""
@@ -80,23 +103,45 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
           )}, but the active financial year is ${activeFy ? fyShortName(activeFy.name) : "unset"}. The financial year is derived from the document date — saving will be rejected.`
         : null;
 
-  // Preview document number: a NEW doc uses the per-FY sequence of the year the
-  // date falls in; an edited doc keeps its existing number.
+  // Preview document number: a NEW doc shows NOTHING until the server has
+  // confirmed this (FY, kind) counter, because the only value available before
+  // then is the localStorage seed (which starts at 1 on a fresh browser and is
+  // what made a list ending at 003 preview as 001). An edited doc keeps its
+  // existing number.
+  const seqReady = isServerSequenceReady(previewFy.id, kind);
   const displayedNumber = isEdit
     ? isQuote
       ? (doc as Quotation).quotationNumber || ""
       : (doc as Estimate).estimateNumber || ""
-    : isQuote
-      ? buildDocumentNumber(
-          "quotation",
-          previewFy.name,
-          documentSequenceFor(previewFy.id, "quotation")
-        )
-      : buildDocumentNumber(
-          "estimate",
-          previewFy.name,
-          documentSequenceFor(previewFy.id, "estimate")
-        );
+    : !seqReady
+      ? ""
+      : isQuote
+        ? buildDocumentNumber(
+            "quotation",
+            previewFy.name,
+            documentSequenceFor(previewFy.id, "quotation")
+          )
+        : buildDocumentNumber(
+            "estimate",
+            previewFy.name,
+            documentSequenceFor(previewFy.id, "estimate")
+          );
+
+  // The preview must be the SERVER's counter, never a locally minted one. The
+  // local cache starts at 1 on a fresh browser and is otherwise never told what
+  // the server already handed out, so previewing from it could advertise a
+  // number that already exists (this is exactly how a quotation list ending at
+  // 003 used to preview as 001). Reconcile ONE kind — the kind this modal owns —
+  // for the FY the date actually falls in, whenever that FY changes.
+  //
+  // `syncServerSequence` is a read-only peek: it never allocates, never reserves
+  // and never blocks the form. The authoritative number is allocated by the
+  // server inside the create transaction.
+  useEffect(() => {
+    if (isEdit || !previewFy.id) return;
+    void syncServerSequence(previewFy.id, kind);
+  }, [isEdit, previewFy.id, kind, syncServerSequence]);
+
   const [scope, setScope] = useState<string>(
     (doc as Estimate)?.scope || ""
   );
@@ -133,11 +178,48 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
     else setOpenModal(null);
   };
 
+  const dialogRef = useModalBehavior(handleClose);
+
   // Fix C: async so the wizard cannot close over a row that is still
   // optimistic - the caller receives the persisted record and the modal stays
   // open (with the existing error toast) if the create failed.
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  //
+  // `submitForm` holds the real work; `handleSubmit` wraps it in the
+  // single-flight guard so a rapid double click on Save cannot dispatch two
+  // creates (UX protection — the server's entitlement check and its
+  // already-exists guard remain authoritative).
+  const { isSubmitting, run: runSubmit } = useSubmitGuard();
+
+  // Create-only experience: sample preview + learning tour (first run), the
+  // in-form immutability warning, a confirmation dialog before the API call, a
+  // loading overlay while it runs, and a success panel with View PDF / view /
+  // list actions. Edit mode is not part of this flow.
+  const [wantsSample, setWantsSample] = useState(false);
+  const [wantConfirm, setWantConfirm] = useState(false);
+  const [createdDoc, setCreatedDoc] = useState<Quotation | Estimate | null>(
+    null,
+  );
+  const [firstRunWantsSample] = useState(
+    () => !isLearningSeen(kind) && !isLearningDismissed(kind),
+  );
+  const [learningDismissed] = useState(() => isLearningDismissed(kind));
+  useEffect(() => {
+    if (!firstRunWantsSample) return;
+    const t = window.setTimeout(() => setWantsSample(true), 350);
+    return () => window.clearTimeout(t);
+  }, [firstRunWantsSample]);
+
+  // Render-level totals preview (also used by the confirmation summary).
+  const totalsPreview = calculateInvoiceTotals(
+    items.map((it) => ({
+      quantity: it.quantity,
+      unitPrice: it.unitPrice,
+      gstRate: it.gstRate,
+    })),
+    pricingMode
+  );
+
+  const submitForm = async () => {
     if (!selectedCustomer) return;
     if (items.length === 0) return;
 
@@ -153,7 +235,7 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
       return {
         id: it.id,
         productId: it.productId,
-        description: it.description?.trim() || "Item",
+        description: normalizeBusinessText(it.description) || "ITEM",
         hsnSac: it.hsnSac,
         quantity: it.quantity,
         unit: it.unit,
@@ -180,7 +262,7 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
       // renumbered).
       date,
       validUntil,
-      scope: scope || undefined,
+      scope: scope ? normalizeBusinessText(scope) : undefined,
       customerId: selectedCustomer.id,
       customerName: selectedCustomer.name,
       customerGstin: selectedCustomer.gstin,
@@ -188,8 +270,8 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
       customerPhone: selectedCustomer.primaryContact?.mobile,
       items: invoiceItems,
       status: status as Quotation["status"],
-      notes,
-      terms,
+      notes: notes ? normalizeBusinessText(notes) : "",
+      terms: normalizeBusinessText(terms),
     };
 
     const totals = calculateInvoiceTotals(
@@ -219,17 +301,19 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
           ...snapBase,
           quotationNumber: (doc as Quotation).quotationNumber,
         });
-      } else {
-        // Submit-time mint (rollover idempotent) so the stored number is the
-        // reconciled one even across the 31-Mar -> 1-Apr boundary.
-        const finalNumber = mintDocumentNumber(companyProfile.invoicePrefix || "QT", "quotation");
-        // Fix C: await the persisted record; close only once it exists.
-        const created = await addQuotation({
-          ...snapBase,
-          quotationNumber: finalNumber,
-        });
-        if (!created) return;
+        handleClose();
+        return;
       }
+      // No client-minted number: the engine allocates the authoritative one
+      // inside the create transaction and ignores this field. `displayedNumber`
+      // is a read-only preview and must never be submitted — sending the local
+      // preview would let a stale browser counter pick the number, which is how a
+      // quotation list ending at 003 could be created as 001.
+      // Fix C: await the persisted record and surface the success panel;
+      // the modal never closes over an optimistic row.
+      const created = await addQuotation({ ...snapBase, quotationNumber: "" });
+      if (!created) return;
+      setCreatedDoc(created);
     } else {
       if (isEdit && doc) {
         updateEstimate({
@@ -237,18 +321,97 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
           ...snapBase,
           estimateNumber: (doc as Estimate).estimateNumber,
         });
-      } else {
-        const finalNumber = mintDocumentNumber(companyProfile.invoicePrefix || "EST", "estimate");
-        // Fix C: await the persisted record; close only once it exists so the
-        // user can never reopen this document against an optimistic id.
-        const created = await addEstimate({
-          ...snapBase,
-          estimateNumber: finalNumber,
-        });
-        if (!created) return;
+        handleClose();
+        return;
       }
+      const created = await addEstimate({ ...snapBase, estimateNumber: "" });
+      if (!created) return;
+      setCreatedDoc(created);
     }
-    handleClose();
+  };
+
+  // The confirmation is the human gate; submission is single-flight so a
+  // double click can never dispatch two creates.
+  const confirmCreate = () => {
+    setWantConfirm(false);
+    void runSubmit(submitForm);
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSubmitting) return;
+    if (isEdit) {
+      // Edit mode keeps its existing save path (submission stays single-flight).
+      void runSubmit(submitForm);
+      return;
+    }
+    if (!selectedCustomer || items.length === 0) return;
+    setWantConfirm(true);
+  };
+
+  const closeSample = () => {
+    markLearningSeen(kind);
+    setWantsSample(false);
+  };
+
+  const handleCreatedPdf = async () => {
+    if (!createdDoc) return;
+    const d = createdDoc;
+    const dNumber = isQuote
+      ? (d as Quotation).quotationNumber
+      : (d as Estimate).estimateNumber;
+    const metaRows: DocPdfMetaRow[] = [
+      {
+        label: isQuote ? "Quotation Date" : "Estimate Date",
+        value: d.date,
+      },
+      ...((d as Quotation).validUntil
+        ? [{ label: "Valid Until", value: (d as Quotation).validUntil }]
+        : []),
+    ];
+    const itemsPdf: DocPdfItem[] = d.items.map((it) => ({
+      description: it.description,
+      hsnSac: it.hsnSac,
+      quantity: it.quantity,
+      unit: it.unit,
+      unitPrice: it.unitPrice,
+      taxableAmount: it.taxableAmount,
+      gstRate: it.gstRate,
+      totalAmount: it.totalAmount,
+    }));
+    const opts: RenderDocumentPdfOptions = {
+      banner: isQuote ? "Quotation" : "Estimate",
+      subtitle: isQuote
+        ? "A quotation is not a tax invoice."
+        : "An estimate is not a firm quote or a tax invoice.",
+      docNumber: dNumber,
+      metaRows,
+      party: {
+        title: isQuote
+          ? "Quotation For (Prepared To)"
+          : "Estimate For (Prepared To)",
+        name: d.customerName,
+        address: d.customerAddress,
+        phone: d.customerPhone,
+        gstin: d.customerGstin,
+      },
+      items: itemsPdf,
+      subtotal: d.subtotal,
+      cgst: d.cgst,
+      sgst: d.sgst,
+      total: d.grandTotal,
+      notes: d.notes,
+      terms: d.terms,
+      footerNote: isQuote
+        ? "This quotation is not a tax invoice."
+        : "This estimate is not a firm quote or a tax invoice.",
+      approximate: !isQuote,
+    };
+    try {
+      await openCreatedDocumentPdf(companyProfile, opts);
+    } catch {
+      // Popup blocked / render failure: the document list still shows it.
+    }
   };
 
   const totalsLabels: TotalsLabels = isQuote
@@ -265,8 +428,74 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
         total: "Estimated Total",
       };
 
+  // Create-success panel: the server has persisted the document; offer View
+  // PDF (rendered from the created record) / View / Go to list / Close.
+  if (createdDoc) {
+    const docNumber = isQuote
+      ? (createdDoc as Quotation).quotationNumber
+      : (createdDoc as Estimate).estimateNumber;
+    const listHref = isQuote ? "/quotations" : "/estimates";
+    const detailHref = isQuote
+      ? `/quotations/${(createdDoc as Quotation).id}`
+      : `/estimates/${(createdDoc as Estimate).id}`;
+    return (
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="sales-document-title"
+        className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+      >
+        <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
+          <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#fef2f2] text-[#93000b] flex items-center justify-center">
+                <FileText className="w-5 h-5" />
+              </div>
+              <h3
+                id="sales-document-title"
+                className="text-base font-bold text-[#191c1e]"
+              >
+                {isQuote ? "Quotation" : "Estimate"} Created
+              </h3>
+            </div>
+            <button
+              onClick={handleClose}
+              aria-label="Close sales document modal"
+              className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <DocumentCreateSuccess
+            kind={kind}
+            number={docNumber}
+            onViewPdf={handleCreatedPdf}
+            onViewDocument={() => {
+              handleClose();
+              router.push(detailHref);
+            }}
+            onGoToList={() => {
+              handleClose();
+              router.push(listHref);
+            }}
+            onClose={handleClose}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="sales-document-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
           <div className="flex items-center gap-3">
@@ -274,7 +503,7 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
               <FileText className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">
+              <h3 id="sales-document-title" className="text-base font-bold text-[#191c1e]">
                 {isEdit
                   ? isQuote
                     ? "Edit Quotation"
@@ -292,6 +521,7 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
           </div>
           <button
             onClick={handleClose}
+            aria-label="Close sales document modal"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -302,6 +532,16 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
           onSubmit={handleSubmit}
           className="flex-1 overflow-y-auto p-6 space-y-6 text-xs"
         >
+          {!isEdit && !learningDismissed && (
+            <button
+              type="button"
+              onClick={() => setWantsSample(true)}
+              className="self-start inline-flex items-center gap-1.5 text-[#93000b] hover:text-[#770008] border border-[#ecd7d7] hover:border-[#93000b] bg-white rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors"
+            >
+              <GraduationCap className="w-4 h-4" />
+              View sample {kind === "quotation" ? "quotation" : "estimate"} &amp; learn
+            </button>
+          )}
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0]">
             <div className="sm:col-span-2">
               <label className="block font-semibold text-gray-700 mb-1">
@@ -414,9 +654,7 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
           {/* Price Type selector */}
           <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] flex flex-col sm:flex-row sm:items-center gap-3">
             <div className="flex items-center gap-2 min-w-64">
-              <span className="material-symbols-outlined text-[16px] text-[#93000b]">
-                percent
-              </span>
+              <Icon name="percent" className="text-[16px] text-[#93000b]" />
               <label className="font-bold text-gray-800 uppercase tracking-wider text-[11px]">
                 Price Type
               </label>
@@ -454,9 +692,9 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
               <textarea
                 rows={3}
                 value={notes}
-                onChange={(e) => setNotes(e.target.value)}
+                onChange={(e) => setNotes(e.target.value.toUpperCase())}
                 placeholder="Additional notes for the customer..."
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none"
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none uppercase"
               />
             </div>
             <div className="flex-1 space-y-2">
@@ -466,9 +704,9 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
               <textarea
                 rows={3}
                 value={terms}
-                onChange={(e) => setTerms(e.target.value)}
+                onChange={(e) => setTerms(e.target.value.toUpperCase())}
                 placeholder="Payment terms, validity, delivery terms..."
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none"
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none uppercase"
               />
             </div>
           </div>
@@ -483,20 +721,55 @@ export const SalesDocumentModal: React.FC<SalesDocumentModalProps> = ({
             </button>
             <button
               type="submit"
-              disabled={!selectedCustomer || items.length === 0}
+              disabled={isSubmitting || !selectedCustomer || items.length === 0}
+              aria-busy={isSubmitting}
               className="bg-[#93000b] hover:bg-[#770008] text-white py-2.5 px-6 rounded-xl font-bold shadow-xs transition-colors flex items-center gap-2 disabled:opacity-40"
             >
-              <Check className="w-4 h-4" />
+              {/* Fixed-size icon slot: the check and the spinner swap in place
+                  so the label change cannot shift the button's width. */}
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                {isSubmitting ? (
+                  <Icon name="progress_activity" className="h-4 w-4 animate-spin text-[16px] leading-none" aria-hidden="true" />
+                ) : (
+                  <Check className="w-4 h-4" aria-hidden="true" />
+                )}
+              </span>
               <span>
-                {isEdit
-                  ? "Save Changes"
-                  : isQuote
-                    ? "Save Quotation"
-                    : "Save Estimate"}
+                {isSubmitting
+                  ? isEdit
+                    ? "Saving…"
+                    : "Creating…"
+                  : isEdit
+                    ? "Save Changes"
+                    : isQuote
+                      ? "Save Quotation"
+                      : "Save Estimate"}
               </span>
             </button>
           </div>
         </form>
+
+        {wantConfirm && selectedCustomer && (
+          <DocumentCreateConfirmation
+            kind={kind}
+            summary={{
+              number: displayedNumber,
+              customer: selectedCustomer.name,
+              itemCount: items.length,
+              total: totalsPreview.grandTotal,
+              note: "The financial year is derived from the document date.",
+            }}
+            isSubmitting={isSubmitting}
+            onCancel={() => setWantConfirm(false)}
+            onConfirm={confirmCreate}
+          >
+            <DocumentImmutabilityWarning kind={kind} stacked />
+          </DocumentCreateConfirmation>
+        )}
+        {wantsSample && !isEdit && (
+          <DocumentExperienceModal kind={kind} onClose={closeSample} />
+        )}
+        <DocumentSubmitLoading kind={kind} visible={isSubmitting} />
       </div>
     </div>
   );

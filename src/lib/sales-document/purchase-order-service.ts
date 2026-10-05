@@ -23,6 +23,7 @@ import {
 } from "@/lib/business/api-error";
 import { allocateDocumentNumber } from "@/lib/sequence/sequence-service";
 import { buildDocumentNumber } from "@/lib/invoice";
+import { assertCreateAllowed } from "@/lib/billing/entitlements-server";
 import {
   str,
   shortText,
@@ -37,12 +38,13 @@ import {
   sellerStateCode,
   rejectProtectedKeys,
   PO_STATUSES,
+  PURCHASE_ORDER_STATUS_TRANSITIONS,
+  isLegalTransition,
 } from "@/lib/sales-document/shared";
-import type { PoStatusT, PricingModeT } from "@/lib/sales-document/shared";
+import type { PoStatusT } from "@/lib/sales-document/shared";
 import type { Prisma } from "@/generated/prisma/client";
 import {
   assertFinancialYearActive,
-  assertDocumentDateInFinancialYear,
   financialYearForBusinessDate,
 } from "@/lib/financial-year/financial-year-service";
 
@@ -264,6 +266,10 @@ export async function createPurchaseOrder(
 
   const created = await prisma.$transaction(
     async (tx) => {
+      // The plan's purchase-order monthly quota is enforced server-side inside
+      // this transaction (business-row lock → calendar-month count → check)
+      // BEFORE the number is allocated and the record inserted.
+      await assertCreateAllowed(tx, businessId, "purchaseOrders");
       const allocated = await allocateDocumentNumber(
         businessId,
         fyId,
@@ -364,6 +370,15 @@ export async function getPurchaseOrder(
 }
 
 // Identity/numbering fields are immutable once minted.
+//
+// `status` is deliberately NOT PATCH-settable, matching the Invoice rule
+// (INVOICE_PROTECTED_KEYS + the explicit status rejection in updateInvoice):
+// status is a lifecycle fact, not a form field. Accepting an arbitrary
+// client-chosen status on PATCH would let a caller assert "Received" — the
+// state that represents goods having physically arrived — with no such event
+// having occurred, and — because the status also decided whether the old DELETE
+// policy would allow removal — would couple a forged status to record
+// destruction.
 const PO_PROTECTED_KEYS = [
   "id",
   "businessId",
@@ -373,12 +388,16 @@ const PO_PROTECTED_KEYS = [
   "updatedAt",
   "prefix",
   "poPrefix",
+  "status",
 ] as const;
 
 /**
- * PATCH — operational edit of a member's purchase order (whitelist-only;
- * totals recomputed server-side). The vendor snapshot is refreshed ONLY when
- * `vendor` is explicitly supplied; otherwise the historical snapshot is kept.
+ * PATCH — immutable after creation. A purchase order is created-and-frozen:
+ * none of its content fields may be edited through the ordinary PATCH. The ONLY
+ * post-creation change is the status lifecycle (transitionPurchaseOrderStatus).
+ * Any payload field supplied here is rejected (400) rather than silently
+ * ignored, so a stale edit form surfaces its failure instead of pretending
+ * success. An empty PATCH is a harmless no-op returning the current document.
  */
 export async function updatePurchaseOrder(
   businessIdInput: unknown,
@@ -387,10 +406,21 @@ export async function updatePurchaseOrder(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
-  const business = ctx.business;
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
+  // Identity/status guard: `status` is a lifecycle fact owned by the status
+  // endpoint, never a PATCH-settable field. `poNumber` is engine-owned and
+  // immutable.
   rejectProtectedKeys(raw, PO_PROTECTED_KEYS);
+
+  // Mass-assignment guard: NOTHING is editable on PATCH. Any residual key (i.e.
+  // any content field a client tried to change) aborts the request.
+  const contentKeys = Object.keys(raw);
+  if (contentKeys.length > 0) {
+    throw new ValidationError(
+      `Purchase orders are immutable after creation; ${contentKeys.join(", ")} cannot be changed. Only the status can be updated, through the purchase order status endpoint.`,
+    );
+  }
 
   const existing = await prisma.purchaseOrder.findFirst({
     where: { id, businessId },
@@ -398,177 +428,40 @@ export async function updatePurchaseOrder(
   });
   if (!existing) throw new ResourceNotFoundError("Purchase order not found");
 
-  const hasItems = raw.items !== undefined;
-  const items = hasItems
-    ? normalizeItems(raw.items, "purchase order")
-    : existing.items.map((it) => ({
-        productId: it.productId,
-        productName: it.productName,
-        sku: it.sku,
-        hsnSac: it.hsnSac,
-        unit: it.unit,
-        quantity: Number(it.quantity),
-        rate: Number(it.rate),
-        gstRate: Number(it.gstRate),
-      }));
-
-  const pricingMode =
-    raw.pricingMode !== undefined
-      ? normalizePricingMode(str(raw.pricingMode) ?? "")
-      : (existing.pricingMode as PricingModeT);
-
-  let placeOfSupplyCode = String(existing.placeOfSupplyCode ?? "").trim();
-  if (raw.placeOfSupplyCode !== undefined) {
-    const s = str(raw.placeOfSupplyCode) ?? "";
-    if (s && !/^\d{2}$/.test(s)) {
-      throw new ValidationError("placeOfSupplyCode must be a 2-digit state code");
-    }
-    placeOfSupplyCode = s;
-  }
-
-  const totals = computeDocumentTotals(
-    items,
-    pricingMode,
-    sellerStateCode(business),
-    placeOfSupplyCode,
-  );
-
-  const productIds = [
-    ...new Set(items.map((it) => it.productId).filter((v): v is string => v !== null)),
-  ];
-  const found =
-    productIds.length > 0
-      ? await prisma.product.findMany({
-          where: { id: { in: productIds }, businessId },
-          select: { id: true, name: true, sku: true, hsnSac: true, unit: true },
-        })
-      : [];
-  if (found.length !== productIds.length) {
-    throw new ResourceNotFoundError("One or more products were not found");
-  }
-  const productById = Object.fromEntries(found.map((p) => [p.id, p]));
-
-  const data: Prisma.PurchaseOrderUncheckedUpdateInput = {
-    taxType: totals.taxType,
-    placeOfSupplyCode: totals.placeOfSupplyCode || null,
-    subtotal: totals.subtotal,
-    taxableAmount: totals.taxableAmount,
-    cgst: totals.cgst,
-    sgst: totals.sgst,
-    igst: totals.igst,
-    totalTax: totals.totalTax,
-    grandTotal: totals.grandTotal,
-  };
-
-  if (raw.status !== undefined) {
-    data.status = normalizeStatus(str(raw.status) ?? "");
-  }
-  if (raw.pricingMode !== undefined) {
-    data.pricingMode = normalizePricingMode(str(raw.pricingMode) ?? "");
-  }
-  if (raw.notes !== undefined) {
-    const s = shortText(raw.notes, "notes");
-    data.notes = s ?? null;
-  }
-  if (raw.terms !== undefined) {
-    const s = shortText(raw.terms, "terms");
-    data.terms = s ?? null;
-  }
-  if (raw.placeOfSupply !== undefined) {
-    data.placeOfSupply = str(raw.placeOfSupply) ?? null;
-  }
-  if (raw.deliveryAddress !== undefined) {
-    const s = shortText(raw.deliveryAddress, "deliveryAddress");
-    data.deliveryAddress = s ?? null;
-  }
-  if (raw.deliveryMode !== undefined) {
-    const s = shortText(raw.deliveryMode, "deliveryMode");
-    data.deliveryMode = s ?? null;
-  }
-  if (raw.poDate !== undefined || raw.date !== undefined) {
-    const d = requiredIsoDate(str(raw.poDate ?? raw.date), "poDate");
-    // F11 — the purchase order's financial-year binding is immutable; a changed
-    // date must stay inside it (no cross-FY draft moves).
-    await assertDocumentDateInFinancialYear(
-      businessId,
-      existing.financialYearId,
-      d,
-      "Purchase order",
-    );
-    data.poDate = d;
-  }
-  if (raw.deliveryDate !== undefined) {
-    const s = str(raw.deliveryDate);
-    if (s) {
-      const d = new Date(s);
-      if (Number.isNaN(d.getTime())) throw new ValidationError("deliveryDate is not a valid date");
-      data.deliveryDate = d;
-    } else {
-      data.deliveryDate = null;
-    }
-  }
-
-  // Vendor snapshot: refreshed only when explicitly provided.
-  if (raw.vendor !== undefined) {
-    if (raw.vendor === null || typeof raw.vendor !== "object") {
-      throw new ValidationError("vendor must be a vendor snapshot object");
-    }
-    data.vendorSnapshot = buildVendorSnapshot(
-      raw.vendor as Record<string, unknown>,
-    ) as Prisma.InputJsonValue;
-  }
-
-  const rewriteItems =
-    hasItems ||
-    pricingMode !== existing.pricingMode ||
-    placeOfSupplyCode !== String(existing.placeOfSupplyCode ?? "").trim();
-
-  const updated = await prisma.purchaseOrder.update({
-    where: { id },
-    data: rewriteItems
-      ? {
-          ...data,
-          items: {
-            deleteMany: {},
-            create: items.map((it, idx) => {
-              const line = totals.lines[idx];
-              const prod = it.productId ? productById[it.productId] : undefined;
-              return {
-                productId: it.productId,
-                productName: it.productName || (prod ? prod.name : it.productName),
-                sku: it.sku || (prod ? prod.sku : null),
-                hsnSac: it.hsnSac || (prod ? prod.hsnSac : null),
-                unit: it.unit || (prod ? prod.unit : "Pcs"),
-                quantity: it.quantity,
-                rate: it.rate,
-                pricingMode,
-                gstRate: it.gstRate,
-                taxableAmount: line.taxable,
-                cgst: line.cgst,
-                sgst: line.sgst,
-                igst: line.igst,
-                taxAmount: line.taxAmount,
-                totalAmount: line.totalAmount,
-              };
-            }),
-          },
-        }
-      : data,
-    include: purchaseOrderInclude(),
-  });
-
-  return toPurchaseOrderJson(updated);
+  return toPurchaseOrderJson(existing);
 }
 
 /**
- * DELETE — physical removal allowed ONLY for Draft purchase orders. Issued POs
- * (Sent/Accepted/Partially Received/Received) are protected with a 409 — the
- * caller should use Cancelled instead. Cross-tenant or unknown ids stay 404.
+ * STATUS LIFECYCLE — the only path that changes a purchase order's status.
+ *
+ * Follows transitionInvoiceStatus (the Invoice service is the repository's
+ * reference implementation): authorize against `businessId` before reading the
+ * document, load the PO scoped to that business so the CURRENT status comes
+ * from the database rather than the request, validate the requested edge
+ * against PURCHASE_ORDER_STATUS_TRANSITIONS, and only then write.
+ *
+ * `requestedStatus` is a request to transition, not a column assignment. The
+ * ordinary updatePurchaseOrder PATCH still rejects `status` outright.
+ *
+ * The six statuses are the ones the schema comment already documents
+ * ("Draft | Sent | Accepted | Partially Received | Received | Cancelled"); this
+ * adds no new status and no new business meaning. The matrix mirrors the other
+ * documents: Draft -> Sent, then Sent -> any later status, and every status after
+ * Draft is terminal (no receiving progression).
+ *
+ * No edit-lock semantics are introduced: the repository defines no per-status
+ * lockdown for purchase orders, so updatePurchaseOrder is unchanged.
  */
-export async function deletePurchaseOrder(businessIdInput: unknown, idInput: unknown) {
+export async function transitionPurchaseOrderStatus(
+  businessIdInput: unknown,
+  idInput: unknown,
+  requestedStatus: unknown,
+) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  await requireBusinessPermission(businessId, "invoices", "delete");
+  await requireBusinessPermission(businessId, "invoices", "edit");
+
+  const target = normalizeStatus(str(requestedStatus) ?? "");
 
   const existing = await prisma.purchaseOrder.findFirst({
     where: { id, businessId },
@@ -576,12 +469,47 @@ export async function deletePurchaseOrder(businessIdInput: unknown, idInput: unk
   });
   if (!existing) throw new ResourceNotFoundError("Purchase order not found");
 
-  if (existing.status !== "Draft") {
+  if (
+    !isLegalTransition(PURCHASE_ORDER_STATUS_TRANSITIONS, existing.status, target)
+  ) {
     throw new ConflictError(
-      "Only draft purchase orders can be deleted; issued purchase orders must be cancelled",
+      `Purchase order cannot transition from ${existing.status} to ${target}`,
     );
   }
 
-  await prisma.purchaseOrder.delete({ where: { id } });
-  return { id };
+  const updated = await prisma.purchaseOrder.update({
+    where: { id },
+    data: { status: target },
+    include: purchaseOrderInclude(),
+  });
+
+  return toPurchaseOrderJson(updated);
+}
+
+/**
+ * DELETE — NEVER. Purchase orders are not deletable in ANY status, by ANY
+ * user, through ANY API.
+ *
+ * This supersedes the earlier policy, which permitted physical removal of a
+ * Draft PO. A draft has already consumed a PO- number from its
+ * DocumentSequence for the pinned financial year, so removing it leaves a
+ * permanent gap in an auditable numbering run.
+ *
+ * The route is kept (rather than removed) for API compatibility, but it can
+ * only ever reach this rejection: `prisma.purchaseOrder.delete` and
+ * `deleteMany` are NOT called from anywhere in the application. A PO that is no
+ * longer wanted is closed with Cancelled, never erased.
+ *
+ * Authorization is still evaluated FIRST, so an unauthenticated caller gets 401
+ * and a caller without `invoices.delete` on the business gets 403. Only an
+ * authorized caller reaches the 409.
+ */
+export async function deletePurchaseOrder(businessIdInput: unknown, idInput: unknown) {
+  const businessId = validateBusinessId(businessIdInput);
+  validateId(idInput);
+  await requireBusinessPermission(businessId, "invoices", "delete");
+
+  throw new ConflictError(
+    "Purchase orders cannot be deleted. Cancel the purchase order instead.",
+  );
 }

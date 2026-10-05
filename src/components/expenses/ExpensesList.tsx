@@ -58,17 +58,56 @@ export const ExpensesList: React.FC = () => {
   const totalAmount = fyExpenses.reduce((acc, curr) => acc + curr.amount, 0);
 
   const thisMonthTotal = useMemo(() => {
-    // Current month sum
+    const d = new Date();
+    const monthPrefix = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
     return expenses
-      .filter((e) => e.date.startsWith("2026-08"))
+      .filter((e) => e.date.startsWith(monthPrefix))
       .reduce((acc, curr) => acc + curr.amount, 0);
   }, [expenses]);
 
   const todayTotal = useMemo(() => {
+    const d = new Date();
+    const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
+      d.getDate()
+    ).padStart(2, "0")}`;
     return expenses
-      .filter((e) => e.date === "2026-08-24")
+      .filter((e) => e.date.slice(0, 10) === today)
       .reduce((acc, curr) => acc + curr.amount, 0);
   }, [expenses]);
+
+  // Top category across the current fiscal-year expenses, computed live. Falls
+  // back to a neutral placeholder when there is no spend data yet.
+  const { topCategory, topCategoryAmount, topCategoryShare, topCategoryVendors } =
+    useMemo(() => {
+      if (fyExpenses.length === 0) {
+        return {
+          topCategory: "—",
+          topCategoryAmount: 0,
+          topCategoryShare: 0,
+          topCategoryVendors: 0,
+        };
+      }
+      const byCategory = new Map<string, { amount: number; vendors: Set<string> }>();
+      fyExpenses.forEach((e) => {
+        const entry = byCategory.get(e.category) || { amount: 0, vendors: new Set<string>() };
+        entry.amount += e.amount;
+        if (e.vendor) entry.vendors.add(e.vendor);
+        byCategory.set(e.category, entry);
+      });
+      let best: { category: string; amount: number; vendors: number } | null = null;
+      byCategory.forEach((entry, category) => {
+        if (!best || entry.amount > best.amount) {
+          best = { category, amount: entry.amount, vendors: entry.vendors.size };
+        }
+      });
+      const share = totalAmount > 0 ? (best!.amount / totalAmount) * 100 : 0;
+      return {
+        topCategory: best!.category,
+        topCategoryAmount: best!.amount,
+        topCategoryShare: share,
+        topCategoryVendors: best!.vendors,
+      };
+    }, [fyExpenses, totalAmount]);
 
   // Category Colors
   const getCategoryBadgeClass = (category: ExpenseCategory) => {
@@ -240,14 +279,15 @@ export const ExpensesList: React.FC = () => {
           </div>
           <div className="mt-2">
             <span className="text-lg font-bold text-[#191c1e] truncate block">
-              Raw Material
+              {topCategory}
             </span>
             <span className="text-xs text-gray-500 font-mono">
-              ₹1,19,400 (49% of total)
+              ₹{topCategoryAmount.toLocaleString("en-IN")}{" "}
+              ({topCategoryShare.toFixed(0)}% of total)
             </span>
           </div>
           <div className="mt-1 text-[11px] text-purple-700 font-medium">
-            3 primary suppliers
+            {topCategoryVendors} {topCategoryVendors === 1 ? "supplier" : "suppliers"}
           </div>
         </div>
       </div>

@@ -1,12 +1,23 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { PurchaseOrder } from "@/types";
 import { ArrowLeft, Download, Printer } from "lucide-react";
 import { DocPrintSheet, PrintItem, PrintMetaRow } from "@/components/shared/DocPrintSheet";
-import { AddPurchaseOrderModal } from "@/components/purchaseOrders/AddPurchaseOrderModal";
+import {
+  purchaseOrdersApi,
+  fromBackendPurchaseOrder,
+} from "@/lib/api/purchaseOrders";
+import { isTemporaryId } from "@/lib/optimistic-id";
+import { ApiError } from "@/lib/api-client";
+import { nextPurchaseOrderStatuses } from "@/lib/sales-document/status-transitions";
+import { Icon } from "../ui/Icon";
+import {
+  renderDocumentPdf,
+  documentPdfFilename,
+} from "@/lib/print/document-pdf";
 
 const STATUS_COLORS: Record<string, string> = {
   Draft: "bg-gray-100 text-gray-700 border-gray-200",
@@ -17,34 +28,83 @@ const STATUS_COLORS: Record<string, string> = {
   Cancelled: "bg-rose-50 text-rose-700 border-rose-200",
 };
 
-const STATUS_OPTIONS = [
-  "Draft",
-  "Sent",
-  "Accepted",
-  "Partially Received",
-  "Received",
-  "Cancelled",
-];
-
+/**
+ * Status lifecycle notes for this view.
+ *
+ * Selectable options are derived from PURCHASE_ORDER_STATUS_TRANSITIONS (via
+ * nextPurchaseOrderStatuses) — the same authoritative matrix the server
+ * validates against — so an illegal target is never offered. UX only, never a
+ * security boundary: the server re-reads the stored status and rejects an
+ * illegal edge. A terminal status (Received / Cancelled) renders read-only.
+ */
 export const PurchaseOrderDetailsView: React.FC = () => {
   const {
     purchaseOrders,
     updatePurchaseOrderStatus,
     addNotification,
-    setDeleteConfirm,
+    companyProfile,
+    activeBusinessId,
+    transitioningDocument,
   } = useApp();
   const router = useRouter();
   const params = useParams<{ id: string }>();
-  const [editing, setEditing] = useState(false);
+const [downloadingPdf, setDownloadingPdf] = useState(false);
+  const [fetchResult, setFetchResult] = useState<{
+    id: string;
+    record: PurchaseOrder | null;
+    error: "missing" | "error" | null;
+  } | null>(null);
 
-  const po = purchaseOrders.find((p) => p.id === params.id);
+  // Fix C: deep links / reloads had no state to resolve, so they always
+  // rendered "not found". Fetch the authoritative record instead. The result is
+  // keyed by id so a previous route's record is never shown, and the status is
+  // derived during render rather than reset inside the effect.
+  const poFromState = purchaseOrders.find((p) => p.id === params.id);
+  const current = fetchResult?.id === params.id ? fetchResult : null;
+  const po = poFromState ?? current?.record ?? null;
+  const fetchStatus: "idle" | "loading" | "saving" | "missing" | "error" = (() => {
+    if (poFromState) return "idle";
+    if (isTemporaryId(params.id)) return "saving";
+    if (!activeBusinessId) return "idle";
+    if (current === null) return "loading";
+    return current.error ?? "idle";
+  })();
+
+  useEffect(() => {
+    if (poFromState) return;
+    if (isTemporaryId(params.id)) return;
+    if (!activeBusinessId) return;
+    let cancelled = false;
+    purchaseOrdersApi
+      .get(activeBusinessId, params.id)
+      .then((r) => fromBackendPurchaseOrder(r.purchaseOrder))
+      .then((record) => {
+        if (cancelled) return;
+        setFetchResult({ id: params.id, record, error: null });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setFetchResult({
+          id: params.id,
+          record: null,
+          error: err instanceof ApiError && err.status === 404 ? "missing" : "error",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [poFromState, activeBusinessId, params.id]);
 
   if (!po) {
+    let message = "Purchase order not found.";
+    if (fetchStatus === "loading") message = "Loading purchase order...";
+    else if (fetchStatus === "saving")
+      message = "This purchase order is still being saved...";
+    else if (fetchStatus === "error")
+      message = "This purchase order could not be loaded.";
     return (
       <div className="space-y-6">
-        <div className="p-8 text-center text-gray-400">
-          Purchase order not found.
-        </div>
+        <div className="p-8 text-center text-gray-400">{message}</div>
       </div>
     );
   }
@@ -53,24 +113,79 @@ export const PurchaseOrderDetailsView: React.FC = () => {
     window.print();
   };
 
-  const handleDownloadPdf = () => {
-    addNotification({
-      type: "success",
-      title: "Purchase Order PDF Ready",
-      message: `Purchase order ${po.poNumber} has been downloaded.`,
-    });
+  const handleDownloadPdf = async () => {
+    if (downloadingPdf) return;
+    setDownloadingPdf(true);
+    try {
+      const bytes = await renderDocumentPdf(companyProfile, {
+        banner: "PURCHASE ORDER",
+        docNumber: po.poNumber,
+        metaRows,
+        party: {
+          title: "Vendor (Supplier)",
+          name: po.vendor.name,
+          address: po.vendor.address,
+          phone: po.vendor.phone,
+          gstin: po.vendor.gstin,
+          extraRows: [
+            ...(po.vendor.contactPerson
+              ? [{ label: "Contact Person", value: po.vendor.contactPerson }]
+              : []),
+            ...(po.vendor.email
+              ? [{ label: "Email", value: po.vendor.email }]
+              : []),
+          ],
+        },
+        deliveryBlock: {
+          deliveryAddress: po.deliveryAddress,
+          deliveryMode: po.deliveryMode,
+        },
+        items,
+        subtotal: po.subtotal,
+        cgst: po.cgst,
+        sgst: po.sgst,
+        total: po.grandTotal,
+        notes: po.notes,
+        terms: po.terms,
+        footerNote: "This is a purchase order, not a tax invoice.",
+      });
+      const blob = new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = documentPdfFilename(po.poNumber, "purchase-order");
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      addNotification({
+        type: "error",
+        title: "Could not download PDF",
+        message:
+          err instanceof Error
+            ? err.message
+            : "Try the Print button instead.",
+      });
+    } finally {
+      setDownloadingPdf(false);
+    }
   };
 
-  const handleDelete = () => {
-    setDeleteConfirm({
-      kind: "purchaseOrder",
-      id: po.id,
-      name: po.poNumber,
-    });
-  };
+  // NOTE: purchase orders are NOT deletable. There is deliberately no Delete
+  // action here and no delete path in the context or the API — a PO that is no
+  // longer wanted is closed with Cancelled via the status control below, never
+  // erased.
+
+  // True only while THIS document's transition is in flight; the status itself
+  // is never mutated locally — the context swaps in the server's response.
+  const isTransitioning = transitioningDocument?.id === po.id;
+
+  // Legal destinations only, from the shared authoritative matrix.
+  const nextStatusOptions: readonly string[] = nextPurchaseOrderStatuses(po.status);
 
   const handleStatusChange = (status: string) => {
-    updatePurchaseOrderStatus(po.id, status as PurchaseOrder["status"]);
+    void updatePurchaseOrderStatus(po.id, status as PurchaseOrder["status"]);
   };
 
   const metaRows: PrintMetaRow[] = [
@@ -129,26 +244,34 @@ export const PurchaseOrderDetailsView: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
-          <select
-            value={po.status}
-            onChange={(e) => handleStatusChange(e.target.value)}
-            className="bg-white border border-[#eceef0] focus:border-[#93000b] py-2 px-2 rounded-lg text-xs font-semibold outline-none text-gray-700"
-            title="Change status"
-          >
-            {STATUS_OPTIONS.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-
-          <button
-            onClick={() => setEditing(true)}
-            className="flex items-center gap-1.5 px-3 py-2 bg-white border border-[#eceef0] hover:bg-gray-100 text-gray-700 rounded-lg text-xs font-semibold transition-colors"
-          >
-            <span className="material-symbols-outlined text-[16px]">edit</span>
-            <span>Edit</span>
-          </button>
+          {nextStatusOptions.length === 0 ? (
+            <span
+              className="rounded-lg border border-[#eceef0] bg-white px-3 py-2 text-xs font-semibold text-gray-500"
+              title={`${po.status} is a final status and cannot be changed`}
+            >
+              {po.status}
+            </span>
+          ) : (
+            <select
+              value={po.status}
+              onChange={(e) => handleStatusChange(e.target.value)}
+              disabled={isTransitioning}
+              aria-busy={isTransitioning}
+              className="bg-white border border-[#eceef0] focus:border-[#93000b] py-2 px-2 rounded-lg text-xs font-semibold outline-none text-gray-700 disabled:cursor-not-allowed disabled:opacity-60"
+              title={
+                isTransitioning
+                  ? "Saving status…"
+                  : `Change status (next: ${nextStatusOptions.join(", ")})`
+              }
+            >
+              <option value={po.status}>{po.status}</option>
+              {nextStatusOptions.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          )}
 
           <button
             onClick={handlePrint}
@@ -160,20 +283,16 @@ export const PurchaseOrderDetailsView: React.FC = () => {
 
           <button
             onClick={handleDownloadPdf}
-            className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-semibold shadow-xs transition-colors"
+            disabled={downloadingPdf}
+            className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-semibold shadow-xs transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            title="Download this purchase order as a PDF file"
           >
-            <Download className="w-4 h-4" />
-            <span>Download PDF</span>
-          </button>
-
-          <button
-            onClick={handleDelete}
-            className="p-2 bg-white border border-[#eceef0] hover:bg-rose-50 hover:text-rose-700 text-gray-700 rounded-lg transition-colors"
-            title="Delete"
-          >
-            <span className="material-symbols-outlined text-[18px]">
-              delete
-            </span>
+            {downloadingPdf ? (
+              <Icon name="progress_activity" className="text-[16px] animate-spin" />
+            ) : (
+              <Download className="w-4 h-4" />
+            )}
+            <span>{downloadingPdf ? "Generating PDF..." : "Download PDF"}</span>
           </button>
         </div>
       </div>
@@ -213,10 +332,6 @@ export const PurchaseOrderDetailsView: React.FC = () => {
         signature
         footerNote="This is a purchase order, not a tax invoice."
       />
-
-      {editing && (
-        <AddPurchaseOrderModal po={po} onClose={() => setEditing(false)} />
-      )}
     </div>
   );
 };

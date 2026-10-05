@@ -189,6 +189,14 @@ export const estimatesApi = {
     http.patch<{ estimate: EstimateBackendJson }>(`/api/estimates/${id}`, input, {
       businessId,
     }),
+  // Authoritative lifecycle move. `status` is a requested destination; the
+  // server reads the current status from the DB and rejects an illegal edge.
+  transitionStatus: (businessId: string, id: string, status: Estimate["status"]) =>
+    http.patch<{ estimate: EstimateBackendJson }>(
+      `/api/estimates/${id}/status`,
+      { status },
+      { businessId },
+    ),
   remove: (businessId: string, id: string) =>
     http.del<{ id: string }>(`/api/estimates/${id}`, { businessId }),
 };

@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { Invoice, InvoiceItem, InvoiceStatus, PricingMode } from "@/types";
@@ -14,6 +14,7 @@ import { stateWithCode, INDIAN_STATES } from "@/lib/india";
 import { getEWayBillComplianceStatus } from "@/lib/compliance";
 import { financialYearForDate, matchFinancialYear } from "@/lib/financialYear";
 import { localDateString, parseLocalDate } from "@/lib/dates";
+import { useSubmitGuard } from "@/hooks/useSubmitGuard";
 import { fyShortName } from "@/lib/utils";
 import {
   validateName,
@@ -23,9 +24,24 @@ import {
   validateQuantity,
   validateGstRate,
   validateVehicleNumber,
+  normalizeBusinessText,
 } from "@/lib/validation";
-import { X, FileText, Trash2, Check, Truck, ShieldAlert } from "lucide-react";
+import { X, FileText, Trash2, Check, Truck, ShieldAlert, GraduationCap } from "lucide-react";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
 import { SearchablePicker } from "@/components/invoices/SearchablePicker";
+import { InvoiceEditModal } from "@/components/invoices/InvoiceEditModal";
+import { DocumentImmutabilityWarning } from "@/components/documents/DocumentImmutabilityWarning";
+import { DocumentExperienceModal } from "@/components/documents/DocumentExperienceModal";
+import { DocumentCreateConfirmation } from "@/components/documents/DocumentCreateConfirmation";
+import { DocumentSubmitLoading } from "@/components/documents/DocumentSubmitLoading";
+import { DocumentCreateSuccess } from "@/components/documents/DocumentCreateSuccess";
+import {
+  isLearningDismissed,
+  isLearningSeen,
+  markLearningSeen,
+} from "@/lib/document-experience";
+import { openCreatedInvoicePdf } from "@/lib/open-document-pdf";
+import { Icon } from "../ui/Icon";
 
 interface LineDraft {
   id: string;
@@ -59,13 +75,13 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     products,
     vehicles,
     addInvoice,
-    updateInvoice,
     setOpenModal,
     companyProfile,
     getActiveFinancialYear,
     financialYears,
     documentSequenceFor,
-    mintDocumentNumber,
+    isServerSequenceReady,
+    syncServerSequence,
     canCreateResource,
   } = useApp();
   const router = useRouter();
@@ -162,15 +178,51 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
 
   const selectedCustomer = customers.find((c) => c.id === customerId);
 
-  // Auto-number for a NEW invoice uses the per-FY sequence of the year the date
-  // falls in; an edited invoice keeps its existing number.
+  // Issued invoices (anything that left Draft) are financially frozen
+  // server-side; mirror that lock in the UI so the user cannot configure
+  // financial changes that the server will reject with a 409.
+  const financialLocked = !!invoice && invoice.status !== "Draft";
+
+  // INVOICE NUMBER — server-assigned only.
+//
+// A preview is only ever an estimate: another browser (or another user) can
+// consume the same number at any moment, which is exactly how a form ends up
+// offering a number that already exists. The create form therefore NEVER sends
+// a number. The server allocates the authoritative one inside the create
+// transaction (see invoice-service.createInvoice, which always calls
+// allocateDocumentNumber), reconciled against the highest number that already
+// exists for this business + financial year.
+//
+// A number that must be chosen by hand is an EDIT-time concern, handled by the
+// existing Invoice Number edit functionality after the invoice exists — not by
+// the create form. Keeping a manual entry point here meant the form could offer
+// a number the allocator was never going to honour.
+  //
+  // The number shown below is a read-only PREVIEW of what the server will
+  // assign. It stays BLANK until the server confirms this (FY, kind) counter, so
+  // the form can never flash the localStorage seed (which starts at 1 on a fresh
+  // browser).
+  const invoiceSeqReady = isServerSequenceReady(previewFy.id, "invoice");
   const displayedInvoiceNumber = isEdit
     ? invoice?.invoiceNumber || ""
-    : buildInvoiceNumber(
-        companyProfile.invoicePrefix || "INV",
-        previewFy.name,
-        documentSequenceFor(previewFy.id, "invoice")
-      );
+    : !invoiceSeqReady
+      ? ""
+      : buildInvoiceNumber(
+          companyProfile.invoicePrefix || "INV",
+          previewFy.name,
+          documentSequenceFor(previewFy.id, "invoice"),
+        );
+
+  // The preview must come from the server's counter, not the local cache. The
+  // cache starts at 1 on a fresh browser and is otherwise never told what the
+  // server already handed out, so it could preview a number that already
+// existed. Reconcile the FY this form is actually previewing (derived from the
+    // document date, so it can differ from the active FY) whenever it changes.
+  // `syncServerSequence` only reads; allocation stays in the create transaction.
+  useEffect(() => {
+    if (isEdit || !previewFy.id) return;
+    void syncServerSequence(previewFy.id, "invoice");
+  }, [isEdit, previewFy.id, syncServerSequence]);
 
   const handleCustomerSelect = (id: string) => {
     setCustomerId(id);
@@ -189,7 +241,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
       {
         id: `item-${Date.now()}-${prev.length}`,
         productId: prod.id,
-        description: prod.name,
+        description: normalizeBusinessText(prod.name),
         hsnSac: prod.hsnSac,
         quantity: 1,
         unit: prod.unit || "Pcs",
@@ -214,7 +266,17 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     value: string | number
   ) => {
     setItems((prev) =>
-      prev.map((it, i) => (i === index ? { ...it, [field]: value } : it))
+      prev.map((it, i) =>
+        i === index
+          ? {
+              ...it,
+              [field]:
+                field === "description" || field === "hsnSac"
+                  ? String(value).toUpperCase()
+                  : value,
+            }
+          : it
+      )
     );
   };
 
@@ -249,11 +311,41 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
   // Fix C: async so the modal only closes once the server has returned the
   // persisted invoice. Closing on the optimistic row would let the user act on
   // a temp id that has no database row behind it.
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!selectedCustomer) return;
-    if (items.length === 0) return;
+  //
+  // `submitForm` holds the real work; `handleSubmit` wraps it in the
+  // single-flight guard so a rapid double click cannot dispatch two invoice
+  // creates (UX protection — the server's invoice entitlement check inside the
+  // create transaction remains authoritative).
+  const { isSubmitting, run: runSubmit } = useSubmitGuard();
 
+  // The invoice is created-and-frozen. The full GST form below is CREATE-only;
+  // editing opens InvoiceEditModal (number + product/quantity/price only).
+  // Before a create is dispatched we show a confirmation; while it runs a
+  // loading overlay; on success a panel (View PDF / View / Go to list); on a
+  // server 409 a duplicate-number dialog. First-run surfaces the sample
+  // preview + learning tour once per browser.
+  const [wantsSample, setWantsSample] = useState(false);
+  const [wantConfirm, setWantConfirm] = useState(false);
+  const [createdInvoice, setCreatedInvoice] = useState<Invoice | null>(null);
+  const [firstRunWantsSample] = useState(
+    () => !isLearningSeen("invoice") && !isLearningDismissed("invoice"),
+  );
+  const [learningDismissed] = useState(() => isLearningDismissed("invoice"));
+  useEffect(() => {
+    if (!firstRunWantsSample) return;
+    const t = window.setTimeout(() => setWantsSample(true), 350);
+    return () => window.clearTimeout(t);
+  }, [firstRunWantsSample]);
+
+  const validateForm = (): boolean => {
+    if (!selectedCustomer) {
+      setComplianceError("Select a customer to continue.");
+      return false;
+    }
+    if (items.length === 0) {
+      setComplianceError("Add at least one line item.");
+      return false;
+    }
     // Field-level validation (UX only; re-enforced server-side later).
     for (const it of items) {
       const hsn = it.hsnSac ? validateHsnSAC(true).validate(it.hsnSac) : null;
@@ -262,22 +354,30 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
       const gst = validateGstRate().validate(String(it.gstRate));
       if (hsn || qty || price || gst) {
         setComplianceError(hsn || qty || price || gst || "");
-        return;
+        return false;
       }
     }
     if (vehicleNumber.trim()) {
       const veh = validateVehicleNumber(true).validate(vehicleNumber);
       if (veh) {
         setComplianceError(veh);
-        return;
+        return false;
       }
     }
     const contactErr = validateContact(selectedCustomer);
     if (contactErr) {
       setComplianceError(contactErr);
-      return;
+      return false;
     }
     setComplianceError(null);
+    return true;
+  };
+
+  const submitForm = async () => {
+    if (!validateForm()) return;
+    // validateForm guarantees a selection; capture for TypeScript narrowing.
+    const cust = selectedCustomer;
+    if (!cust) return;
 
     const invoiceItems: InvoiceItem[] = items.map((it) => {
       const line = calculateLineTotals(
@@ -292,7 +392,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
       return {
         id: it.id,
         productId: it.productId,
-        description: it.description?.trim() || "Item",
+        description: normalizeBusinessText(it.description) || "ITEM",
         hsnSac: it.hsnSac,
         quantity: it.quantity,
         unit: it.unit,
@@ -305,7 +405,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     });
 
     // Auto-populate receiver snapshot from the selected customer.
-    const ba = selectedCustomer.billingAddress;
+    const ba = cust.billingAddress;
     const customerAddress = [
       ba?.addressLine1,
       ba?.city,
@@ -315,20 +415,21 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
       .filter(Boolean)
       .join(", ");
 
-    // Auto-number for a NEW invoice uses the active FY's per-FY sequence; an
-    // edited invoice keeps its existing number. Submitting re-mints (rollover
-    // is idempotent) so the number stored is always the reconciled one.
-    const finalNumber = isEdit
-      ? (invoice?.invoiceNumber ?? displayedInvoiceNumber)
-      : mintDocumentNumber(companyProfile.invoicePrefix || "INV", "invoice");
+    // The number the request carries. The create form NEVER sends one: the client
+    // must not pre-mint a counter value, because doing so produced a client/server
+    // split where the form could present a number the server would never issue,
+    // and it advanced a local counter that has no authority. An empty string is
+    // the explicit "server, you decide" signal, so the server allocates the
+    // authoritative number inside the create transaction.
+    const finalNumber = "";
 
     const base = {
       invoiceNumber: finalNumber,
-      customerId: selectedCustomer.id,
-      customerName: selectedCustomer.name,
-      customerGstin: selectedCustomer.gstin,
+      customerId: cust.id,
+      customerName: cust.name,
+      customerGstin: cust.gstin,
       customerAddress,
-      customerPhone: selectedCustomer.primaryContact?.mobile,
+      customerPhone: cust.primaryContact?.mobile,
       date,
       dueDate: addDays(date, 15),
       placeOfSupply,
@@ -337,7 +438,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
         vehicleNumber.trim() || driverName.trim()
           ? {
               vehicleNumber: vehicleNumber.trim() || undefined,
-              driverName: driverName.trim() || undefined,
+              driverName: normalizeBusinessText(driverName) || undefined,
               status: vehicleStatus,
             }
           : undefined,
@@ -352,16 +453,49 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
       ewayBillDate: invoice?.ewayBillDate,
       status,
       pricingMode,
-      notes: notes ? notes.replace(/<[^>]*>/g, "").trim().slice(0, 1000) || undefined : undefined,
+      notes:
+        notes
+          ? normalizeBusinessText(notes.replace(/<[^>]*>/g, "")).slice(0, 1000) ||
+            undefined
+          : undefined,
     };
 
-    if (isEdit && invoice) {
-      updateInvoice({ ...base, id: invoice.id });
-      close();
-    } else {
-      const created = await addInvoice(base);
-      if (created) close();
+    const created = await addInvoice(base);
+    if (created.status === "created") {
+      // Close the confirmation first so the success panel mounts cleanly.
+      setCreatedInvoice(created.invoice);
     }
+    // "duplicate" can no longer come from a create: no number is submitted, so
+    // the server allocates one it has already reserved. "failed" is already
+    // toasted. Either way the form stays open so the user can try again.
+
+    // Re-reconcile against the server after every attempt, success or failure.
+    // A create that rolls back (e.g. insufficient stock) or that allocated a
+    // number the server then issued differently leaves the local cache out of
+    // step, and the preview is a display aid, so it is simply re-read. This is
+    // the only thing that keeps the preview honest: the form never advances the
+    // counter itself, and it never assumes the number it showed was kept.
+    void syncServerSequence(previewFy.id, "invoice");
+  };
+
+  // Submission is single-flight (useSubmitGuard); the confirmation dialog is
+  // the human gate before the API call, so a double view of the dialog or a
+  // double click can never dispatch two creates.
+  const confirmCreate = () => {
+    setWantConfirm(false);
+    void runSubmit(submitForm);
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSubmitting) return;
+    if (!validateForm()) return;
+    setWantConfirm(true);
+  };
+
+  const closeSample = () => {
+    markLearningSeen("invoice");
+    setWantsSample(false);
   };
 
   const close = () => {
@@ -369,8 +503,82 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
     else setOpenModal(null);
   };
 
+  const dialogRef = useModalBehavior(close);
+
+  // DOCUMENT IMMUTABILITY: an invoice is created-and-frozen. Editing an existing
+  // invoice opens the narrow edit modal (invoice number + product / quantity /
+  // price only); the full GST form below is CREATE-only. All hooks above
+  // already ran, so these conditional returns keep hook order stable.
+  if (isEdit && invoice) {
+    return <InvoiceEditModal invoice={invoice} onClose={close} />;
+  }
+
+  // Create-success panel: the server has persisted the invoice; offer View PDF
+  // (rendered from the created record) / View invoice / Go to invoices / Close.
+  if (createdInvoice) {
+    return (
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="invoice-modal-title"
+        className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+      >
+        <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
+          <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#fef2f2] text-[#93000b] flex items-center justify-center">
+                <FileText className="w-5 h-5" />
+              </div>
+              <h3
+                id="invoice-modal-title"
+                className="text-base font-bold text-[#191c1e]"
+              >
+                Invoice Created
+              </h3>
+            </div>
+            <button
+              onClick={close}
+              aria-label="Close invoice dialog"
+              className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <DocumentCreateSuccess
+            kind="invoice"
+            number={createdInvoice.invoiceNumber}
+            onViewPdf={() =>
+              void openCreatedInvoicePdf(createdInvoice, companyProfile).catch(
+                () => undefined
+              )
+            }
+            onViewDocument={() => {
+              const id = createdInvoice.id;
+              close();
+              router.push(`/invoices/${id}`);
+            }}
+            onGoToList={() => {
+              close();
+              router.push("/invoices");
+            }}
+            onClose={close}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="invoice-modal-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
           <div className="flex items-center gap-3">
@@ -378,7 +586,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
               <FileText className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">
+              <h3 id="invoice-modal-title" className="text-base font-bold text-[#191c1e]">
                 {isEdit ? "Edit Tax Invoice" : "Generate GST Tax Invoice"}
               </h3>
               <p className="text-xs text-gray-500">
@@ -388,6 +596,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
           </div>
           <button
             onClick={close}
+            aria-label="Close invoice dialog"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -403,6 +612,16 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
               <span className="font-semibold">Please correct the invoice: </span>
               {complianceError}
             </div>
+          )}
+          {!isEdit && !learningDismissed && (
+            <button
+              type="button"
+              onClick={() => setWantsSample(true)}
+              className="self-start inline-flex items-center gap-1.5 text-[#93000b] hover:text-[#770008] border border-[#ecd7d7] hover:border-[#93000b] bg-white rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors"
+            >
+              <GraduationCap className="w-4 h-4" />
+              View sample invoice &amp; learn
+            </button>
           )}
           {!isEdit && !canCreateResource("invoices") && (
             <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-[#fef2f2] border border-rose-200 text-[#93000b] rounded-xl px-4 py-3">
@@ -450,15 +669,35 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
             </div>
 
             <div>
-              <label className="block font-semibold text-gray-700 mb-1">
-                Invoice Number <span className="text-rose-500">*</span>
-              </label>
+              <div className="flex items-center justify-between mb-1">
+                <label className="block font-semibold text-gray-700">
+                  Invoice Number
+                </label>
+                <span className="text-xs font-medium text-gray-500 bg-gray-100 border border-[#eceef0] rounded px-2 py-0.5">
+                  Server-assigned
+                </span>
+              </div>
+              {/* Always read-only: the number is allocated by the server inside the
+                  create transaction. A number is never typed here, so the form
+                  cannot "accidentally keep" a value that was never allocated. To
+                  change a number, save the invoice and use Invoice Number edit. */}
               <input
                 type="text"
                 readOnly
                 value={displayedInvoiceNumber}
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] rounded-lg outline-none font-mono font-bold uppercase text-gray-800"
+                title={
+                  isEdit
+                    ? "The number assigned to this invoice."
+                    : "Preview of the number the server will assign when you save. The server may allocate a different number if someone else saves first."
+                }
+                placeholder="Assigned when you save"
+                className="w-full py-2 px-3 bg-gray-50 border border-[#eceef0] rounded-lg outline-none font-mono font-bold uppercase text-gray-500"
               />
+              <p className="mt-1 text-xs text-gray-500">
+                {isEdit
+                  ? "This is the number assigned to this invoice."
+                  : "Preview only. The server assigns the next available number when you save — this value is not reserved and may change. You can change the number later from the saved invoice."}
+              </p>
             </div>
 
             <div>
@@ -527,9 +766,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
           {/* Price Type selector */}
           <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] flex flex-col sm:flex-row sm:items-center gap-3">
             <div className="flex items-center gap-2 min-w-64">
-              <span className="material-symbols-outlined text-[16px] text-[#93000b]">
-                percent
-              </span>
+              <Icon name="percent" className="text-[16px] text-[#93000b]" />
               <label className="font-bold text-gray-800 uppercase tracking-wider text-[11px]">
                 Price Type
               </label>
@@ -539,7 +776,8 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
               onChange={(e) =>
                 setPricingMode(e.target.value as PricingMode)
               }
-              className="flex-1 w-full bg-white border border-[#eceef0] focus:border-[#93000b] py-2 px-3 rounded-lg outline-none font-medium"
+              disabled={financialLocked}
+              className="flex-1 w-full bg-white border border-[#eceef0] focus:border-[#93000b] py-2 px-3 rounded-lg outline-none font-medium disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <option value="inclusive">GST Inclusive</option>
               <option value="exclusive">GST Exclusive</option>
@@ -552,7 +790,26 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
           </div>
 
           {/* Line Items */}
-          <div className="space-y-3">
+          {financialLocked && (
+            <div className="flex items-start gap-2.5 bg-[#fef2f2] border border-rose-200 text-[#93000b] rounded-xl px-4 py-3">
+              <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
+              <div className="text-xs">
+                <span className="font-semibold">
+                  Financial fields are locked for Pending/Issued invoices.
+                </span>
+                <p className="text-rose-700 mt-0.5">
+                  Quantity, rate, GST, and totals cannot be changed after an
+                  invoice has been issued. Non-financial details (notes,
+                  vehicle) remain editable.
+                </p>
+              </div>
+            </div>
+          )}
+          <fieldset
+            disabled={financialLocked}
+            className="min-w-0 p-0 m-0 border-0 space-y-3"
+          >
+            <div className="space-y-3">
             <div className="flex items-center justify-between">
               <h4 className="font-bold text-[#191c1e] uppercase tracking-wider text-xs">
                 Line Items &amp; Materials
@@ -730,6 +987,7 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
               </div>
             )}
           </div>
+          </fieldset>
 
           {/* Vehicle dispatch block */}
           <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] space-y-3">
@@ -780,9 +1038,9 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
                   <input
                     type="text"
                     value={driverName}
-                    onChange={(e) => setDriverName(e.target.value)}
+                    onChange={(e) => setDriverName(e.target.value.toUpperCase())}
                     placeholder="Auto from vehicle"
-                    className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                    className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
                   />
                 </div>
                 <div>
@@ -812,9 +1070,9 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
               <textarea
                 rows={3}
                 value={notes}
-                onChange={(e) => setNotes(e.target.value)}
+                onChange={(e) => setNotes(e.target.value.toUpperCase())}
                 placeholder="Add delivery note, bank transfer instructions, or lorry receipt number..."
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none"
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none uppercase"
               />
             </div>
 
@@ -889,14 +1147,54 @@ export const AddInvoiceModal: React.FC<AddInvoiceModalProps> = ({
             </button>
             <button
               type="submit"
-              disabled={!selectedCustomer || items.length === 0}
+              disabled={isSubmitting || !selectedCustomer || items.length === 0}
+              aria-busy={isSubmitting}
               className="bg-[#93000b] hover:bg-[#770008] text-white py-2.5 px-6 rounded-xl font-bold shadow-xs transition-colors flex items-center gap-2 disabled:opacity-40"
             >
-              <Check className="w-4 h-4" />
-              <span>{isEdit ? "Save Changes" : "Save & Generate Invoice"}</span>
+              {/* Fixed-size icon slot: the check and the spinner swap in place
+                  so the label change cannot shift the button's width. */}
+              <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                {isSubmitting ? (
+                  <Icon name="progress_activity" className="h-4 w-4 animate-spin text-[16px] leading-none" aria-hidden="true" />
+                ) : (
+                  <Check className="w-4 h-4" aria-hidden="true" />
+                )}
+              </span>
+              <span>
+                {isSubmitting
+                  ? isEdit
+                    ? "Saving…"
+                    : "Creating…"
+                  : isEdit
+                    ? "Save Changes"
+                    : "Save & Generate Invoice"}
+              </span>
             </button>
           </div>
         </form>
+
+        {wantConfirm && selectedCustomer && (
+          <DocumentCreateConfirmation
+            kind="invoice"
+            summary={{
+              number: displayedInvoiceNumber,
+              customer: selectedCustomer.name,
+              itemCount: items.length,
+              total: totals.grandTotal,
+              note:
+                "The number above is a preview. The server assigns the final number when you confirm. It can be changed later from the saved invoice.",
+            }}
+            isSubmitting={isSubmitting}
+            onCancel={() => setWantConfirm(false)}
+            onConfirm={confirmCreate}
+          >
+            <DocumentImmutabilityWarning kind="invoice" stacked />
+          </DocumentCreateConfirmation>
+        )}
+        {wantsSample && (
+          <DocumentExperienceModal kind="invoice" onClose={closeSample} />
+        )}
+        <DocumentSubmitLoading kind="invoice" visible={isSubmitting} />
       </div>
     </div>
   );

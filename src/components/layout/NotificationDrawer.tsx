@@ -1,7 +1,8 @@
 "use client";
 
-import React from "react";
+import React, { useEffect } from "react";
 import { useApp } from "@/context/AppContext";
+import { Icon } from "../ui/Icon";
 
 export const NotificationDrawer: React.FC = () => {
   const {
@@ -11,6 +12,18 @@ export const NotificationDrawer: React.FC = () => {
     markAllNotificationsRead,
     markNotificationRead,
   } = useApp();
+
+  // Escape dismisses the drawer and returns focus to the notifications trigger.
+  useEffect(() => {
+    if (!isNotificationOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      setIsNotificationOpen(false);
+      document.getElementById("btn-topbar-notifications")?.focus();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [isNotificationOpen, setIsNotificationOpen]);
 
   if (!isNotificationOpen) return null;
 
@@ -41,9 +54,10 @@ export const NotificationDrawer: React.FC = () => {
             </button>
             <button
               onClick={() => setIsNotificationOpen(false)}
+              aria-label="Close notifications"
               className="p-1 text-on-surface-variant hover:bg-surface-container rounded-full transition-colors flex items-center justify-center"
             >
-              <span className="material-symbols-outlined text-[20px]">close</span>
+              <Icon name="close" className="text-[20px]" />
             </button>
           </div>
         </div>
@@ -61,9 +75,7 @@ export const NotificationDrawer: React.FC = () => {
 
                 {/* Icon */}
                 <div className="w-10 h-10 rounded-full bg-surface-container flex items-center justify-center shrink-0 border border-outline-variant ml-2 group-hover:border-primary transition-colors">
-                  <span className={`material-symbols-outlined text-[20px] ${item.iconColor || 'text-primary'}`}>
-                    {item.icon}
-                  </span>
+                  <Icon name={item.icon} className="text-[20px] ${item.iconColor || 'text-primary'}" />
                 </div>
 
                 {/* Content */}
@@ -87,7 +99,7 @@ export const NotificationDrawer: React.FC = () => {
 
             {unreadNotifications.length === 0 && (
               <div className="p-md text-center mt-6 mb-4">
-                <span className="material-symbols-outlined text-surface-dim text-4xl mb-2">done_all</span>
+                <Icon name="done_all" className="text-surface-dim text-4xl mb-2" />
                 <p className="font-body-sm text-on-surface-variant text-xs">You&apos;re all caught up — no unread notifications.</p>
               </div>
             )}
@@ -100,7 +112,7 @@ export const NotificationDrawer: React.FC = () => {
             onClick={() => setIsNotificationOpen(false)}
             className="w-full py-2 bg-surface text-primary border border-outline-variant rounded font-label-md hover:bg-surface-container transition-colors flex items-center justify-center text-xs font-semibold shadow-xs"
           >
-            View All Notifications
+            Close Notifications
           </button>
         </div>
       </div>

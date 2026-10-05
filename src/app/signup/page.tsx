@@ -4,10 +4,15 @@ import Link from "next/link";
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
+import { isValidEmail, EMAIL_INVALID_MESSAGE } from "@/lib/auth/email-validation";
+import { googleButtonVisible } from "@/lib/auth/oauth-config";
 import { Button } from "@/components/ui/Button";
 import { Input } from "@/components/ui/Input";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
 import { LegalFooter } from "@/components/legal/LegalFooter";
+import { GoogleSignInButton } from "@/components/auth/GoogleSignInButton";
+
+const googleEnabled = googleButtonVisible(process.env.NEXT_PUBLIC_GOOGLE_OAUTH_ENABLED);
 
 export default function SignupPage() {
   const router = useRouter();
@@ -28,8 +33,8 @@ export default function SignupPage() {
       setError("Please enter your name and email address.");
       return;
     }
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
-      setError("Please enter a valid email address.");
+    if (!isValidEmail(email)) {
+      setError(EMAIL_INVALID_MESSAGE);
       return;
     }
     if (password.length < 8) {
@@ -51,9 +56,10 @@ export default function SignupPage() {
       setError(result.error);
       return;
     }
-    // New accounts enter the business onboarding wizard (never straight to the
-    // dashboard). The wizard will open on its first step.
-    router.replace("/onboarding");
+    // Route through the home page, which sends a fresh account into the
+    // onboarding wizard only once Providers confirms the server has no business
+    // for it yet — never on a stale client snapshot.
+    router.replace("/");
   };
 
   return (
@@ -71,10 +77,16 @@ export default function SignupPage() {
           </p>
         </div>
 
-        <form
-          onSubmit={handleSubmit}
-          className="rounded-xl border border-outline-variant/50 bg-surface-container-lowest p-6 shadow-sm"
-        >
+        <div className="rounded-xl border border-outline-variant/50 bg-surface-container-lowest p-6 shadow-sm">
+          <GoogleSignInButton errorCallbackURL="/signup" />
+          {googleEnabled && (
+            <div className="mt-5 flex items-center gap-3 text-[11px] font-semibold uppercase tracking-wider text-outline">
+              <span className="h-px flex-1 bg-outline-variant/50" />
+              or
+              <span className="h-px flex-1 bg-outline-variant/50" />
+            </div>
+          )}
+          <form onSubmit={handleSubmit}>
           <div className="space-y-4">
             <Input
               label="Your name"
@@ -86,6 +98,7 @@ export default function SignupPage() {
             <Input
               label="Email address"
               type="email"
+              autoComplete="email"
               placeholder="you@example.com"
               icon="mail"
               value={email}
@@ -94,6 +107,7 @@ export default function SignupPage() {
             <Input
               label="Password"
               type="password"
+              autoComplete="new-password"
               placeholder="Minimum 8 characters"
               icon="lock"
               value={password}
@@ -102,6 +116,7 @@ export default function SignupPage() {
             <Input
               label="Confirm password"
               type="password"
+              autoComplete="new-password"
               placeholder="Re-enter your password"
               icon="lock"
               value={confirmPassword}
@@ -157,6 +172,7 @@ export default function SignupPage() {
             </Link>
           </p>
         </form>
+      </div>
       </div>
       </div>
       <LegalFooter />

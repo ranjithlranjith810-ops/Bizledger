@@ -2,6 +2,7 @@
 
 import { http } from "@/lib/api-client";
 import type { NotificationItem } from "@/types";
+import type { IconName } from "@/components/ui/Icon";
 
 export interface NotificationBackendJson {
   id: string;
@@ -17,7 +18,7 @@ export interface NotificationBackendJson {
   createdAt: string;
 }
 
-const TYPE_ICONS: Record<string, string> = {
+const TYPE_ICONS: Record<string, IconName> = {
   payment: "payments",
   warning: "warning",
   payroll: "payroll",

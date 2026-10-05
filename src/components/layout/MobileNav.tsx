@@ -3,16 +3,18 @@
 import React from "react";
 import { usePathname, useRouter } from "next/navigation";
 import { ROUTES } from "@/lib/constants";
+import { Icon, type IconName } from "../ui/Icon";
 
 interface MobileNavItem {
   label: string;
   route: string;
-  icon: string;
+  icon: IconName;
   extraActivePrefix?: string;
 }
 
 const NAV_ITEMS: MobileNavItem[] = [
   { label: "Home", route: ROUTES.dashboard, icon: "home" },
+  { label: "Invoices", route: ROUTES.invoices, icon: "description" },
   { label: "Customers", route: ROUTES.customers, icon: "group" },
   { label: "Products", route: ROUTES.products, icon: "inventory_2" },
   { label: "Quotes", route: ROUTES.quotations, icon: "request_quote" },
@@ -39,7 +41,11 @@ export const MobileNav: React.FC = () => {
   };
 
   return (
-    <nav className="fixed bottom-0 left-0 w-full z-50 lg:hidden bg-surface-container-lowest border-t border-outline-variant shadow-lg flex justify-around items-center h-16 px-1 select-none">
+    // `min-h-16` + a bottom safe-area pad: a hard `h-16` would clip the bar on
+    // devices with a home indicator, and the bar's own content would sit under
+    // it. `pb-[env(safe-area-inset-bottom)]` resolves to 0 where there is no
+    // inset, so non-notched devices are unchanged.
+    <nav className="fixed bottom-0 left-0 w-full z-50 lg:hidden bg-surface-container-lowest border-t border-outline-variant shadow-lg flex justify-around items-center min-h-16 px-1 pb-[env(safe-area-inset-bottom)] select-none">
       {NAV_ITEMS.map((item) => {
         const active = isActive(item);
         return (
@@ -52,12 +58,7 @@ export const MobileNav: React.FC = () => {
                 : "text-on-surface-variant active:bg-surface-container"
             }`}
           >
-            <span
-              className="material-symbols-outlined text-[22px]"
-              style={active ? { fontVariationSettings: "'FILL' 1" } : undefined}
-            >
-              {item.icon}
-            </span>
+            <Icon name={item.icon} className="text-[22px]" />
             <span className="font-label-sm text-[9px] mt-xs whitespace-nowrap">
               {item.label}
             </span>

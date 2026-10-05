@@ -13,27 +13,47 @@ import {
   ShieldCheck,
   ExternalLink,
 } from "lucide-react";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
 
 export const ExpenseDetailsModal: React.FC = () => {
   const { selectedExpenseId, setSelectedExpenseId, setOpenModal, expenses } =
     useApp();
   const [showFullReceipt, setShowFullReceipt] = useState(false);
 
-  const expense = expenses.find((e) => e.id === selectedExpenseId);
-
-  if (!expense) return null;
-
-  const handlePrint = () => {
-    window.print();
-  };
-
   const closeModal = () => {
     setSelectedExpenseId(null);
     setOpenModal(null);
   };
 
+  const dialogRef = useModalBehavior(closeModal);
+
+  const expense = expenses.find((e) => e.id === selectedExpenseId);
+
+  if (!expense) return null;
+
+  const formattedCreatedAt = expense.createdAt
+    ? new Date(expense.createdAt).toLocaleString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric",
+        hour: "2-digit",
+        minute: "2-digit",
+      })
+    : "—";
+
+  const handlePrint = () => {
+    window.print();
+  };
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="expense-details-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         {/* Modal Top Nav */}
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
@@ -43,7 +63,7 @@ export const ExpenseDetailsModal: React.FC = () => {
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <h3 className="text-base font-bold text-[#191c1e] font-mono">
+                <h3 id="expense-details-title" className="text-base font-bold text-[#191c1e] font-mono">
                   Expense #{expense.expenseNumber}
                 </h3>
                 <span className="bg-blue-50 text-blue-700 text-[11px] font-semibold px-2 py-0.5 rounded border border-blue-200">
@@ -70,6 +90,7 @@ export const ExpenseDetailsModal: React.FC = () => {
             </button>
             <button
               onClick={closeModal}
+              aria-label="Close expense details"
               className="p-2 text-gray-400 hover:text-gray-800 hover:bg-gray-200 rounded-lg transition-colors"
             >
               <X className="w-5 h-5" />
@@ -159,7 +180,7 @@ export const ExpenseDetailsModal: React.FC = () => {
                   Approved By
                 </span>
                 <span className="font-semibold text-emerald-700">
-                  {expense.approvedBy || "Sarah Jenkins"}
+                  {expense.approvedBy || "—"}
                 </span>
               </div>
 
@@ -206,7 +227,7 @@ export const ExpenseDetailsModal: React.FC = () => {
                   className="text-xs font-semibold text-[#93000b] hover:underline flex items-center gap-1"
                 >
                   <Download className="w-3.5 h-3.5" />
-                  Download File ({expense.receiptSize || "1.4 MB"})
+                  Download File ({expense.receiptSize || "—"})
                 </a>
               )}
             </div>
@@ -231,7 +252,7 @@ export const ExpenseDetailsModal: React.FC = () => {
                 {showFullReceipt && (
                   <div className="p-3 bg-gray-50 rounded-lg text-xs text-gray-600 flex items-center justify-between">
                     <span>
-                      File: {expense.receiptName || "ApexSteel_Inv_8921.pdf"}
+                      File: {expense.receiptName || "receipt"}
                     </span>
                     <button
                       onClick={() => setShowFullReceipt(false)}
@@ -255,19 +276,35 @@ export const ExpenseDetailsModal: React.FC = () => {
               Audit &amp; Verification Log
             </h4>
             <div className="space-y-3 text-xs">
-              <div className="flex items-start gap-3">
-                <div className="w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
-                  <ShieldCheck className="w-3.5 h-3.5" />
+              {expense.approvedBy ? (
+                <div className="flex items-start gap-3">
+                  <div className="w-6 h-6 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0 mt-0.5">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                  </div>
+                  <div>
+                    <span className="font-semibold text-gray-800">
+                      Approved by {expense.approvedBy}
+                    </span>
+                    <p className="text-[11px] text-gray-400">
+                      {expense.referenceNumber ? `Reference ${expense.referenceNumber}` : "Recorded in the expense ledger"}
+                    </p>
+                  </div>
                 </div>
-                <div>
-                  <span className="font-semibold text-gray-800">
-                    Approved by David Lee
-                  </span>
-                  <p className="text-[11px] text-gray-400">
-                    Verified against purchase order PO-8819
-                  </p>
+              ) : (
+                <div className="flex items-start gap-3">
+                  <div className="w-6 h-6 rounded-full bg-gray-100 text-gray-500 flex items-center justify-center shrink-0 mt-0.5">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                  </div>
+                  <div>
+                    <span className="font-semibold text-gray-800">
+                      Awaiting approval
+                    </span>
+                    <p className="text-[11px] text-gray-400">
+                      Recorded in the expense ledger.
+                    </p>
+                  </div>
                 </div>
-              </div>
+              )}
 
               <div className="flex items-start gap-3">
                 <div className="w-6 h-6 rounded-full bg-blue-100 text-blue-700 flex items-center justify-center shrink-0 mt-0.5">
@@ -278,7 +315,7 @@ export const ExpenseDetailsModal: React.FC = () => {
                     Created by {expense.createdBy}
                   </span>
                   <p className="text-[11px] text-gray-400">
-                    {expense.createdAt || "2026-08-24 10:30 AM"}
+                    {formattedCreatedAt}
                   </p>
                 </div>
               </div>

@@ -3,11 +3,13 @@
 import React, { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
-import { ONBOARDING_STEPS } from "@/lib/constants";
-import { validatePan, validateGstin } from "@/lib/validation";
+import { useAuth } from "@/context/AuthContext";
+import { ONBOARDING_STEPS, isResumableAppRoute } from "@/lib/constants";
+import { validatePan, validateGstin, normalizeGstinValue } from "@/lib/validation";
 import { Input } from "@/components/ui/Input";
 import { Select } from "@/components/ui/Select";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
+import { Icon } from "../ui/Icon";
 
 const STEP_LABELS = ONBOARDING_STEPS;
 
@@ -28,7 +30,9 @@ function formatInvoiceNumber(prefix: string, startingNumber: number): string {
 
 export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
   const router = useRouter();
+  const { lastRoute } = useAuth();
   const [finishing, setFinishing] = useState(false);
+  const [finishError, setFinishError] = useState("");
   const {
     companyProfile,
     updateCompanyProfile,
@@ -72,7 +76,18 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
   const [taxErrors, setTaxErrors] = useState<Record<string, string>>({});
 
   const validateTaxStep = (): boolean => {
-    const gstinErr = validateGstin().validate(form.gstin);
+    // 10.2-D: the wizard's OWN helper text under the GST-status select says
+    // "Your GST status controls whether GSTIN is required on invoices." Respect
+    // that documented decision: GSTIN is ONLY validated/required when the
+    // business states it is GST registered or on the Composite scheme. A
+    // business that is Not GST Registered (unregistered/consumer) is no longer
+    // forced to enter a GSTIN. PAN stays mandatory for every business as it
+    // does for every company/business profile in this app (not a guessed rule).
+    const requiresGstin =
+      form.gstRegistered === "registered" || form.gstRegistered === "composite";
+    const gstinErr = requiresGstin
+      ? validateGstin().validate(normalizeGstinValue(form.gstin))
+      : null;
     const panErr = validatePan().validate(form.pan);
     const errors: Record<string, string> = {};
     if (gstinErr) errors.gstin = gstinErr;
@@ -87,13 +102,9 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
     router.push(`/onboarding/${next <= 6 ? STEP_LABELS[next - 1].href.split("/").pop() : ""}`);
   };
 
+  // Explicit previous-step navigation only (Steps 2-6). Step 1 has no Back/Home
+  // action; the browser back button remains available if the user wants to leave.
   const goBack = () => {
-    if (stepIndex <= 1) {
-      // An account that has NOT finished onboarding has no dashboard to return
-      // to — send the user to the app home instead of a fake dashboard.
-      router.push("/");
-      return;
-    }
     const prev = stepIndex - 1;
     setOnboardingStep(prev);
     router.push(STEP_LABELS[prev - 1].href);
@@ -113,7 +124,7 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
   const saveTax = () => {
     updateCompanyProfile({
       gstRegistered: form.gstRegistered,
-      gstin: form.gstin.trim().toUpperCase(),
+      gstin: normalizeGstinValue(form.gstin),
       pan: form.pan.trim().toUpperCase(),
     });
   };
@@ -145,6 +156,17 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
 
   const step1Valid = form.companyName.trim() !== "";
   const step4Valid = Number(form.invoiceStartingNumber) > 0;
+
+  // Live validity mirrors validateTaxStep() without mutating state during
+  // render, so the Continue button can be disabled (visual feedback) instead of
+  // silently swallowing the click on invalid input.
+  const requiresGstin =
+    form.gstRegistered === "registered" || form.gstRegistered === "composite";
+  const step2Valid =
+    (requiresGstin
+      ? !validateGstin().validate(normalizeGstinValue(form.gstin))
+      : true) && !validatePan().validate(form.pan);
+  const step3Valid = form.city.trim() !== "" && form.addressLine1.trim() !== "";
 
   return (
     <div className="min-h-screen bg-[#f7f9fb]">
@@ -312,7 +334,7 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
                   label="PAN"
                   required
                   icon="badge"
-                  placeholder="e.g. ABCDE1234F"
+                  placeholder="e.g. ABCPE1234F"
                   value={form.pan}
                   error={taxErrors.pan}
                   onChange={(e) =>
@@ -400,7 +422,7 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
                   }
                 />
                 <div className="sm:col-span-2 flex items-start gap-2 rounded-lg bg-[#f7f9fb] border border-[#eceef0] px-3 py-2.5">
-                  <span className="material-symbols-outlined text-[#93000b] text-[18px]">preview</span>
+                  <Icon name="preview" className="text-[#93000b] text-[18px]" />
                   <div>
                     <p className="text-[11px] font-semibold text-[#191c1e]">Preview</p>
                     <p className="text-xs text-gray-500 font-mono mt-0.5">
@@ -508,15 +530,29 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
             )}
           </div>
 
+          {finishError && (
+            <div className="flex items-start gap-2 rounded-lg bg-error/10 border border-error/30 px-4 py-3 mx-6 mb-4">
+              <Icon name="error" className="text-[18px] text-error shrink-0" />
+              <p className="text-xs font-medium text-error">{finishError}</p>
+            </div>
+          )}
+
           {/* Footer nav */}
-          <div className="border-t border-[#eceef0] px-6 py-4 flex items-center justify-between">
-            <button
-              onClick={goBack}
-              className="inline-flex items-center gap-1.5 text-xs font-bold text-gray-600 hover:bg-[#f7f9fb] px-4 py-2 rounded-lg transition-colors"
-            >
-              <span className="material-symbols-outlined text-[16px]">arrow_back</span>
-              {stepIndex === 1 ? "Home" : "Back"}
-            </button>
+          <div
+            className={`border-t border-[#eceef0] px-6 py-4 flex items-center ${
+              stepIndex === 1 ? "justify-end" : "justify-between"
+            }`}
+          >
+            {stepIndex > 1 && (
+              <button
+                type="button"
+                onClick={goBack}
+                className="inline-flex items-center gap-1.5 text-xs font-bold text-gray-600 hover:bg-[#f7f9fb] px-4 py-2 rounded-lg transition-colors"
+              >
+                <Icon name="arrow_back" className="text-[16px]" />
+                Back
+              </button>
+            )}
 
             {stepIndex < 6 ? (
               <button
@@ -537,32 +573,55 @@ export const OnboardingWizard: React.FC<{ step: number }> = ({ step }) => {
                   }
                   goNext();
                 }}
-                disabled={stepIndex === 1 && !step1Valid}
+                disabled={
+                  (stepIndex === 1 && !step1Valid) ||
+                  (stepIndex === 2 && !step2Valid) ||
+                  (stepIndex === 3 && !step3Valid) ||
+                  (stepIndex === 4 && !step4Valid)
+                }
                 className="inline-flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-5 py-2.5 rounded-lg text-xs font-bold shadow-sm transition-colors disabled:opacity-40"
               >
                 Continue
-                <span className="material-symbols-outlined text-[16px]">arrow_forward</span>
+                <Icon name="arrow_forward" className="text-[16px]" />
               </button>
             ) : (
               <button
                 onClick={async () => {
                   if (finishing) return;
                   setFinishing(true);
-                  await completeOnboarding();
-                  router.replace("/dashboard");
+                  setFinishError("");
+                  const errorMessage = await completeOnboarding();
+                  if (errorMessage) {
+                    // Duplicate GSTIN (or a recoverable conflict): keep the
+                    // wizard open and show the message so the user can correct
+                    // or review. A single submission already created the
+                    // business; the scope refresh above completed onboarding
+                    // and will route to the dashboard once businessId resolves.
+                    setFinishing(false);
+                    setFinishError(errorMessage);
+                    return;
+                  }
+                  // Return the user to the route they were on when onboarding
+                  // became required (preserved by AppShell), defaulting to the
+                  // dashboard when there is no prior app route.
+                  const destination =
+                    lastRoute && lastRoute !== "/" && isResumableAppRoute(lastRoute)
+                      ? lastRoute
+                      : "/dashboard";
+                  router.replace(destination);
                 }}
                 disabled={finishing}
                 className="inline-flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-6 py-2.5 rounded-lg text-xs font-bold shadow-sm transition-colors disabled:opacity-40"
               >
-                <span className="material-symbols-outlined text-[16px]">check</span>
-                {finishing ? "Creating business…" : "Finish &amp; Open Dashboard"}
+                <Icon name="check" className="text-[16px]" />
+                {finishing ? "Creating business…" : "Finish & Open Dashboard"}
               </button>
             )}
           </div>
         </div>
 
         <p className="mt-6 text-center text-[11px] text-gray-400">
-          You can edit any of this later in Settings · Your data is saved locally as you go, so you
+          You can edit any of this later in Settings · Your progress is saved as you go, so you
           can close this page and resume where you left off.
         </p>
       </div>

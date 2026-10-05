@@ -79,6 +79,9 @@ export interface EntitlementDb {
   product: { count(args: unknown): Promise<number> };
   businessMember: { count(args: unknown): Promise<number> };
   invoice: { count(args: unknown): Promise<number> };
+  estimate: { count(args: unknown): Promise<number> };
+  quotation: { count(args: unknown): Promise<number> };
+  purchaseOrder: { count(args: unknown): Promise<number> };
   businessDirectoryProfile: { count(args: unknown): Promise<number> };
 }
 
@@ -119,8 +122,13 @@ const PLAN_LIMIT_KEYS = [
   "teamMembers",
   "products",
   "invoicesPerMonth",
+  "estimatesPerMonth",
+  "quotationsPerMonth",
+  "purchaseOrdersPerMonth",
   "directoryListings",
 ] as const;
+
+type PlanLimitKey = (typeof PLAN_LIMIT_KEYS)[number];
 
 // ---------------------------------------------------------------------------
 // Phase 9C-4 - Feature entitlement registry (A-class prerequisite).
@@ -227,32 +235,78 @@ function validLimitValue(value: unknown): number | "Unlimited" | null {
   return null;
 }
 
-/** Merges a PlanCatalog row into a SubscriptionPlan-shaped object, plus the
- * plan's featureEntitlements map (see `featuresFromCatalogRow`). */
-export function planFromCatalogRow(row: CatalogPlanRow): {
-  plan: SubscriptionPlan;
-  features: FeatureEntitlements;
-} {
+/** The four document kinds share a single ceiling: the plan's INVOICE limit.
+ * When a document key is absent from a catalog row (e.g. pre-existing rows
+ * written before those keys existed), it inherits `invoicesPerMonth` exactly —
+ * never 0 and never an invented second plan configuration. */
+const DOCUMENT_LIMIT_KEYS = new Set<PlanLimitKey>([
+  "estimatesPerMonth",
+  "quotationsPerMonth",
+  "purchaseOrdersPerMonth",
+]);
+
+/**
+ * Resolves a PlanCatalog row's persisted `limits` JSON into the full 8-key
+ * limit set through the canonical fallback chain:
+ *   1. a valid persisted DB value wins for that key;
+ *   2. otherwise the STATIC catalog value for a canonical plan id wins
+ *      (a malformed canonical row fails OPEN to its catalog default);
+ *   3. otherwise a missing document key inherits `invoicesPerMonth` — the
+ *      invoice limit is the common ceiling for all four document kinds — via
+ *      the same DB → static → 0 chain;
+ *   4. otherwise 0 (a truly unspecified resource on an unknown plan is not
+ *      granted: fail CLOSED, never an accidental "Unlimited").
+ * This is the SINGLE limits resolver used by BOTH enforcement
+ * (`planFromCatalogRow`) and the pricing catalog DTO (`toPlanDto`), so the
+ * pricing page advertises exactly what the server enforces.
+ */
+export function catalogLimits(row: {
+  id: string;
+  limits: unknown;
+}): SubscriptionPlan["limits"] {
   const staticPlan = getPlanById(PLAN_CATALOG, row.id as SubscriptionPlanId);
   const dbLimits =
     row.limits && typeof row.limits === "object"
       ? (row.limits as Record<string, unknown>)
       : {};
 
-  // Phase 9C-4 safe-limit rule: a malformed limit on a CANONICAL plan (id has
-  // a static catalog entry) fails open to the static default — a garbage row
-  // never locks a customer out. But a limit that is MISSING/INVALID on an
-  // UNKNOWN custom plan id must NEVER fall through to "Unlimited" (that would
-  // accidentally grant an uncapped resource) — it fails CLOSED to 0.
-  const pick = (key: (typeof PLAN_LIMIT_KEYS)[number]): number | "Unlimited" => {
+  const pick = (key: PlanLimitKey): number | "Unlimited" => {
     const dbValue = validLimitValue(dbLimits[key]);
     if (dbValue !== null) return dbValue;
     if (staticPlan) {
       const staticValue = staticPlan.limits?.[key];
       if (staticValue !== undefined) return staticValue as number | "Unlimited";
     }
+    if (DOCUMENT_LIMIT_KEYS.has(key)) {
+      const invoiceValue = validLimitValue(dbLimits.invoicesPerMonth);
+      if (invoiceValue !== null) return invoiceValue;
+      if (staticPlan?.limits?.invoicesPerMonth !== undefined) {
+        return staticPlan.limits.invoicesPerMonth as number | "Unlimited";
+      }
+    }
     return 0;
   };
+
+  return {
+    customers: pick("customers"),
+    teamMembers: pick("teamMembers"),
+    products: pick("products"),
+    invoicesPerMonth: pick("invoicesPerMonth"),
+    estimatesPerMonth: pick("estimatesPerMonth"),
+    quotationsPerMonth: pick("quotationsPerMonth"),
+    purchaseOrdersPerMonth: pick("purchaseOrdersPerMonth"),
+    directoryListings: pick("directoryListings"),
+  };
+}
+
+/** Merges a PlanCatalog row into a SubscriptionPlan-shaped object, plus the
+ * plan's featureEntitlements map (see `featuresFromCatalogRow`). Limits come
+ * from the shared `catalogLimits` resolver. */
+export function planFromCatalogRow(row: CatalogPlanRow): {
+  plan: SubscriptionPlan;
+  features: FeatureEntitlements;
+} {
+  const staticPlan = getPlanById(PLAN_CATALOG, row.id as SubscriptionPlanId);
 
   return {
     plan: {
@@ -265,13 +319,7 @@ export function planFromCatalogRow(row: CatalogPlanRow): {
       ...(staticPlan?.popular !== undefined ? { popular: staticPlan.popular } : {}),
       features: staticPlan?.features ?? [],
       businessNetworkIncluded: row.businessNetworkIncluded,
-      limits: {
-        customers: pick("customers"),
-        teamMembers: pick("teamMembers"),
-        products: pick("products"),
-        invoicesPerMonth: pick("invoicesPerMonth"),
-        directoryListings: pick("directoryListings"),
-      },
+      limits: catalogLimits(row),
     },
     features: featuresFromCatalogRow(row),
   };
@@ -355,14 +403,36 @@ export async function resolveEffectivePlan(
   };
 }
 
-/** Current DB-side usage for a resource kind. Invoices are metered over the
- * current UTC calendar month, excluding Cancelled; every other kind is a
- * lifetime total. Both are anchored on the server-mint `createdAt` so
- * back-dated invoice dates cannot dodge the ceiling.
+/** Calendar-month window (UTC), matching the invoice quota exactly. Boundaries
+ * are built with Date.UTC so they never depend on the server's local timezone,
+ * and `lt nextMonthStart` is an EXCLUSIVE upper bound so exactly one instant can
+ * never be double-counted or slip through a 31/30/28-day month length. */
+function monthWindow(businessId: string, excludeStatus?: string) {
+  const now = new Date();
+  const monthStart = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
+  );
+  const nextMonthStart = new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
+  );
+  return {
+    businessId,
+    createdAt: { gte: monthStart, lt: nextMonthStart },
+    ...(excludeStatus ? { status: { not: excludeStatus } } : {}),
+  };
+}
+
+/** Current DB-side usage for a resource kind. The four document kinds (invoices,
+ * estimates, quotations, purchase orders) are metered over the current UTC
+ * calendar month — a Cancelled invoice/PO is not a metered document and must
+ * not consume the monthly allowance; estimates and quotations have no Cancelled
+ * status, so every created row counts. Every other kind is a lifetime total.
+ * All are anchored on the server-mint `createdAt` so back-dated document dates
+ * cannot dodge the ceiling.
  *
  * `period` is retained in the signature for call-site compatibility; the
- * calendar-month invoice window is intentionally NOT derived from it, because
- * the governed limit is `invoicesPerMonth` regardless of billing cadence. */
+ * calendar-month window is intentionally NOT derived from it, because the
+ * governed limit is `...PerMonth` regardless of billing cadence. */
 export async function countUsage(
   db: EntitlementDb,
   businessId: string,
@@ -389,28 +459,25 @@ export async function countUsage(
       // the subscription's billing `period`: an annual subscriber is still
       // capped at `invoicesPerMonth` per calendar month, which the previous
       // rolling window got wrong (it counted 365 days for annual plans).
-      //
-      // Boundaries are built with Date.UTC so they never depend on the
-      // server's local timezone, and `lt nextMonthStart` is an EXCLUSIVE
-      // upper bound so exactly one instant can never be double-counted or
-      // slip through a 31/30/28-day month length.
-      const now = new Date();
-      const monthStart = new Date(
-        Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
-      );
-      const nextMonthStart = new Date(
-        Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
-      );
-      return db.invoice.count({
-        where: {
-          businessId,
-          createdAt: { gte: monthStart, lt: nextMonthStart },
-          // A cancelled invoice is not a metered invoice: it must not consume
-          // the monthly allowance.
-          status: { not: "Cancelled" },
-        },
-      });
+      // A cancelled invoice is not a metered invoice.
+      return db.invoice.count({ where: monthWindow(businessId, "Cancelled") });
     }
+    case "estimates":
+      // Estimate quota mirrors the invoice monthly window. Estimates have no
+      // Cancelled status (Draft/Sent/Accepted/Rejected/Expired), so nothing is
+      // excluded — every minted estimate consumes one estimate slot.
+      return db.estimate.count({ where: monthWindow(businessId) });
+    case "quotations":
+      // Quotation quota mirrors the invoice monthly window. Quotations have no
+      // Cancelled status (Draft/Sent/Accepted/Rejected/Expired), so nothing is
+      // excluded — every minted quotation consumes one quotation slot.
+      return db.quotation.count({ where: monthWindow(businessId) });
+    case "purchaseOrders":
+      // PO quota mirrors the invoice monthly window INCLUDING the Cancelled
+      // exclusion: a cancelled PO is not a metered PO (exactly like invoices).
+      return db.purchaseOrder.count({
+        where: monthWindow(businessId, "Cancelled"),
+      });
     case "directoryListing":
       return db.businessDirectoryProfile.count({ where: { businessId } });
     default:
@@ -421,7 +488,9 @@ export async function countUsage(
 }
 
 /** Pure limit decision: throws `EntitlementDeniedError` when `used >= limit`;
- * otherwise returns the decision (remaining = slots left AFTER this insert). */
+ * otherwise returns the decision. `remaining` is the exact number of slots
+ * left under the ceiling: `limit - used` (never `limit - used - 1` — one used
+ * item against a ceiling of five leaves four remaining). */
 export function assertWithinLimit(
   plan: SubscriptionPlan,
   kind: EntitlementKind,
@@ -440,7 +509,7 @@ export function assertWithinLimit(
     kind,
     limit: cap,
     used,
-    remaining: cap - used - 1,
+    remaining: Math.max(cap - used, 0),
   };
 }
 

@@ -47,6 +47,22 @@ export type QuotationStatusT = (typeof QUOTATION_STATUSES)[number];
 export type EstimateStatusT = (typeof ESTIMATE_STATUSES)[number];
 export type PoStatusT = (typeof PO_STATUSES)[number];
 
+// The status LISTS live here (server-side) and the authoritative TRANSITION
+// matrix lives in ./status-transitions, which is dependency-free so the client
+// status dropdowns can derive their options from the exact same rules without
+// pulling this server module into the browser bundle. Re-exported for the
+// services' convenience.
+export {
+  QUOTATION_STATUS_TRANSITIONS,
+  ESTIMATE_STATUS_TRANSITIONS,
+  PURCHASE_ORDER_STATUS_TRANSITIONS,
+  isLegalTransition,
+  isTerminalStatus,
+  nextQuotationStatuses,
+  nextEstimateStatuses,
+  nextPurchaseOrderStatuses,
+} from "./status-transitions";
+
 // ------------------------------------------------------------------ primitives
 export function str(v: unknown): string | undefined {
   if (v == null) return undefined;

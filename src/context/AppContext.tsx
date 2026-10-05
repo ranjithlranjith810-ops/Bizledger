@@ -1,6 +1,6 @@
 "use client";
 
-import React, { createContext, useContext, useState, useEffect } from "react";
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from "react";
 import {
   Expense,
   Vehicle,
@@ -18,6 +18,8 @@ import {
   AppContextType,
   DeleteConfirmState,
   DeleteEntityKind,
+  DomainHydrationKey,
+  DomainHydrationStatus,
   SubscriptionState,
   PaymentRecord,
   PaymentMethod,
@@ -27,28 +29,28 @@ import {
   QuotationStatus,
   EstimateStatus,
   PurchaseOrderStatus,
+  InvoiceCreateResult,
 } from "@/types";
 import {
-  INITIAL_COMPANY_PROFILE,
-  INITIAL_EXPENSES,
-  INITIAL_VEHICLES,
-  INITIAL_VEHICLE_EXPENSES,
-  INITIAL_TEAM_MEMBERS,
   SUBSCRIPTION_PLANS,
-  INITIAL_CUSTOMERS,
-  INITIAL_PRODUCTS,
-  INITIAL_INVOICES,
-  INITIAL_NOTIFICATIONS,
   EMPTY_COMPANY_PROFILE,
 } from "@/data/mockData";
 import { dataKey } from "@/lib/storage";
+import type { IconName } from "@/components/ui/Icon";
 import { resolveInitialOnboardingState } from "@/lib/constants";
-import { http, ApiError } from "@/lib/api-client";
-import { billingApi } from "@/lib/api/billing";
+import { localDateString, addDaysLocal } from "@/lib/dates";
+import { http, ApiError, apiFetch } from "@/lib/api-client";
+import { normalizeGstinValue } from "@/lib/validation";
+import { billingApi, toSubscriptionPlans } from "@/lib/api/billing";
 import { customersApi, toBackendInput as customerToBackendInput } from "@/lib/api/customers";
 import { productsApi } from "@/lib/api/products";
 import { financialYearsApi, toFrontend as fyToFrontend, FinancialYearBackend } from "@/lib/api/financialYears";
-import { invoicesApi, toBackendInput as invoiceToBackendInput, fromBackendInvoice } from "@/lib/api/invoices";
+import {
+  invoicesApi,
+  toBackendInput as invoiceToBackendInput,
+  fromBackendInvoice,
+  toUpdateInput,
+} from "@/lib/api/invoices";
 import { quotationsApi, toBackendInput as quotationToBackendInput, fromBackendQuotation } from "@/lib/api/quotations";
 import { estimatesApi, toBackendInput as estimateToBackendInput, fromBackendEstimate } from "@/lib/api/estimates";
 import { purchaseOrdersApi, toBackendInput as poToBackendInput, fromBackendPurchaseOrder } from "@/lib/api/purchaseOrders";
@@ -77,6 +79,7 @@ import {
   SEQUENCES_KEY,
   PerFySequences,
   SequenceKind,
+  isSyntheticFinancialYearId,
 } from "@/lib/financialYear";
 import {
   countCurrentPeriodInvoices,
@@ -116,17 +119,17 @@ function capitalize(s: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 function todayIso(): string {
-  return new Date().toISOString().split("T")[0];
+  return localDateString();
 }
 function nowIso(): string {
   return new Date().toISOString();
 }
 function plusDaysIso(days: number): string {
-  return new Date(Date.now() + days * 86400000).toISOString().split("T")[0];
+  return addDaysLocal(localDateString(), days);
 }
 
 // Team-seat count for entitlement purposes. The account owner is NOT a paid
-// team-member seat — only ADDITIONAL (non-owner) members count against the
+// team-member seat â€” only ADDITIONAL (non-owner) members count against the
 // plan's teamMember ceiling. This keeps the Free plan's 0 extra seats from
 // consuming the owner (who may always use the app).
 function additionalTeamSeatsUsed(members: TeamMember[]): number {
@@ -134,7 +137,7 @@ function additionalTeamSeatsUsed(members: TeamMember[]): number {
 }
 
 // Derive a place-of-supply pair from a customer's billing state. This must
-// NEVER fall back to a hard-coded seller state — if we cannot prove the POS we
+// NEVER fall back to a hard-coded seller state â€” if we cannot prove the POS we
 // leave it empty and the GST engine resolves to intrastate (CGST+SGST), which
 // is the conservative, correct classification for an unproven destination.
 function placeOfSupplyFromState(customerState: string): {
@@ -186,6 +189,23 @@ export const AppProvider: React.FC<{
     resolveInitialOnboardingState({ activeAccountId, businessId })
   );
 
+  // Reconciliation (Bug fix: existing business users must never be stranded in
+  // the onboarding wizard). A server-confirmed business id ALWAYS wins over a
+  // client-initialized incomplete onboarding state, even when the business is
+  // resolved AFTER this provider has already mounted â€” the login/session race
+  // where Providers re-resolves to a non-null business while this provider
+  // stays mounted with a stale `completed: false` (a `useState` initializer
+  // never re-runs on a prop change). This is handled at render time with the
+  // sanctioned "adjust state when a prop changes" pattern (a `useEffect` would
+  // add a cascading re-render): when `businessId` arrives non-null, the derived
+  // state re-syncs `onboarding` so the invariant "business exists => onboarding
+  // is done" that AppShell and the home page rely on routes to the dashboard.
+  const [resolvedBusinessId, setResolvedBusinessId] = useState<string | null>(businessId);
+  if (businessId && businessId !== resolvedBusinessId) {
+    setResolvedBusinessId(businessId);
+    setOnboarding({ completed: true, currentStep: 6 });
+  }
+
   // Financial years (per account) + which one is currently active. Seeded with
   // a default India FY when none are stored.
   const [financialYears, setFinancialYears] = useState<FinancialYearSettings[]>(() => {
@@ -222,8 +242,7 @@ export const AppProvider: React.FC<{
     setOnboarding((prev) => ({ ...prev, currentStep: step }));
   };
 
-  const completeOnboarding = async () => {
-    setOnboarding((prev) => ({ ...prev, completed: true, currentStep: 6 }));
+  const completeOnboarding = async (): Promise<string | null> => {
     // The backend business is the tenant scope for every API request. Create it
     // from the onboarding company profile when this is the user's first business
     // (a fresh auth user has none yet). The scope provider re-resolves and
@@ -233,8 +252,21 @@ export const AppProvider: React.FC<{
         const created = await http.post<{ id: string }>("/api/businesses", {
           name: companyProfile.companyName.trim(),
           legalName: companyProfile.companyName.trim(),
+          gstin: normalizeGstinValue(companyProfile.gstin ?? "") || undefined,
+          gstRegistered:
+            companyProfile.gstRegistered === "registered" ||
+            companyProfile.gstRegistered === "composite",
         });
         if (created?.id) {
+          // Persist the full onboarding company profile for this tenant so a
+          // reload restores it from the server (GET /api/businesses/[id]).
+          // Best-effort: a failure here must not strand the wizard â€” the
+          // profile can be saved again from Settings.
+          try {
+            await http.patch(`/api/businesses/${created.id}`, companyProfile);
+          } catch {
+            // ignore â€” scope refresh below already completes onboarding.
+          }
           // Backfill the onboarding-created financial years (they were saved
           // locally while no business existed yet) and activate the active one.
           for (const fy of financialYears) {
@@ -249,11 +281,24 @@ export const AppProvider: React.FC<{
           }
           notifyBusinessScopeChanged();
         }
-      } catch {
-        // The wizard still completes locally; the next reload re-attempts via
-        // the scope provider's GET /api/businesses when the backend is up.
+      } catch (error) {
+        // Duplicate GSTIN (409): surface the exact server message and refresh
+        // the scope. If an earlier timed-out submission actually created THIS
+        // user's business, the scope resolution completes onboarding and routes
+        // to the dashboard; a genuinely foreign GSTIN keeps the wizard open so
+        // the user sees the error instead of silently duplicating or landing in
+        // a no-business state.
+        if (error instanceof ApiError && error.status === 409) {
+          notifyBusinessScopeChanged();
+          setOnboarding((prev) => ({ ...prev, completed: false, currentStep: 6 }));
+          return error.message || "A business with this GSTIN already exists.";
+        }
+        // Any other failure still completes the wizard locally; the next reload
+        // re-attempts via the scope provider's GET /api/businesses.
       }
     }
+    setOnboarding((prev) => ({ ...prev, completed: true, currentStep: 6 }));
+    return null;
   };
 
   // Domain 5: financial years are backend-authoritative once the scope resolves.
@@ -278,6 +323,59 @@ export const AppProvider: React.FC<{
           setBackendFyIds(mapped.map((m) => m.id));
         } else {
           setBackendFyIds([]);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [businessId]);
+
+  // Company profile hydration: the rich profile (companyProfileJson) is
+  // backend-authoritative. On scope resolution the saved blob replaces the local
+  // state; tenants with no saved blob yet (created before this feature) fall
+  // back to the synced business scalars so the settings page never shows empty
+  // data and old leaf consumers (eway-bill config, PDF header) stay consistent.
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    http
+      .get<{
+        business: {
+          name: string;
+          email?: string | null;
+          phone?: string | null;
+          gstin?: string | null;
+          gstRegistered?: boolean;
+          addressLine1?: string | null;
+          city?: string | null;
+          state?: string | null;
+          pincode?: string | null;
+          country?: string | null;
+        };
+        companyProfile?: Record<string, unknown> | null;
+      }>(`/api/businesses/${businessId}`)
+      .then((data) => {
+        if (!active) return;
+        if (data?.companyProfile && typeof data.companyProfile === "object") {
+          setCompanyProfile((prev) => ({ ...prev, ...data.companyProfile }));
+        } else if (data?.business) {
+          const b = data.business;
+          setCompanyProfile((prev) => ({
+            ...prev,
+            companyName: b.name || prev.companyName,
+            email: b.email || prev.email,
+            mobile: b.phone || prev.mobile,
+            gstin: b.gstin || prev.gstin,
+            gstRegistered: b.gstRegistered ? "registered" : prev.gstRegistered,
+            streetAddress: b.addressLine1 || prev.streetAddress,
+            addressLine1: b.addressLine1 || prev.addressLine1,
+            city: b.city || prev.city,
+            state: b.state || prev.state,
+            pincode: b.pincode || prev.pincode,
+            country: b.country || prev.country,
+          }));
         }
       })
       .catch(() => {});
@@ -358,12 +456,14 @@ export const AppProvider: React.FC<{
     );
     setActiveFinancialYearId(id);
     if (businessId && id) {
-      financialYearsApi.activate(businessId, id).catch(() => {
+      financialYearsApi.activate(businessId, id).catch((err) => {
         addNotification({
           type: "error",
           title: "Could Not Switch Year",
           message:
-            "The active financial year could not be saved to the server. Reload the app to revert.",
+            err instanceof Error && err.message
+              ? err.message
+              : "The active financial year could not be saved to the server. Reload the app to revert.",
           icon: "error",
         });
       });
@@ -389,7 +489,11 @@ export const AppProvider: React.FC<{
   const defaultSubscription = (): SubscriptionState => defaultSubscriptionState();
 
   // SINGLE source of truth for subscription state (active plan, status, billing dates,
-  // pending checkout selection). Persisted as one account-scoped key.
+  // pending checkout selection). This is a server-authoritative working copy: the
+  // backend subscription (billingApi.getSubscription) is the source of truth, and
+  // nothing here is written to localStorage â€” storage hydration was retired and
+  // readStorage always returns the fallback, so the local object never round-trips
+  // client-side persistence. Subscription/entitlement enforcement lives on the server.
   const [subscription, setSubscription] = useState<SubscriptionState>(() => {
     if (!activeAccountId) return defaultSubscription();
     const saved = readStorage<SubscriptionState>(
@@ -429,8 +533,8 @@ export const AppProvider: React.FC<{
     return defaultSubscription();
   });
 
-  // Explicit subscription lifecycle: loading → ready | error. This is distinct
-  // from status "none" — it represents "server answer pending" vs "server
+  // Explicit subscription lifecycle: loading â†’ ready | error. This is distinct
+  // from status "none" â€” it represents "server answer pending" vs "server
   // confirmed no paid subscription". The billing page uses this to render
   // skeleton during loading and an error panel on failure, never falsely Free.
   //
@@ -446,18 +550,94 @@ export const AppProvider: React.FC<{
   const [subscriptionReloadKey, setSubscriptionReloadKey] = useState(0);
   const retrySubscription = () => setSubscriptionReloadKey((k) => k + 1);
 
+  // PLAN CATALOG â€” DB-driven (ADMIN-AUTHORITATIVE model, Phase 9C). The catalog
+  // the customer surfaces see is fetched from GET /api/billing/plans (active
+  // plans only), NOT the static PLAN_CATALOG. The static catalog is only the
+  // offline/demo fallback shown when the server is unreachable; a successful
+  // fetch always replaces it. Admin edits/deactivations therefore reflect for
+  // customers automatically (deactivated plans disappear; edited limits update).
+  //
+  // SAFETY: succeeded responses with ZERO plans are ignored (never render an
+  // empty catalog when the baseline Free plan exists) â€” status "ready" with the
+  // existing catalog retained. Unknown admin plan ids are preserved end-to-end.
+  const [planCatalog, setPlanCatalog] = useState<SubscriptionPlan[]>(SUBSCRIPTION_PLANS);
+  const [planCatalogStatus, setPlanCatalogStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [planCatalogReloadKey, setPlanCatalogReloadKey] = useState(0);
+  // Ref mirror so the subscription-sync effect (registered once) always reads
+  // the LATEST catalog without a dependency reshuffle on every fetch.
+  const planCatalogRef = useRef(planCatalog);
+  useEffect(() => {
+    planCatalogRef.current = planCatalog;
+  }, [planCatalog]);
+  const retryPlanCatalog = () => {
+    setPlanCatalogStatus("loading");
+    setPlanCatalogReloadKey((k) => k + 1);
+  };
+
+  // Financial-domain hydration lifecycle. Mirrors the subscription/plan-catalog
+  // pattern (loading | ready | error) for every backend-listed domain so
+  // consumers can distinguish "loading", "successfully empty", "successfully
+  // populated", and "failed (previous data retained)". Kept separately from the
+  // collections themselves; a reload key is user-triggered via retryDomains()
+  // and re-runs the EXISTING *.list(businessId) calls â€” no second fetch
+  // architecture is introduced.
+  const initialDomainHydration: Record<DomainHydrationKey, DomainHydrationStatus> = {
+    customers: "loading",
+    products: "loading",
+    invoices: "loading",
+    quotations: "loading",
+    estimates: "loading",
+    purchaseOrders: "loading",
+    expenses: "loading",
+    vehicles: "loading",
+    team: "loading",
+    notifications: "loading",
+  };
+  const [domainHydration, setDomainHydration] = useState<
+    Record<DomainHydrationKey, DomainHydrationStatus>
+  >(initialDomainHydration);
+  const [domainsReloadKey, setDomainsReloadKey] = useState(0);
+  const setDomainStatus = (domain: DomainHydrationKey, status: DomainHydrationStatus) => {
+    setDomainHydration((prev) => ({ ...prev, [domain]: status }));
+  };
+  // User-triggered only: reruns the existing list operations on next effect pass.
+  const retryDomains = () => setDomainsReloadKey((k) => k + 1);
+
+  useEffect(() => {
+    if (!businessId) return;
+    let active = true;
+    billingApi
+      .listPlans()
+      .then(({ plans }) => {
+        if (!active) return;
+        const next = toSubscriptionPlans(plans);
+        if (next.length > 0) {
+          setPlanCatalog(next);
+          planCatalogRef.current = next;
+        }
+        setPlanCatalogStatus("ready");
+      })
+      .catch(() => {
+        if (!active) return;
+        setPlanCatalogStatus("error");
+      });
+    return () => {
+      active = false;
+    };
+  }, [businessId, planCatalogReloadKey]);
+
   // ACTIVE plan derived from subscription state (a failed/cancelled payment keeps
   // the previous plan active; only a successful payment switches it).
-  // `getEffectivePlan` NEVER returns null for a valid account — when there is no
+  // `getEffectivePlan` NEVER returns null for a valid account â€” when there is no
   // paid plan it resolves to the Free (base) plan, so entitlements like customers
   // 2 / products 5 / team 0 / invoices 5 correctly govern instead of collapsing
   // to 0 (which previously surfaced as misleading "allows up to 0 X" messages).
-  const activePlan = getEffectivePlan(subscription);
+  const activePlan = getEffectivePlan(subscription, planCatalog);
 
   // Backend subscription sync: once the webhook activates a paid subscription,
   // the server is authoritative. `billingApi.getSubscription` returns the ACTIVE
   // subscription (or null when the business has none), and only activation is
-  // applied here — a paid plan never reverts below the Free plan, and a missing
+  // applied here â€” a paid plan never reverts below the Free plan, and a missing
   // answer (backend down / still PENDING) leaves the current state untouched.
   useEffect(() => {
     if (!businessId) return;
@@ -467,14 +647,14 @@ export const AppProvider: React.FC<{
       .then((data) => {
         if (!active) return;
         setSubscription((prev) =>
-          resolveServerSubscription(prev, data?.subscription),
+          resolveServerSubscription(prev, data?.subscription, planCatalogRef.current),
         );
         setSubscriptionLifecycle({ businessId, status: "ready" });
       })
       .catch(() => {
         if (!active) return;
         setSubscriptionLifecycle({ businessId, status: "error" });
-        // Do NOT touch subscription state — keep whatever we had.
+        // Do NOT touch subscription state â€” keep whatever we had.
       });
     return () => {
       active = false;
@@ -489,8 +669,21 @@ export const AppProvider: React.FC<{
   const notifyEntitlementBlocked = (kind: LimitKind, result: EntitlementResult) => {
     const planName = activePlan?.name ?? "your current plan";
     let message: string;
-    if (kind === "invoices") {
-      message = `You've used all ${result.limit} invoices allowed by ${planName} this month. Upgrade your plan to create more.`;
+    if (
+      kind === "invoices" ||
+      kind === "estimates" ||
+      kind === "quotations" ||
+      kind === "purchaseOrders"
+    ) {
+      const noun =
+        kind === "invoices"
+          ? "invoices"
+          : kind === "estimates"
+          ? "estimates"
+          : kind === "quotations"
+          ? "quotations"
+          : "purchase orders";
+      message = `You've used all ${result.limit} ${noun} allowed by ${planName} this month. Upgrade your plan to create more.`;
     } else {
       const label =
         kind === "customers"
@@ -509,7 +702,19 @@ export const AppProvider: React.FC<{
     addNotification({
       type: "warning",
       title: `${capitalize(
-        kind === "directoryListing" ? "directory listing" : kind === "invoices" ? "invoice" : kind === "teamMembers" ? "team member" : kind
+        kind === "directoryListing"
+          ? "directory listing"
+          : kind === "invoices"
+          ? "invoice"
+          : kind === "estimates"
+          ? "estimate"
+          : kind === "quotations"
+          ? "quotation"
+          : kind === "purchaseOrders"
+          ? "purchase order"
+          : kind === "teamMembers"
+          ? "team member"
+          : kind
       )} limit reached`,
       message,
       icon: "workspace_premium",
@@ -541,6 +746,43 @@ export const AppProvider: React.FC<{
     id: string;
     target: "quotation" | "invoice";
   } | null>(null);
+
+  // Synchronous mirror of `convertingDocument`, used as the actual
+  // double-submit guard.
+  //
+  // React state is NOT a reliable guard against a double click: two clicks
+  // dispatched in the same tick both read the same (stale) `convertingDocument`
+  // and both proceed, because `setConvertingDocument` has not been applied yet.
+  // A ref is updated during the event handler, so the second click observes the
+  // first one immediately.
+  //
+  // UX ONLY. The server remains authoritative: it re-checks the source
+  // document's conversion marker inside the create transaction under the
+  // Business-row lock, so a duplicate submission can never create a second
+  // document even if this guard is bypassed.
+  const convertingRef = useRef<string | null>(null);
+
+  // True when `id` is already being converted. Synchronous (ref-based).
+  const isConvertingDoc = (id: string) => convertingRef.current === id;
+
+  // ------------------------------------------------------------------
+  // STATUS TRANSITION single-flight guard
+  //
+  // A status change is now a real server round-trip (it used to be a local
+  // setState that never persisted). Two guards are used for the same reason as
+  // conversion above:
+  //   * `transitioningDocument` drives the disabled/loading UI;
+  //   * `transitioningRef` is the synchronous double-submit guard, because two
+  //     clicks in one tick both observe stale React state.
+  //
+  // UX ONLY. The server reads the document's CURRENT status from the database
+  // and rejects an illegal edge, so a duplicate or forged request can never
+  // move the stored status.
+  const [transitioningDocument, setTransitioningDocument] = useState<{
+    id: string;
+  } | null>(null);
+  const transitioningRef = useRef<string | null>(null);
+  const isTransitioningDoc = (id: string) => transitioningRef.current === id;
 
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>(() =>
     readStorage<PurchaseOrder[]>(activeAccountId ? dataKey(activeAccountId, "purchaseOrders") : "", [])()
@@ -601,9 +843,73 @@ export const AppProvider: React.FC<{
   const purchaseOrderSequence = getSequence(docSequences, activeFyId, "purchaseOrder");
   // Read-only per-FY sequence read so a date-derived number preview can use the
   // counter of the year the DATE falls in (stays internally consistent; the
-  // authoritative number is always minted server-side at submit).
+  // authoritative number is always allocated server-side inside the create
+  // transaction).
+  //
+  // This is a SERVER-DERIVED CACHE, not numbering authority. It is only ever
+  // populated by `syncServerSequence`; the localStorage seed above is retained
+  // solely so the first paint is not blank, and `isServerSequenceReady` below
+  // tells a form when that value has actually been confirmed by the server.
   const documentSequenceFor = (fyId: string | null, kind: SequenceKind): number =>
     getSequence(docSequences, fyId, kind);
+
+  // Which (fyId, kind) counters have been confirmed by the server. A form must
+  // not render a number for a pair that is not in here: before the server
+  // answers, the only value available is the localStorage seed, which starts at
+  // 1 on a fresh browser and can be arbitrarily wrong (a quotation list ending
+  // at 003 used to preview as 001). Rendering that is exactly the bug this
+  // architecture removes, so a create form waits for the server instead.
+  const [serverSequences, setServerSequences] = useState<Record<string, number>>(
+    () => ({}),
+  );
+
+  const isServerSequenceReady = (fyId: string | null, kind: SequenceKind): boolean =>
+    !!fyId && serverSequences[`${fyId}:${kind}`] !== undefined;
+
+  // Reconcile ONE cached counter with the server's document_sequence row.
+  //
+  // This is a best-effort display aid only, and is deliberately narrow:
+  //   - one request for ONE kind (the form that is about to show a number), not
+  //     a four-kind sweep;
+  //   - never sent with a synthetic FY id (that is what produced the 404s);
+  //   - never awaited by anything. Opening a create form does not wait for it,
+  //     and a failure leaves the cached value untouched and the form usable.
+  // The authoritative number is allocated by the server inside the create
+  // transaction; this value can be stale the instant another user saves.
+  const syncServerSequence = useCallback(async (
+    fyId: string | null,
+    kind: SequenceKind,
+  ) => {
+    if (!businessId || !fyId) return;
+    // `financialYearForDate` mints a SYNTHETIC id ("fy-2026-2027") for a
+    // calendar year with no persisted row. That id is not in the database, so
+    // asking the server about it produced a 404. Only a backend-minted id is
+    // ever sent.
+    if (isSyntheticFinancialYearId(fyId)) return;
+    try {
+      const res = await apiFetch<{ nextNumber: number }>(
+        `/api/sequences/next?financialYearId=${encodeURIComponent(fyId)}&kind=${encodeURIComponent(kind)}`,
+        { businessId },
+      );
+      const value = Number(res.nextNumber);
+      if (!Number.isFinite(value) || value <= 0) return;
+      // Mark this (fyId, kind) as server-confirmed BEFORE publishing the value,
+      // so a form can never render a preview derived from the local seed.
+      setServerSequences((prev) => {
+        const key = `${fyId}:${kind}`;
+        if (prev[key] === value) return prev;
+        return { ...prev, [key]: value };
+      });
+      setDocSequences((prev) => {
+        const current = prev[fyId] ?? {};
+        if (current[kind] === value) return prev;
+        return { ...prev, [fyId]: { ...current, [kind]: value } };
+      });
+    } catch {
+      // A failed preview must never blank a usable counter, and must never
+      // block creation. The server remains authoritative at create time.
+    }
+  }, [businessId]);
 
   // Most-recently deleted entity, kept in memory so the user can Undo a
   // customer / product / invoice deletion from its toast before leaving.
@@ -614,7 +920,7 @@ export const AppProvider: React.FC<{
 
   
 
-  const addNotification = (notif: { type: NotificationItem["type"]; title: string; message: string; icon?: string; iconColor?: string }) => {
+  const addNotification = (notif: { type: NotificationItem["type"]; title: string; message: string; icon?: IconName; iconColor?: string }) => {
     const newNotif: NotificationItem = {
       id: `notif-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
       type: notif.type,
@@ -628,9 +934,25 @@ export const AppProvider: React.FC<{
     setNotifications((prev) => [newNotif, ...prev.slice(0, 9)]);
   };
 
+  // Ids of notifications that are KNOWN to exist as backend rows (hydrated from
+  // GET /api/notifications in the Domain 13 effect). Local ephemeral toasts use
+  // `notif-â€¦` ids that have NO database row â€” calling DELETE/PATCH for them
+  // would 404. This set is the source of truth for "does a server call make
+  // sense here".
+  const backendNotificationIdsRef = useRef<Set<string>>(new Set());
+
   const removeNotification = (id: string) => {
     setNotifications((prev) => prev.filter((n) => n.id !== id));
-    void notificationsApi.dismiss(id).catch(() => {});
+    // Local toasts (notif-*) are not persisted and have no backend row â€”
+    // deliberately skipped (no DELETE). Backend rows are dismissed so the
+    // read-state survives a reload. The call is idempotent: if the row was
+    // already deleted server-side, the resulting 404 is expected and ignored.
+    if (!backendNotificationIdsRef.current.has(id)) return;
+    void notificationsApi.dismiss(id).catch((error) => {
+      if (error instanceof ApiError && error.status === 404) {
+        backendNotificationIdsRef.current.delete(id);
+      }
+    });
   };
 
   const markAllNotificationsRead = () => {
@@ -644,7 +966,12 @@ export const AppProvider: React.FC<{
     setNotifications((prev) =>
       prev.map((n) => (n.id === id ? { ...n, read: true } : n))
     );
-    void notificationsApi.markRead(id).catch(() => {});
+    if (!backendNotificationIdsRef.current.has(id)) return;
+    void notificationsApi.markRead(id).catch((error) => {
+      if (error instanceof ApiError && error.status === 404) {
+        backendNotificationIdsRef.current.delete(id);
+      }
+    });
   };
 
   const confirmDelete = (state: DeleteConfirmState) => {
@@ -659,9 +986,6 @@ export const AppProvider: React.FC<{
       case "customer":
         deleteCustomer(state.id);
         break;
-      case "invoice":
-        deleteInvoice(state.id);
-        break;
       case "expense":
         deleteExpense(state.id);
         break;
@@ -670,15 +994,6 @@ export const AppProvider: React.FC<{
         break;
       case "team":
         deleteTeamMember(state.id);
-        break;
-      case "quotation":
-        deleteQuotation(state.id);
-        break;
-      case "estimate":
-        deleteEstimate(state.id);
-        break;
-      case "purchaseOrder":
-        deletePurchaseOrder(state.id);
         break;
     }
     setDeleteConfirm(null);
@@ -718,7 +1033,7 @@ export const AppProvider: React.FC<{
     addNotification({
       type: "success",
       title: "Expense Recorded",
-      message: `Expense ${optimistic.expenseNumber} for ₹${optimistic.amount.toLocaleString("en-IN")} was saved successfully.`,
+      message: `Expense ${optimistic.expenseNumber} for â‚¹${optimistic.amount.toLocaleString("en-IN")} was saved successfully.`,
       icon: "check_circle",
     });
   };
@@ -977,7 +1292,7 @@ export const AppProvider: React.FC<{
     addNotification({
       type: "success",
       title: "Vehicle Expense Logged",
-      message: `₹${veData.amount.toLocaleString("en-IN")} for ${veData.vehicleRegistration} recorded.`,
+      message: `â‚¹${veData.amount.toLocaleString("en-IN")} for ${veData.vehicleRegistration} recorded.`,
       icon: "local_shipping",
     });
   };
@@ -1080,22 +1395,64 @@ export const AppProvider: React.FC<{
           .join(", "),
       };
     }
-    setCompanyProfile((prev) => ({ ...prev, ...merged }));
-    addNotification({
-      type: "success",
-      title: "Profile Updated",
-      message: "Company details updated successfully.",
-      icon: "check_circle",
-    });
+    const prev = companyProfile;
+    const next: CompanyProfile = { ...prev, ...merged };
+    setCompanyProfile(next);
+
+    // No business scope yet (onboarding wizard pre-tenant): local-only update.
+    // Once the tenant is created, completeOnboarding persists the full profile
+    // so nothing is lost on reload.
+    if (!businessId) {
+      addNotification({
+        type: "success",
+        title: "Profile Updated",
+        message: "Company details updated successfully.",
+        icon: "check_circle",
+      });
+      return;
+    }
+
+    // Server-authoritative persistence: on success the response returns the
+    // normalized profile (whitelisted + trimmed server-side) which REPLACES the
+    // optimistic merge; on failure the optimistic change is reverted so the UI
+    // never shows un-persisted data as if it were saved.
+    void (async () => {
+      try {
+        const res = await http.patch<{ companyProfile?: Record<string, unknown> }>(
+          `/api/businesses/${businessId}`,
+          next,
+        );
+        if (res?.companyProfile && typeof res.companyProfile === "object") {
+          setCompanyProfile((p) => ({ ...p, ...res.companyProfile }));
+        }
+        addNotification({
+          type: "success",
+          title: "Profile Updated",
+          message: "Company details updated successfully.",
+          icon: "check_circle",
+        });
+      } catch (error) {
+        setCompanyProfile(prev);
+        addNotification({
+          type: "error",
+          title: "Could Not Update Profile",
+          message:
+            error instanceof ApiError
+              ? error.message
+              : "Company details could not be saved. Your change was reverted.",
+          icon: "error",
+        });
+      }
+    })();
   };
 
   // NOTE: No arbitrary `changePlan` mutation is exposed. A plan may only change
   // via the checkout/payment flow (`setPendingPlan` + `completePayment("success")`)
-  // which the account owner/admin drives — a user cannot silently hand-switch to
+  // which the account owner/admin drives â€” a user cannot silently hand-switch to
   // a paid plan or override plan limits. (Admin assignment arrives in the
   // backend phase via `fetchPlanCatalog` / the subscription API.)
 
-  // Set a checkout selection. THIS DOES NOT activate the plan — only a successful
+  // Set a checkout selection. THIS DOES NOT activate the plan â€” only a successful
   // payment via completePayment("success") may change the active plan.
   const setPendingPlan = (planId: SubscriptionPlan["id"] | null, period: "month" | "year" = "month") => {
     setSubscription((prev) =>
@@ -1112,7 +1469,7 @@ export const AppProvider: React.FC<{
     const planId = subscription?.pendingPlanId;
     const period = subscription?.pendingPeriod ?? "month";
     if (!planId) return;
-    const plan = SUBSCRIPTION_PLANS.find((p) => p.id === planId);
+    const plan = planCatalog.find((p) => p.id === planId);
     if (!plan) return;
     const baseAmount = computeAmount(plan, period);
     const gstRate = 18;
@@ -1161,9 +1518,9 @@ export const AppProvider: React.FC<{
     }
   };
 
-  // Records a refund REQUEST in the frontend demo. It does NOT grant or move a
-  // refund — that requires a production payment processor. Only successful,
-  // still-refundable (not yet re-requested) payments can be flagged.
+  // Records a refund REQUEST in the app. It does NOT grant or move a refund â€”
+  // that is handled by the payments/support flow against the payment partner.
+  // Only successful, still-refundable (not yet re-requested) payments can be flagged.
   const requestRefund = (paymentId: string, reason: string): boolean => {
     let found = false;
     setPaymentHistory((h) =>
@@ -1189,14 +1546,16 @@ export const AppProvider: React.FC<{
     return found;
   };
 
-const addInvoice = async (
+  // Fix C: see addEstimate. Awaits the server and returns the persisted record.
+  // The entitlement gate is unchanged and still short-circuits with `failed`.
+  const addInvoice = async (
     invData: Omit<Invoice, "id">,
-  ): Promise<Invoice | null> => {
+  ): Promise<InvoiceCreateResult> => {
     const used = countCurrentPeriodInvoices(invoices, subscription);
     const gate = checkEntitlement(activePlan, "invoices", used);
     if (!gate.allowed) {
       notifyEntitlementBlocked("invoices", gate);
-      return null;
+      return { status: "failed" };
     }
     const tempId = makeId("inv");
     const optimistic: Invoice = {
@@ -1222,7 +1581,7 @@ const addInvoice = async (
     if (!businessId || !activeFyId) {
       revert();
       failed();
-      return null;
+      return { status: "failed" };
     }
 
     try {
@@ -1237,7 +1596,7 @@ const addInvoice = async (
       if (!created?.id) {
         revert();
         failed();
-        return null;
+        return { status: "failed" };
       }
       const persisted = fromBackendInvoice(created);
       setInvoices((prev) =>
@@ -1249,58 +1608,191 @@ const addInvoice = async (
         message: `Invoice ${persisted.invoiceNumber} generated for ${persisted.customerName}.`,
         icon: "description",
       });
-      return persisted;
-    } catch {
+      return { status: "created", invoice: persisted };
+    } catch (error) {
       revert();
-      failed();
-      return null;
+      // A business-scoped invoice-number collision is surfaced as a dedicated
+      // dialog (Try Another Number / Cancel) rather than a generic toast.
+      const duplicate = error instanceof ApiError && error.status === 409;
+      if (duplicate) {
+        addNotification({
+          type: "error",
+          title: "Invoice Number Already Exists",
+          message: `Invoice #${optimistic.invoiceNumber} is already in use in this business. Please choose another invoice number.`,
+          icon: "error",
+        });
+      } else if (error instanceof ApiError && error.status === 400) {
+        // A 400 carries a specific business-rule message — most importantly the
+        // insufficient-stock rejection ("Widget A available 5, requested 10"),
+        // which is actionable. Show it verbatim instead of a generic failure.
+        addNotification({
+          type: "error",
+          title: "Could Not Save Invoice",
+          message: error.message,
+          icon: "error",
+        });
+      } else {
+        failed();
+      }
+      return { status: duplicate ? "duplicate" : "failed" };
     }
   };
 
-  const updateInvoice = (invoice: Invoice) => {
-    setInvoices((prev) =>
-      prev.map((inv) => (inv.id === invoice.id ? invoice : inv))
-    );
-    addNotification({
-      type: "info",
-      title: "Invoice Updated",
-      message: `Invoice ${invoice.invoiceNumber} was updated.`,
-      icon: "description",
-    });
+  // DOCUMENT-EDIT RULE: the ONLY post-creation edits are the invoice number and
+  // the product / quantity / price of its lines. This sends a strict narrow
+  // patch ({ invoiceNumber?, items }) via toUpdateInput — never a spread of the
+  // invoice — and resolves `true` only on server confirmation so the caller can
+  // close the edit modal on success. Totals and snapshot fields are excluded:
+  // the server re-snapshots products and recomputes every total. Any other edit
+  // intent (customer, dates, notes/terms, status) is not part of this path.
+  const updateInvoice = async (invoice: Invoice): Promise<boolean> => {
+    const number = invoice.invoiceNumber?.trim() ?? "";
+    if (!number) {
+      addNotification({
+        type: "error",
+        title: "Invoice Number Required",
+        message: "The invoice number cannot be empty.",
+        icon: "error",
+      });
+      return false;
+    }
+    if (!businessId) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Invoice",
+        message: "You are not connected to a business workspace.",
+        icon: "error",
+      });
+      return false;
+    }
+
+    const prev = invoices.find((inv) => inv.id === invoice.id) ?? invoice;
+
+    try {
+      const { invoice: updated } = await invoicesApi.update(
+        businessId,
+        invoice.id,
+        toUpdateInput(invoice),
+      );
+      if (!updated?.id) return false;
+      setInvoices((list) =>
+        list.map((inv) =>
+          inv.id === updated.id ? fromBackendInvoice(updated) : inv,
+        ),
+      );
+      addNotification({
+        type: "success",
+        title: "Invoice Updated",
+        message: `Invoice ${updated.invoiceNumber} was updated and its totals recalculated.`,
+        icon: "description",
+      });
+      return true;
+    } catch (error) {
+      // No optimistic write happened here; keep the store consistent anyway
+      // and surface the server's message (e.g. duplicate number -> 409).
+      setInvoices((list) =>
+        list.map((inv) => (inv.id === invoice.id ? prev : inv)),
+      );
+      addNotification({
+        type: "error",
+        title: "Could Not Update Invoice",
+        message:
+          error instanceof ApiError
+            ? error.message
+            : `Invoice ${number} could not be updated.`,
+        icon: "error",
+      });
+      return false;
+    }
   };
 
-  const updateInvoiceStatus = (id: string, status: Invoice["status"]) => {
-    setInvoices((prev) =>
-      prev.map((inv) => (inv.id === id ? { ...inv, status } : inv))
-    );
-    addNotification({
-      type: "info",
-      title: "Invoice Status Updated",
-      message: `Invoice status updated to ${status}.`,
-      icon: "info",
-    });
+  // Authoritative status transition (F4). The status is NOT set locally: the
+  // server owns the lifecycle, reads the CURRENT status from the database,
+  // validates the edge against INVOICE_STATUS_TRANSITIONS and only then writes.
+  // On success the row is replaced with the server's authoritative document; on
+  // failure nothing changes locally and the real server error is surfaced.
+  const updateInvoiceStatus = async (
+    id: string,
+    status: Invoice["status"],
+  ): Promise<boolean> => {
+    if (!businessId || !isPersistedId(id)) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          "This invoice is still being saved. Try the status change again in a moment.",
+        icon: "error",
+      });
+      return false;
+    }
+    if (isTransitioningDoc(id)) return false;
+    transitioningRef.current = id;
+    setTransitioningDocument({ id });
+
+    try {
+      const { invoice: updated } = await invoicesApi.transitionStatus(
+        businessId,
+        id,
+        status,
+      );
+      if (updated?.id) {
+        setInvoices((prev) =>
+          prev.map((inv) =>
+            inv.id === updated.id ? fromBackendInvoice(updated) : inv,
+          ),
+        );
+      }
+      addNotification({
+        type: "success",
+        title: "Invoice Status Updated",
+        message: `Invoice status updated to ${updated?.status ?? status}.`,
+        icon: "receipt",
+      });
+      return true;
+    } catch (error) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          error instanceof ApiError
+            ? error.message
+            : "The status could not be updated. No change was saved.",
+        icon: "error",
+      });
+      return false;
+    } finally {
+      if (transitioningRef.current === id) transitioningRef.current = null;
+      // If a DIFFERENT document's transition started while this one was in
+      // flight, keep that one's loading indicator/disabled state alive instead
+      // of nulling the indicator for the wrong row.
+      setTransitioningDocument(
+        transitioningRef.current ? { id: transitioningRef.current } : null,
+      );
+    }
   };
 
-  const deleteInvoice = (id: string) => {
-    const target = invoices.find((inv) => inv.id === id);
-    setInvoices((prev) => prev.filter((inv) => inv.id !== id));
-    if (target) setLastDeleted({ kind: "invoice", item: target });
-    addNotification({
-      type: "info",
-      title: "Invoice Removed",
-      message: target
-        ? `Invoice ${target.invoiceNumber} has been deleted.`
-        : "Invoice has been deleted.",
-      icon: "info",
-    });
-  };
+  // NOTE: there is no deleteInvoice. Invoices are not deletable in any status:
+  // the server rejects DELETE unconditionally, so a local-state "removal" would
+  // only make the row disappear until the next reload while the record still
+  // existed â€” a false success. A mistaken invoice is corrected through its
+  // status (e.g. cancel it), never erased.
 
   // ------------------------------------------------------------------
   // QUOTATIONS
   // ------------------------------------------------------------------
+  // Fix C: see addEstimate. Awaits the server and returns the persisted record.
   const addQuotation = async (
     quotationData: Omit<Quotation, "id" | "createdAt">,
   ): Promise<Quotation | null> => {
+    // Client-side gate: mirror the invoice create â€” refuse before the optimistic
+    // insert when the plan's monthly quotation quota is exhausted. The server
+    // remains the authoritative check.
+    const used = countCurrentPeriodInvoices(quotations, subscription);
+    const gate = checkEntitlement(activePlan, "quotations", used);
+    if (!gate.allowed) {
+      notifyEntitlementBlocked("quotations", gate);
+      return null;
+    }
     const tempId = makeId("quot");
     const optimistic: Quotation = {
       ...quotationData,
@@ -1357,43 +1849,89 @@ const addInvoice = async (
     }
   };
 
-  const updateQuotation = (quotation: Quotation) => {
-    setQuotations((prev) =>
-      prev.map((q) => (q.id === quotation.id ? quotation : q))
-    );
+  // DOCUMENT IMMUTABILITY (Phase 14): quotations are created-and-frozen. The
+  // only post-creation change is the status lifecycle (updateQuotationStatus).
+  // This guard replaces the old content-edit: any attempt to edit a quotation
+  // surfaces the rule and writes nothing to the server.
+  const updateQuotation = (_quotation: Quotation) => {
     addNotification({
-      type: "info",
-      title: "Quotation Updated",
-      message: `Quotation ${quotation.quotationNumber} was updated.`,
+      type: "error",
+      title: "Quotation Cannot Be Edited",
+      message:
+        "Quotations are immutable after creation; only the status can be updated.",
       icon: "request_quote",
     });
   };
 
-  const updateQuotationStatus = (id: string, status: QuotationStatus) => {
-    setQuotations((prev) =>
-      prev.map((q) => (q.id === id ? { ...q, status } : q))
-    );
-    addNotification({
-      type: "info",
-      title: "Quotation Status Updated",
-      message: `Quotation status updated to ${status}.`,
-      icon: "info",
-    });
+  // Authoritative status transition. Replaces the previous local-only setState
+  // (which displayed a status that was never persisted). The server reads the
+  // current status, validates the edge against QUOTATION_STATUS_TRANSITIONS and
+  // only then writes; success replaces the row from the server response, failure
+  // changes nothing and surfaces the real error.
+  const updateQuotationStatus = async (
+    id: string,
+    status: QuotationStatus,
+  ): Promise<boolean> => {
+    if (!businessId || !isPersistedId(id)) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          "This quotation is still being saved. Try the status change again in a moment.",
+        icon: "error",
+      });
+      return false;
+    }
+    if (isTransitioningDoc(id)) return false;
+    transitioningRef.current = id;
+    setTransitioningDocument({ id });
+
+    try {
+      const { quotation: updated } = await quotationsApi.transitionStatus(
+        businessId,
+        id,
+        status,
+      );
+      if (updated?.id) {
+        setQuotations((prev) =>
+          prev.map((q) =>
+            q.id === updated.id ? fromBackendQuotation(updated) : q,
+          ),
+        );
+      }
+      addNotification({
+        type: "success",
+        title: "Quotation Status Updated",
+        message: `Quotation status updated to ${updated?.status ?? status}.`,
+        icon: "receipt",
+      });
+      return true;
+    } catch (error) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          error instanceof ApiError
+            ? error.message
+            : "The status could not be updated. No change was saved.",
+        icon: "error",
+      });
+      return false;
+    } finally {
+      if (transitioningRef.current === id) transitioningRef.current = null;
+      // If a DIFFERENT document's transition started while this one was in
+      // flight, keep that one's loading indicator/disabled state alive instead
+      // of nulling the indicator for the wrong row.
+      setTransitioningDocument(
+        transitioningRef.current ? { id: transitioningRef.current } : null,
+      );
+    }
   };
 
-  const deleteQuotation = (id: string) => {
-    const target = quotations.find((q) => q.id === id);
-    setQuotations((prev) => prev.filter((q) => q.id !== id));
-    if (target) setLastDeleted({ kind: "quotation", item: target });
-    addNotification({
-      type: "info",
-      title: "Quotation Deleted",
-      message: target
-        ? `Quotation ${target.quotationNumber} has been deleted.`
-        : "Quotation has been deleted.",
-      icon: "info",
-    });
-  };
+  // NOTE: there is no deleteQuotation. Quotations are not deletable in any
+  // status: the server rejects DELETE unconditionally. A sent quotation that is
+  // no longer wanted is closed with Rejected or Expired via
+  // updateQuotationStatus, never erased.
 
   const advanceQuotationSequence = () => mintSequence("quotation").value;
 
@@ -1411,7 +1949,8 @@ const addInvoice = async (
     // A second click while this document is already being converted would
     // create a duplicate (and, from one source, both a quotation AND an
     // invoice). Scoped by source id so an unrelated document is not blocked.
-    if (convertingDocument && convertingDocument.id === id) return;
+    // The ref check is synchronous, so a same-tick double click is caught too.
+    if (isConvertingDoc(id)) return;
     const quotation = quotations.find((q) => q.id === id);
     if (!quotation || quotation.convertedInvoiceId) return;
     const used = countCurrentPeriodInvoices(invoices, subscription);
@@ -1488,6 +2027,7 @@ const addInvoice = async (
         company: companyProfile,
       });
       payload.sourceDocument = { type: "quotation", id: quotation.id };
+      convertingRef.current = id;
       setConvertingDocument({ id, target: "invoice" });
       void (async () => {
         try {
@@ -1496,6 +2036,7 @@ const addInvoice = async (
         } catch {
           fail();
         } finally {
+          if (convertingRef.current === id) convertingRef.current = null;
           setConvertingDocument(null);
         }
       })();
@@ -1507,9 +2048,23 @@ const addInvoice = async (
   // ------------------------------------------------------------------
   // ESTIMATES
   // ------------------------------------------------------------------
+  // Fix C: creation AWAITS the server and hands back the PERSISTED record, so a
+  // caller can never navigate to (or convert) the optimistic temp id. The
+  // optimistic row still appears immediately; it is swapped for the server
+  // record on success and removed on any failure - including a 2xx response
+  // that somehow carried no persisted id.
   const addEstimate = async (
     estimateData: Omit<Estimate, "id" | "createdAt">,
   ): Promise<Estimate | null> => {
+    // Client-side gate: mirror the invoice create â€” refuse before the optimistic
+    // insert when the plan's monthly estimate quota is exhausted. The server
+    // remains the authoritative check.
+    const used = countCurrentPeriodInvoices(estimates, subscription);
+    const gate = checkEntitlement(activePlan, "estimates", used);
+    if (!gate.allowed) {
+      notifyEntitlementBlocked("estimates", gate);
+      return null;
+    }
     const tempId = makeId("est");
     const optimistic: Estimate = {
       ...estimateData,
@@ -1568,43 +2123,89 @@ const addInvoice = async (
     }
   };
 
-  const updateEstimate = (estimate: Estimate) => {
-    setEstimates((prev) =>
-      prev.map((e) => (e.id === estimate.id ? estimate : e))
-    );
+  // DOCUMENT IMMUTABILITY (Phase 14): estimates are created-and-frozen. The
+  // only post-creation change is the status lifecycle (updateEstimateStatus).
+  // This guard replaces the old content-edit: any attempt to edit an estimate
+  // surfaces the rule and writes nothing to the server.
+  const updateEstimate = (_estimate: Estimate) => {
     addNotification({
-      type: "info",
-      title: "Estimate Updated",
-      message: `Estimate ${estimate.estimateNumber} was updated.`,
+      type: "error",
+      title: "Estimate Cannot Be Edited",
+      message:
+        "Estimates are immutable after creation; only the status can be updated.",
       icon: "receipt",
     });
   };
 
-  const updateEstimateStatus = (id: string, status: EstimateStatus) => {
-    setEstimates((prev) =>
-      prev.map((e) => (e.id === id ? { ...e, status } : e))
-    );
-    addNotification({
-      type: "info",
-      title: "Estimate Status Updated",
-      message: `Estimate status updated to ${status}.`,
-      icon: "info",
-    });
+  // Authoritative status transition. Replaces the previous local-only setState
+  // (which displayed a status that was never persisted). The server reads the
+  // current status, validates the edge against ESTIMATE_STATUS_TRANSITIONS and
+  // only then writes; success replaces the row from the server response, failure
+  // changes nothing and surfaces the real error.
+  const updateEstimateStatus = async (
+    id: string,
+    status: EstimateStatus,
+  ): Promise<boolean> => {
+    if (!businessId || !isPersistedId(id)) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          "This estimate is still being saved. Try the status change again in a moment.",
+        icon: "error",
+      });
+      return false;
+    }
+    if (isTransitioningDoc(id)) return false;
+    transitioningRef.current = id;
+    setTransitioningDocument({ id });
+
+    try {
+      const { estimate: updated } = await estimatesApi.transitionStatus(
+        businessId,
+        id,
+        status,
+      );
+      if (updated?.id) {
+        setEstimates((prev) =>
+          prev.map((e) =>
+            e.id === updated.id ? fromBackendEstimate(updated) : e,
+          ),
+        );
+      }
+      addNotification({
+        type: "success",
+        title: "Estimate Status Updated",
+        message: `Estimate status updated to ${updated?.status ?? status}.`,
+        icon: "receipt",
+      });
+      return true;
+    } catch (error) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          error instanceof ApiError
+            ? error.message
+            : "The status could not be updated. No change was saved.",
+        icon: "error",
+      });
+      return false;
+    } finally {
+      if (transitioningRef.current === id) transitioningRef.current = null;
+      // If a DIFFERENT document's transition started while this one was in
+      // flight, keep that one's loading indicator/disabled state alive instead
+      // of nulling the indicator for the wrong row.
+      setTransitioningDocument(
+        transitioningRef.current ? { id: transitioningRef.current } : null,
+      );
+    }
   };
 
-  const deleteEstimate = (id: string) => {
-    const target = estimates.find((e) => e.id === id);
-    setEstimates((prev) => prev.filter((e) => e.id !== id));
-    if (target) setLastDeleted({ kind: "estimate", item: target });
-    addNotification({
-      type: "info",
-      title: "Estimate Deleted",
-      message: target
-        ? `Estimate ${target.estimateNumber} has been deleted.`
-        : "Estimate has been deleted.",
-      icon: "info",
-    });
-  };
+  // NOTE: there is no deleteEstimate. Estimates are not deletable in any status:
+  // the server rejects DELETE unconditionally. A sent estimate that is no longer
+  // wanted is closed with Rejected or Expired via updateEstimateStatus, never
+  // erased.
 
   const advanceEstimateSequence = () => mintSequence("estimate").value;
 
@@ -1617,9 +2218,19 @@ const addInvoice = async (
     // A second click while this document is already being converted would
     // create a duplicate (and, from one source, both a quotation AND an
     // invoice). Scoped by source id so an unrelated document is not blocked.
-    if (convertingDocument && convertingDocument.id === id) return;
+    // The ref check is synchronous, so a same-tick double click is caught too.
+    if (isConvertingDoc(id)) return;
     const estimate = estimates.find((e) => e.id === id);
     if (!estimate || estimate.convertedQuotationId) return;
+    // Estimate -> Quotation consumes the DESTINATION counter (quotations), so it
+    // is gated exactly like a direct quotation create before the optimistic
+    // insert. The server remains the authoritative check.
+    const used = countCurrentPeriodInvoices(quotations, subscription);
+    const gate = checkEntitlement(activePlan, "quotations", used);
+    if (!gate.allowed) {
+      notifyEntitlementBlocked("quotations", gate);
+      return;
+    }
     const tempId = makeId("quot");
     const items: InvoiceItem[] = estimate.items.map((it) => ({ ...it }));
     const preview: Quotation = {
@@ -1683,6 +2294,7 @@ const addInvoice = async (
         company: companyProfile,
       });
       payload.sourceEstimateId = estimate.id;
+      convertingRef.current = id;
       setConvertingDocument({ id, target: "quotation" });
       void (async () => {
         try {
@@ -1691,6 +2303,7 @@ const addInvoice = async (
         } catch {
           fail();
         } finally {
+          if (convertingRef.current === id) convertingRef.current = null;
           setConvertingDocument(null);
         }
       })();
@@ -1708,7 +2321,8 @@ const addInvoice = async (
     // A second click while this document is already being converted would
     // create a duplicate (and, from one source, both a quotation AND an
     // invoice). Scoped by source id so an unrelated document is not blocked.
-    if (convertingDocument && convertingDocument.id === id) return;
+    // The ref check is synchronous, so a same-tick double click is caught too.
+    if (isConvertingDoc(id)) return;
     const estimate = estimates.find((e) => e.id === id);
     if (!estimate || estimate.convertedInvoiceId) return;
     const used = countCurrentPeriodInvoices(invoices, subscription);
@@ -1785,6 +2399,7 @@ const addInvoice = async (
         company: companyProfile,
       });
       payload.sourceDocument = { type: "estimate", id: estimate.id };
+      convertingRef.current = id;
       setConvertingDocument({ id, target: "invoice" });
       void (async () => {
         try {
@@ -1793,6 +2408,7 @@ const addInvoice = async (
         } catch {
           fail();
         } finally {
+          if (convertingRef.current === id) convertingRef.current = null;
           setConvertingDocument(null);
         }
       })();
@@ -1804,9 +2420,19 @@ const addInvoice = async (
   // ------------------------------------------------------------------
   // PURCHASE ORDERS
   // ------------------------------------------------------------------
+  // Fix C: see addEstimate. Awaits the server and returns the persisted record.
   const addPurchaseOrder = async (
     poData: Omit<PurchaseOrder, "id" | "createdAt">,
   ): Promise<PurchaseOrder | null> => {
+    // Client-side gate: mirror the invoice create â€” refuse before the optimistic
+    // insert when the plan's monthly purchase-order quota is exhausted. The
+    // server remains the authoritative check.
+    const used = countCurrentPeriodInvoices(purchaseOrders, subscription);
+    const gate = checkEntitlement(activePlan, "purchaseOrders", used);
+    if (!gate.allowed) {
+      notifyEntitlementBlocked("purchaseOrders", gate);
+      return null;
+    }
     const tempId = makeId("po");
     const optimistic: PurchaseOrder = {
       ...poData,
@@ -1863,43 +2489,89 @@ const addInvoice = async (
     }
   };
 
-  const updatePurchaseOrder = (po: PurchaseOrder) => {
-    setPurchaseOrders((prev) =>
-      prev.map((p) => (p.id === po.id ? po : p))
-    );
+  // DOCUMENT IMMUTABILITY (Phase 14): purchase orders are created-and-frozen.
+  // The only post-creation change is the status lifecycle
+  // (updatePurchaseOrderStatus). This guard replaces the old local-only edit:
+  // any attempt to edit a purchase order surfaces the rule and writes nothing.
+  const updatePurchaseOrder = (_po: PurchaseOrder) => {
     addNotification({
-      type: "info",
-      title: "Purchase Order Updated",
-      message: `Purchase Order ${po.poNumber} was updated.`,
+      type: "error",
+      title: "Purchase Order Cannot Be Edited",
+      message:
+        "Purchase orders are immutable after creation; only the status can be updated.",
       icon: "shopping_cart_checkout",
     });
   };
 
-  const updatePurchaseOrderStatus = (id: string, status: PurchaseOrderStatus) => {
-    setPurchaseOrders((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, status } : p))
-    );
-    addNotification({
-      type: "info",
-      title: "Purchase Order Status Updated",
-      message: `Purchase Order status updated to ${status}.`,
-      icon: "info",
-    });
+  // Authoritative status transition. Replaces the previous local-only setState
+  // (which displayed a status that was never persisted). The server reads the
+  // current status, validates the edge against PURCHASE_ORDER_STATUS_TRANSITIONS
+  // and only then writes; success replaces the row from the server response,
+  // failure changes nothing and surfaces the real error.
+  const updatePurchaseOrderStatus = async (
+    id: string,
+    status: PurchaseOrderStatus,
+  ): Promise<boolean> => {
+    if (!businessId || !isPersistedId(id)) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          "This purchase order is still being saved. Try the status change again in a moment.",
+        icon: "error",
+      });
+      return false;
+    }
+    if (isTransitioningDoc(id)) return false;
+    transitioningRef.current = id;
+    setTransitioningDocument({ id });
+
+    try {
+      const { purchaseOrder: updated } = await purchaseOrdersApi.transitionStatus(
+        businessId,
+        id,
+        status,
+      );
+      if (updated?.id) {
+        setPurchaseOrders((prev) =>
+          prev.map((p) =>
+            p.id === updated.id ? fromBackendPurchaseOrder(updated) : p,
+          ),
+        );
+      }
+      addNotification({
+        type: "success",
+        title: "Purchase Order Status Updated",
+        message: `Purchase Order status updated to ${updated?.status ?? status}.`,
+        icon: "receipt",
+      });
+      return true;
+    } catch (error) {
+      addNotification({
+        type: "error",
+        title: "Could Not Update Status",
+        message:
+          error instanceof ApiError
+            ? error.message
+            : "The status could not be updated. No change was saved.",
+        icon: "error",
+      });
+      return false;
+    } finally {
+      if (transitioningRef.current === id) transitioningRef.current = null;
+      // If a DIFFERENT document's transition started while this one was in
+      // flight, keep that one's loading indicator/disabled state alive instead
+      // of nulling the indicator for the wrong row.
+      setTransitioningDocument(
+        transitioningRef.current ? { id: transitioningRef.current } : null,
+      );
+    }
   };
 
-  const deletePurchaseOrder = (id: string) => {
-    const target = purchaseOrders.find((p) => p.id === id);
-    setPurchaseOrders((prev) => prev.filter((p) => p.id !== id));
-    if (target) setLastDeleted({ kind: "purchaseOrder", item: target });
-    addNotification({
-      type: "info",
-      title: "Purchase Order Deleted",
-      message: target
-        ? `Purchase Order ${target.poNumber} has been deleted.`
-        : "Purchase Order has been deleted.",
-      icon: "info",
-    });
-  };
+  // NOTE: there is no deletePurchaseOrder. Purchase orders are not deletable in
+  // any status: the server rejects DELETE unconditionally. A PO that is no
+  // longer wanted is closed with Cancelled via updatePurchaseOrderStatus, never
+  // erased.
 
   const advancePurchaseOrderSequence = () => mintSequence("purchaseOrder").value;
 
@@ -1946,30 +2618,17 @@ const addInvoice = async (
         } else {
           insertRaw();
         }
-      } else if (kind === "invoice") {
-        setInvoices((prev) => [(item as Invoice), ...prev]);
-      } else if (kind === "quotation") {
-        setQuotations((prev) => [item as Quotation, ...prev]);
-      } else if (kind === "estimate") {
-        setEstimates((prev) => [item as Estimate, ...prev]);
-      } else if (kind === "purchaseOrder") {
-        setPurchaseOrders((prev) => [item as PurchaseOrder, ...prev]);
       }
+      // NOTE: there are no invoice/estimate/quotation/purchaseOrder restore
+      // branches â€” those kinds are no longer part of DeleteEntityKind, because
+      // none of them can be deleted in the first place.
       addNotification({
         type: "success",
         title: "Restored",
         message:
           kind === "customer"
             ? `${(item as Customer).name} was restored.`
-            : kind === "product"
-              ? `${(item as Product).name} was restored.`
-              : kind === "invoice"
-                ? `Invoice ${(item as Invoice).invoiceNumber} was restored.`
-                : kind === "quotation"
-                  ? `Quotation ${(item as Quotation).quotationNumber} was restored.`
-                  : kind === "estimate"
-                    ? `Estimate ${(item as Estimate).estimateNumber} was restored.`
-                    : `Purchase Order ${(item as PurchaseOrder).poNumber} was restored.`,
+            : `${(item as Product).name} was restored.`,
         icon: "undo",
       });
     }
@@ -1977,9 +2636,9 @@ const addInvoice = async (
   };
 
   // Central mint: reconcile the financial-year state against today and return
-  // { value, fyName } for a NEW document of the given kind. Rollover — creating
+  // { value, fyName } for a NEW document of the given kind. Rollover â€” creating
   // a missing FY and/or moving the active FY forward when the current one has
-  // ended — runs HERE, immediately before every new document number is minted,
+  // ended â€” runs HERE, immediately before every new document number is minted,
   // so an app left open across 31-Mar-23:59 -> 1-Apr never mints a number in a
   // closed year. Idempotent: correct active FY -> no-op.
   const mintSequence = (kind: SequenceKind): { value: number; fyName: string; fyId: string | null } => {
@@ -2068,203 +2727,265 @@ const addInvoice = async (
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // Show the loading status for the duration of the fetch; setState here is
+    // intentional and synchronized with the async list below.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("customers", "loading");
     customersApi
       .list(businessId)
       .then((data) => {
-        if (active) setCustomers(data.customers ?? []);
+        if (!active) return;
+        setCustomers(data.customers ?? []);
+        setDomainStatus("customers", "ready");
       })
       .catch(() => {
-        // Backend unreachable: the previous local cache remains usable; the
-        // next write surfaces the API error as a notification.
+        // Backend unreachable: keep existing rows; expose the failure via
+        // domainHydration so an error is never mistaken for legitimately
+        // empty data.
+        if (!active) return;
+        setDomainStatus("customers", "error");
       });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 4: products are backend-authoritative. On a business scope change
   // the authoritative list is fetched; the response replaces the local cache.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("products", "loading");
     productsApi
       .list(businessId)
       .then((data) => {
-        if (active) setProducts(data.products ?? []);
+        if (!active) return;
+        setProducts(data.products ?? []);
+        setDomainStatus("products", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("products", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 6: invoices are backend-authoritative on a business scope change.
   // The authoritative list (totals + numbering minted server-side) replaces the
-  // local cache when the backend has rows; an empty backend (fresh account)
-  // leaves the local demo invoices in place so no data is ever wiped silently.
+  // local cache on success. A successful empty response clears the collection,
+  // so switching to a business/account with no invoices never leaves the
+  // previous account's rows visible; a failed request preserves existing rows.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("invoices", "loading");
     invoicesApi
       .list(businessId)
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.invoices) ? data.invoices : [];
-        if (rows.length > 0) {
-          setInvoices(rows.map(fromBackendInvoice));
-        }
+        setInvoices(rows.map(fromBackendInvoice));
+        setDomainStatus("invoices", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        // Keep any existing rows on failure; expose the error separately.
+        if (!active) return;
+        setDomainStatus("invoices", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
+
+  // NOTE: there is deliberately NO global "sync all sequences" effect here.
+  // An earlier version fetched invoice/quotation/estimate/PO counters on app
+  // bootstrap, business load and every domain reload, which produced a
+  // four-request storm on pages that never create a document and — before the
+  // synthetic-FY guard below — 404s while the authoritative FY was still
+  // loading. Number preview is not an application-level concern: it is requested
+  // lazily, only by the create form that is about to display a number, and
+  // creation never depends on it. The server allocates the authoritative number
+  // inside the create transaction regardless.
 
   // Domain 7: quotations are backend-authoritative on a business scope change.
   // The authoritative list (server-minted numbers, recomputed totals) replaces
-  // the local cache when the backend has rows.
+  // the local cache on success (including an empty result, for tenant safety).
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("quotations", "loading");
     quotationsApi
       .list(businessId)
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.quotations) ? data.quotations : [];
-        if (rows.length > 0) {
-          setQuotations(rows.map(fromBackendQuotation));
-        }
+        setQuotations(rows.map(fromBackendQuotation));
+        setDomainStatus("quotations", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("quotations", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 8: estimates are backend-authoritative on a business scope change.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("estimates", "loading");
     estimatesApi
       .list(businessId)
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.estimates) ? data.estimates : [];
-        if (rows.length > 0) {
-          setEstimates(rows.map(fromBackendEstimate));
-        }
+        setEstimates(rows.map(fromBackendEstimate));
+        setDomainStatus("estimates", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("estimates", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 9: purchase orders are backend-authoritative on a business scope change.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("purchaseOrders", "loading");
     purchaseOrdersApi
       .list(businessId)
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.purchaseOrders) ? data.purchaseOrders : [];
-        if (rows.length > 0) {
-          setPurchaseOrders(rows.map(fromBackendPurchaseOrder));
-        }
+        setPurchaseOrders(rows.map(fromBackendPurchaseOrder));
+        setDomainStatus("purchaseOrders", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("purchaseOrders", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 10: expenses are backend-authoritative on a business scope change.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("expenses", "loading");
     expensesApi
       .list(businessId)
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.expenses) ? data.expenses : [];
-        if (rows.length > 0) {
-          setExpenses(rows.map(fromBackendExpense));
-        }
+        setExpenses(rows.map(fromBackendExpense));
+        setDomainStatus("expenses", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("expenses", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 11: vehicles are backend-authoritative on a business scope change.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("vehicles", "loading");
     vehiclesApi
       .list(businessId)
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.vehicles) ? data.vehicles : [];
-        if (rows.length > 0) {
-          setVehicles(rows.map(fromBackendVehicle));
-        }
+        setVehicles(rows.map(fromBackendVehicle));
+        setDomainStatus("vehicles", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("vehicles", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 12: the team roster is backend-authoritative on a business scope change.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("team", "loading");
     teamApi
       .list(businessId)
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.members) ? data.members : [];
-        if (rows.length > 0) {
-          setTeamMembers(rows.map(fromBackendMember));
-        }
+        setTeamMembers(rows.map(fromBackendMember));
+        setDomainStatus("team", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("team", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   // Domain 13: the notification inbox is backend-authoritative once the caller
   // has a business scope. Ephemeral success/error toasts still render locally.
   useEffect(() => {
     if (!businessId) return;
     let active = true;
+    backendNotificationIdsRef.current = new Set();
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    setDomainStatus("notifications", "loading");
     notificationsApi
       .list({ businessId })
       .then((data) => {
         if (!active) return;
         const rows = Array.isArray(data.notifications) ? data.notifications : [];
-        if (rows.length > 0) {
-          setNotifications(rows.map(fromBackendNotification));
-        }
+        setNotifications(rows.map(fromBackendNotification));
+        backendNotificationIdsRef.current = new Set(rows.map((r) => r.id));
+        setDomainStatus("notifications", "ready");
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!active) return;
+        setDomainStatus("notifications", "error");
+      });
     return () => {
       active = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [businessId]);
+  }, [businessId, domainsReloadKey]);
 
   const addCustomer = (customer: Omit<Customer, "id">) => {
     const gate = checkEntitlement(activePlan, "customers", customers.length);
@@ -2465,150 +3186,6 @@ const addInvoice = async (
     });
   };
 
-  // OPERATIONAL reset only: clears all transactions/business records to zero but
-  // preserves the account's business setup (company profile, financial years,
-  // invoice configuration and subscription). This is the safe "I want a clean
-  // slate of records" action and never deletes account/business setup info.
-  const resetBusinessData = () => {
-    if (!activeAccountId) return;
-    setExpenses([]);
-    setVehicles([]);
-    setVehicleExpenses([]);
-    setTeamMembers([]);
-    setInvoices([]);
-    setQuotations([]);
-    setEstimates([]);
-    setPurchaseOrders([]);
-    setCustomers([]);
-    setProducts([]);
-    setNotifications([]);
-    setOpenModal(null);
-    setDeleteConfirm(null);
-    addNotification({
-      type: "success",
-      title: "Business Records Reset",
-      message:
-        "All transactions and business records were cleared to zero. Your business setup (profile, financial years, plan) was preserved.",
-      icon: "check_circle",
-    });
-  };
-
-  // FULL reset back to a brand-new account: wipes operational records AND the
-  // business setup (company profile, financial years, invoice config, onboarding
-  // state, subscription and payment history). Re-routes the user through the
-  // onboarding wizard on next navigation.
-  const resetEntireSetup = () => {
-    if (!activeAccountId) return;
-    const defaultFy = defaultFinancialYear();
-    setCompanyProfile(EMPTY_COMPANY_PROFILE);
-    setExpenses([]);
-    setVehicles([]);
-    setVehicleExpenses([]);
-    setTeamMembers([]);
-    setInvoices([]);
-    setQuotations([]);
-    setEstimates([]);
-    setPurchaseOrders([]);
-    setCustomers([]);
-    setProducts([]);
-    setNotifications([]);
-    setSubscription(defaultSubscription());
-    setPaymentHistory([]);
-    setFinancialYears([defaultFy]);
-    setActiveFinancialYearId(defaultFy.id);
-    setDocSequences({ [defaultFy.id]: { invoice: 1, quotation: 1, estimate: 1, purchaseOrder: 1 } });
-    setOnboarding({ completed: false, currentStep: 0 });
-    setOpenModal(null);
-    setDeleteConfirm(null);
-    addNotification({
-      type: "success",
-      title: "Setup Reset",
-      message: "Entire business setup cleared. You will be guided through onboarding again.",
-      icon: "check_circle",
-    });
-  };
-
-  const loadDemoData = () => {
-    if (!activeAccountId) return;
-    setCompanyProfile({ ...INITIAL_COMPANY_PROFILE });
-    setExpenses([...INITIAL_EXPENSES]);
-    setVehicles([...INITIAL_VEHICLES]);
-    setVehicleExpenses([...INITIAL_VEHICLE_EXPENSES]);
-    setTeamMembers([...INITIAL_TEAM_MEMBERS]);
-    setInvoices([...INITIAL_INVOICES]);
-    setCustomers([...INITIAL_CUSTOMERS]);
-    setProducts([...INITIAL_PRODUCTS]);
-    setNotifications([...INITIAL_NOTIFICATIONS]);
-    const now = Date.now();
-    const seedPayments: PaymentRecord[] = [
-      {
-        id: "PAY-2026-001",
-        date: new Date(now - 28 * 86400000).toISOString(),
-        planId: "business",
-        planName: "Business",
-        billingPeriod: "month",
-        baseAmount: 999,
-        gstRate: 18,
-        gstAmount: 179.82,
-        totalAmount: 1178.82,
-        method: "upi",
-        status: "success",
-        description: "BizLedger Business Subscription (1 Month)",
-      },
-      {
-        id: "PAY-2026-002",
-        date: new Date(now - 58 * 86400000).toISOString(),
-        planId: "business",
-        planName: "Business",
-        billingPeriod: "month",
-        baseAmount: 999,
-        gstRate: 18,
-        gstAmount: 179.82,
-        totalAmount: 1178.82,
-        method: "card",
-        status: "success",
-        description: "BizLedger Business Subscription (1 Month)",
-      },
-      {
-        id: "PAY-2026-003",
-        date: new Date(now - 2 * 86400000).toISOString(),
-        planId: "business",
-        planName: "Business",
-        billingPeriod: "month",
-        baseAmount: 999,
-        gstRate: 18,
-        gstAmount: 179.82,
-        totalAmount: 1178.82,
-        method: "upi",
-        status: "success",
-        description: "BizLedger Business Subscription (1 Month)",
-      },
-    ];
-    setPaymentHistory(seedPayments);
-    setSubscription({
-      currentPlanId: "business",
-      status: "active",
-      billing: {
-        period: "month",
-        startedAt: new Date(now - 28 * 86400000).toISOString(),
-        renewsAt: new Date(now + 2 * 86400000).toISOString(),
-        amount: 999,
-        gstRate: 18,
-        lastPaidAt: new Date(now).toISOString(),
-      },
-      pendingPlanId: null,
-      pendingPeriod: "month",
-    });
-    setOpenModal(null);
-    setDeleteConfirm(null);
-    addNotification({
-      type: "success",
-      title: "Demo Data Loaded",
-      message: "BizLedger has been populated with the sample demo dataset.",
-      icon: "check_circle",
-    });
-  };
-
   // Single-reliable usage snapshot for every entitlement resource, built once
   // and reused by the usage gauges, canCreateResource, and checkEntitlementFor.
   const resourceUsage: ResourceUsage = getUsage({
@@ -2619,6 +3196,12 @@ const addInvoice = async (
     // against the plan's teamMember ceiling instead of counting the owner.
     teamMembers: additionalTeamSeatsUsed(teamMembers),
     invoicesInPeriod: countCurrentPeriodInvoices(invoices, subscription),
+    estimatesInPeriod: countCurrentPeriodInvoices(estimates, subscription),
+    quotationsInPeriod: countCurrentPeriodInvoices(quotations, subscription),
+    purchaseOrdersInPeriod: countCurrentPeriodInvoices(
+      purchaseOrders,
+      subscription,
+    ),
     directoryListings:
       businessId && getMyDirectoryListingCache(businessId) ? 1 : 0,
   });
@@ -2658,6 +3241,8 @@ const addInvoice = async (
     ensureFinancialYearRollover,
     mintDocumentNumber,
     documentSequenceFor,
+  isServerSequenceReady,
+    syncServerSequence,
     onboarding,
     setOnboardingStep,
     completeOnboarding,
@@ -2668,10 +3253,14 @@ const addInvoice = async (
     setPendingPlan,
     completePayment,
     requestRefund,
-    plans: SUBSCRIPTION_PLANS,
+    plans: planCatalog,
     activePlan,
     subscriptionStatus,
     retrySubscription,
+    planCatalogStatus,
+    retryPlanCatalog,
+    domainHydration,
+    retryDomains,
     currentUsage: resourceUsage,
     canCreateResource: (kind: LimitKind) =>
       canCreate(activePlan, kind, usageForKind(resourceUsage, kind)),
@@ -2707,25 +3296,21 @@ const addInvoice = async (
     addInvoice,
     updateInvoice,
     updateInvoiceStatus,
-    deleteInvoice,
     invoiceSequence,
     advanceInvoiceSequence,
     addQuotation,
     updateQuotation,
     updateQuotationStatus,
-    deleteQuotation,
     quotationSequence,
     advanceQuotationSequence,
     addEstimate,
     updateEstimate,
     updateEstimateStatus,
-    deleteEstimate,
     estimateSequence,
     advanceEstimateSequence,
     addPurchaseOrder,
     updatePurchaseOrder,
     updatePurchaseOrderStatus,
-    deletePurchaseOrder,
     purchaseOrderSequence,
     advancePurchaseOrderSequence,
     convertQuotationToInvoice,
@@ -2734,10 +3319,10 @@ const addInvoice = async (
     // UI-only: which conversion request is in flight, for the detail view's
     // button spinner + processing overlay.
     convertingDocument,
+    // UI-only: which status transition is in flight, so the detail view can
+    // disable its status control immediately and show a busy state.
+    transitioningDocument,
     restoreLastDeleted,
-    resetBusinessData,
-    resetEntireSetup,
-    loadDemoData,
   };
 
   return (

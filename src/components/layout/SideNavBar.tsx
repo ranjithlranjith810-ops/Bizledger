@@ -2,8 +2,10 @@
 
 import React, { useEffect } from "react";
 import { usePathname, useRouter } from "next/navigation";
-import { navigationSections } from "@/lib/constants";
+import { navigationSections, ROUTES } from "@/lib/constants";
+import { useAuth } from "@/context/AuthContext";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
+import { Icon } from "../ui/Icon";
 
 export interface SideNavBarProps {
   collapsed?: boolean;
@@ -46,13 +48,10 @@ function NavItems({
                     : "text-secondary hover:bg-surface-container-low hover:text-on-surface"
                 } ${compact ? "justify-center px-0" : ""}`}
               >
-                <span
-                  className={`material-symbols-outlined text-[20px] shrink-0 ${
-                    isActive ? "text-primary fill" : "text-secondary"
-                  }`}
-                >
-                  {item.icon}
-                </span>
+                <Icon
+                  name={item.icon}
+                  className={`text-[20px] shrink-0 ${isActive ? "text-primary fill" : "text-secondary"}`}
+                />
                 {!compact && (
                   <span className="truncate flex-1 text-left">{item.label}</span>
                 )}
@@ -83,6 +82,7 @@ export const SideNavBar: React.FC<SideNavBarProps> = ({
 }) => {
   const pathname = usePathname();
   const router = useRouter();
+  const { account } = useAuth();
   const currentPath = pathname;
 
   const handleNavigate = (path: string) => {
@@ -134,22 +134,37 @@ export const SideNavBar: React.FC<SideNavBarProps> = ({
         </div>
 
         {/* User Profile Footer */}
-        <div id="sidebar-user-footer" className="p-3 border-t border-outline-variant/20 bg-surface-container-lowest">
-          <div className={`flex items-center gap-3 p-2 rounded-lg hover:bg-surface-container-low transition-colors cursor-pointer ${collapsed ? "justify-center" : ""}`}>
+        <button
+          id="sidebar-user-footer"
+          type="button"
+          onClick={() => handleNavigate(ROUTES.settings)}
+          title="Open settings"
+          aria-label="Open account settings"
+          className={`block w-full p-3 border-t border-outline-variant/20 bg-surface-container-lowest hover:bg-surface-container-low transition-colors ${
+            collapsed ? "" : "text-left"
+          }`}
+        >
+          <div className={`flex items-center gap-3 ${collapsed ? "justify-center" : ""}`}>
             <div className="w-8 h-8 rounded-full bg-secondary-container text-on-secondary-container flex items-center justify-center font-semibold text-xs shrink-0">
-              AM
+              {account?.name
+                ? account.name.charAt(0).toUpperCase()
+                : "U"}
             </div>
             {!collapsed && (
               <div className="flex-1 min-w-0">
-                <p className="text-xs font-semibold text-on-surface truncate">Alex Mercer</p>
-                <p className="text-[10px] text-outline truncate">Account Admin</p>
+                <p className="text-xs font-semibold text-on-surface truncate">
+                  {account?.name || "Account"}
+                </p>
+                <p className="text-[10px] text-outline truncate">
+                  {account?.businessName || "Account Admin"}
+                </p>
               </div>
             )}
             {!collapsed && (
-              <span className="material-symbols-outlined text-outline text-[18px]">unfold_more</span>
+              <Icon name="settings" className="text-outline text-[18px]" />
             )}
           </div>
-        </div>
+        </button>
       </aside>
 
       {/* Mobile drawer — same shared navigation as desktop, in an overlay.
@@ -179,7 +194,7 @@ export const SideNavBar: React.FC<SideNavBarProps> = ({
                 className="p-1.5 rounded-md text-secondary hover:text-on-surface hover:bg-surface-container-low transition-colors"
                 aria-label="Close menu"
               >
-                <span className="material-symbols-outlined text-[20px]">close</span>
+                <Icon name="close" className="text-[20px]" />
               </button>
             </div>
             <div id="mobile-drawer-navigation-items" className="flex-1 overflow-y-auto px-3 py-4 space-y-6">

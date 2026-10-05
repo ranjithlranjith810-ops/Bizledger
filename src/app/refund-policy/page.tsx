@@ -4,10 +4,11 @@ import { REFUND_WINDOW_DAYS, LEGAL } from "@/config/legal";
 const SECTIONS = [
   {
     heading: "1. Overview",
-    body: `This policy describes refunds and cancellations for paid BizLedger subscription plans operated by ${LEGAL.entityName}. It is guided by Indian consumer-protection norms and, where applicable, RBI guidance on payments. IMPORTANT: BizLedger is currently a frontend demo build. Payments are SIMULATED and do not charge your bank account or wallet. There is therefore no real money to refund until a production payment processor is integrated.`,
+    body: `This policy describes refunds and cancellations for paid BizLedger subscription plans operated by ${LEGAL.entityName}. It is guided by Indian consumer-protection norms and, where applicable, RBI guidance on payments.`,
     items: [
-      "The refund mechanisms below describe intended policy for the production service.",
-      "In the demo, the in-app \"Request Refund\" flow records your request locally for demonstration only; it does not move money.",
+      "Refunds are credited back to the original payment method through our payment partner.",
+      "The in-app \"Request Refund\" flow records your request immediately for review.",
+      "Refund processing and grant/denial decisions are handled by our support team.",
     ],
   },
   {
@@ -19,7 +20,7 @@ const SECTIONS = [
     items: [
       "Open Subscription & Billing, choose the relevant paid invoice, and tap Request Refund.",
       "Provide a short reason. Your request is recorded immediately.",
-      "Refund processing and grant/denial decisions require a production backend and will be communicated to you as described below.",
+      "Our support team reviews your request and communicates the outcome using the contact details on file.",
     ],
   },
   {
@@ -27,8 +28,8 @@ const SECTIONS = [
     table: {
       rows: [
         { label: "Eligible requests", value: `Within ${REFUND_WINDOW_DAYS} days of purchase, or as required by applicable law.` },
-        { label: "Refund method", value: "Credit back to the original payment method (needs a production payment processor)." },
-        { label: "Processing time", value: "Typically within a reasonable time after approval; exact timelines will be published before launch." },
+        { label: "Refund method", value: "Credit back to the original payment method through our payment partner." },
+        { label: "Processing time", value: "Typically within a reasonable time after approval; exact timelines are published in the app." },
         { label: "Other subscriptions", value: "Downgrades take effect at the next billing cycle; the unused remaining period may be refunded pro-rata at our discretion." },
       ],
     },

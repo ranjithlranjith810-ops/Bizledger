@@ -22,7 +22,7 @@ import {
   ResourceNotFoundError,
   ConflictError,
 } from "@/lib/business/api-error";
-import { assertFeature } from "@/lib/billing/entitlements-server";
+import { assertFeature, assertCreateAllowed } from "@/lib/billing/entitlements-server";
 import { allocateDocumentNumber } from "@/lib/sequence/sequence-service";
 import { buildDocumentNumber } from "@/lib/invoice";
 import {
@@ -41,12 +41,13 @@ import {
   sellerStateCode,
   rejectProtectedKeys,
   QUOTATION_STATUSES,
+  QUOTATION_STATUS_TRANSITIONS,
+  isLegalTransition,
 } from "@/lib/sales-document/shared";
-import type { QuotationStatusT, PricingModeT } from "@/lib/sales-document/shared";
+import type { QuotationStatusT } from "@/lib/sales-document/shared";
 import type { Prisma } from "@/generated/prisma/client";
 import {
   assertFinancialYearActive,
-  assertDocumentDateInFinancialYear,
   financialYearForBusinessDate,
 } from "@/lib/financial-year/financial-year-service";
 
@@ -306,6 +307,36 @@ export async function createQuotation(
       // server-side inside this transaction (business-row lock → resolve
       // effective plan → deny only when the plan EXPLICITLY sets it false/0).
       await assertFeature(tx, businessId, "quotations");
+
+      // The plan's quotation monthly quota is then enforced numerically in the
+      // same transaction (separate usage counter from invoices/estimates/POs),
+      // so a plan that enables the quotation feature is still capped at its
+      // `quotationsPerMonth` ceiling. Both checks take the Business-row lock.
+      await assertCreateAllowed(tx, businessId, "quotations");
+
+      // Conversion guard, AUTHORITATIVE and in-transaction.
+      //
+      // `assertFeature` above takes the same exclusive Business-row lock as the
+      // numeric gate, so competing conversions of one source serialize behind
+      // this transaction. The pre-transaction read of the estimate is only a
+      // fast path: two concurrent conversions both see
+      // `convertedQuotationId = null` there and would both insert a quotation
+      // (two documents from one estimate). Re-reading after the lock, in the
+      // same transaction that creates the quotation, lets exactly one win —
+      // and because the marker is already written in this transaction, the
+      // loser is guaranteed to observe it.
+      if (sourceEstimate && payload.sourceEstimateId) {
+        const lockedEstimate = await tx.estimate.findFirst({
+          where: { id: payload.sourceEstimateId, businessId },
+          select: { convertedQuotationId: true },
+        });
+        if (lockedEstimate?.convertedQuotationId) {
+          throw new ValidationError(
+            "Estimate has already been converted to a quotation",
+          );
+        }
+      }
+
       const allocated = await allocateDocumentNumber(
         businessId,
         fyId,
@@ -419,6 +450,14 @@ export async function getQuotation(
 }
 
 // Identity/numbering and conversion-linkage fields are immutable once minted.
+//
+// `status` is deliberately NOT PATCH-settable, matching the Invoice rule
+// (INVOICE_PROTECTED_KEYS + the explicit status rejection in updateInvoice):
+// status is a lifecycle fact, not a form field. Accepting an arbitrary
+// client-chosen status on PATCH would let a caller assert "Accepted" or
+// "Rejected" with no corresponding event having occurred, and — because the
+// status also decided whether the old DELETE policy would allow removal —
+// would couple a forged status to record destruction.
 const QUOTATION_PROTECTED_KEYS = [
   "id",
   "businessId",
@@ -428,6 +467,7 @@ const QUOTATION_PROTECTED_KEYS = [
   "updatedAt",
   "prefix",
   "quotationPrefix",
+  "status",
   "sourceEstimateId",
   "convertedInvoiceId",
   "convertedInvoiceNumber",
@@ -435,10 +475,12 @@ const QUOTATION_PROTECTED_KEYS = [
 ] as const;
 
 /**
- * PATCH — operational edit of a member's quotation (whitelist-only; totals
- * recomputed server-side). Snapshots are historical: the customer snapshot is
- * refreshed only when `customerId` changes, the company snapshot only when
- * `company` is explicitly supplied. Conversion fields are engine-owned.
+ * PATCH — immutable after creation. A quotation is created-and-frozen: none of
+ * its content fields may be edited through the ordinary PATCH. The ONLY
+ * post-creation change is the status lifecycle (transitionQuotationStatus). Any
+ * payload field supplied here is rejected (400) rather than silently ignored,
+ * so a stale edit form surfaces its failure instead of pretending success.
+ * An empty PATCH is a harmless no-op returning the current document.
  */
 export async function updateQuotation(
   businessIdInput: unknown,
@@ -447,10 +489,21 @@ export async function updateQuotation(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
-  const business = ctx.business;
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
+  // Identity/conversion/status guard: `status` is a lifecycle fact owned by the
+  // status endpoint, never a PATCH-settable field. `quotationNumber` and the
+  // conversion markers are engine-owned and immutable.
   rejectProtectedKeys(raw, QUOTATION_PROTECTED_KEYS);
+
+  // Mass-assignment guard: NOTHING is editable on PATCH. Any residual key (i.e.
+  // any content field a client tried to change) aborts the request.
+  const contentKeys = Object.keys(raw);
+  if (contentKeys.length > 0) {
+    throw new ValidationError(
+      `Quotations are immutable after creation; ${contentKeys.join(", ")} cannot be changed. Only the status can be updated, through the quotation status endpoint.`,
+    );
+  }
 
   const existing = await prisma.quotation.findFirst({
     where: { id, businessId },
@@ -458,167 +511,54 @@ export async function updateQuotation(
   });
   if (!existing) throw new ResourceNotFoundError("Quotation not found");
 
-  const hasItems = raw.items !== undefined;
-  const items = hasItems
-    ? normalizeItems(raw.items, "quotation")
-    : existing.items.map((it) => ({
-        productId: it.productId,
-        productName: it.productName,
-        sku: it.sku,
-        hsnSac: it.hsnSac,
-        unit: it.unit,
-        quantity: Number(it.quantity),
-        rate: Number(it.rate),
-        gstRate: Number(it.gstRate),
-      }));
+  return toQuotationJson(existing);
+}
 
-  const pricingMode =
-    raw.pricingMode !== undefined
-      ? normalizePricingMode(str(raw.pricingMode) ?? "")
-      : (existing.pricingMode as PricingModeT);
+/**
+ * STATUS LIFECYCLE — the only path that changes a quotation's status.
+ *
+ * Mirrors transitionInvoiceStatus in the Invoice service (the repository's
+ * reference implementation): authorize first, then load the document scoped to
+ * the authorized business so the CURRENT status is read from the database and
+ * never from the request body, validate the requested edge against
+ * QUOTATION_STATUS_TRANSITIONS, and only then write. An illegal edge — including
+ * any jump out of a terminal status — is rejected with 409 and the row is left
+ * exactly as it was.
+ *
+ * `requestedStatus` is a request to move, not an assignment. `status` remains
+ * rejected on the ordinary updateQuotation PATCH body.
+ *
+ * No edit-lock semantics are introduced; the repository defines none for
+ * quotations, so updateQuotation's behaviour is unchanged.
+ */
+export async function transitionQuotationStatus(
+  businessIdInput: unknown,
+  idInput: unknown,
+  requestedStatus: unknown,
+) {
+  const businessId = validateBusinessId(businessIdInput);
+  const id = validateId(idInput);
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
-  let placeOfSupplyCode = String(existing.placeOfSupplyCode ?? "").trim();
-  if (raw.placeOfSupplyCode !== undefined) {
-    const s = str(raw.placeOfSupplyCode) ?? "";
-    if (s && !/^\d{2}$/.test(s)) {
-      throw new ValidationError("placeOfSupplyCode must be a 2-digit state code");
-    }
-    placeOfSupplyCode = s;
-  }
+  const target = normalizeStatus(str(requestedStatus) ?? "");
 
-  const totals = computeDocumentTotals(
-    items,
-    pricingMode,
-    sellerStateCode(business),
-    placeOfSupplyCode,
-  );
+  const existing = await prisma.quotation.findFirst({
+    where: { id, businessId },
+    select: { id: true, status: true },
+  });
+  if (!existing) throw new ResourceNotFoundError("Quotation not found");
 
-  const productIds = [
-    ...new Set(items.map((it) => it.productId).filter((v): v is string => v !== null)),
-  ];
-  const found =
-    productIds.length > 0
-      ? await prisma.product.findMany({
-          where: { id: { in: productIds }, businessId },
-          select: { id: true, name: true, sku: true, hsnSac: true, unit: true },
-        })
-      : [];
-  if (found.length !== productIds.length) {
-    throw new ResourceNotFoundError("One or more products were not found");
-  }
-  const productById = Object.fromEntries(found.map((p) => [p.id, p]));
-
-  const data: Prisma.QuotationUncheckedUpdateInput = {
-    taxType: totals.taxType,
-    placeOfSupplyCode: totals.placeOfSupplyCode || null,
-    subtotal: totals.subtotal,
-    taxableAmount: totals.taxableAmount,
-    cgst: totals.cgst,
-    sgst: totals.sgst,
-    igst: totals.igst,
-    totalTax: totals.totalTax,
-    grandTotal: totals.grandTotal,
-  };
-
-  if (raw.status !== undefined) {
-    data.status = normalizeStatus(str(raw.status) ?? "");
-  }
-  if (raw.pricingMode !== undefined) {
-    data.pricingMode = normalizePricingMode(str(raw.pricingMode) ?? "");
-  }
-  if (raw.notes !== undefined) {
-    const s = shortText(raw.notes, "notes");
-    data.notes = s ?? null;
-  }
-  if (raw.terms !== undefined) {
-    const s = shortText(raw.terms, "terms");
-    data.terms = s ?? null;
-  }
-  if (raw.placeOfSupply !== undefined) {
-    data.placeOfSupply = str(raw.placeOfSupply) ?? null;
-  }
-  if (raw.quotationDate !== undefined || raw.date !== undefined) {
-    const s = str(raw.quotationDate ?? raw.date);
-    const d = requiredIsoDate(s, "quotationDate");
-    // F11 — the quotation's financial-year binding is immutable; a changed date
-    // must stay inside it (no cross-FY draft moves).
-    await assertDocumentDateInFinancialYear(
-      businessId,
-      existing.financialYearId,
-      d,
-      "Quotation",
+  if (
+    !isLegalTransition(QUOTATION_STATUS_TRANSITIONS, existing.status, target)
+  ) {
+    throw new ConflictError(
+      `Quotation cannot transition from ${existing.status} to ${target}`,
     );
-    data.quotationDate = d;
   }
-  if (raw.validUntil !== undefined) {
-    const s = str(raw.validUntil);
-    if (s) {
-      const d = new Date(s);
-      if (Number.isNaN(d.getTime())) throw new ValidationError("validUntil is not a valid date");
-      data.validUntil = d;
-    } else {
-      data.validUntil = null;
-    }
-  }
-
-  // Snapshot policy (same as Invoice): party change refreshes the customer
-  // snapshot; explicit `company` refreshes the seller snapshot.
-  if (raw.customerId !== undefined) {
-    const customerId = validateId(raw.customerId, "customerId is invalid");
-    const customer = await prisma.customer.findFirst({
-      where: { id: customerId, businessId },
-    });
-    if (!customer) throw new ResourceNotFoundError("Customer not found");
-    data.customerId = customer.id;
-    data.customerSnapshot = buildCustomerSnapshot(customer) as Prisma.InputJsonValue;
-  }
-  if (raw.company !== undefined) {
-    if (raw.company !== null && typeof raw.company !== "object") {
-      throw new ValidationError("company must be a company snapshot object or null");
-    }
-    // A refresh is still opt-in, but the snapshot is always rebuilt from the
-    // authoritative stored profile - never from the request body.
-    data.companySnapshot = buildCompanySnapshot(
-      companyProfileRecord(business),
-    ) as Prisma.InputJsonValue;
-  }
-
-  const rewriteItems =
-    hasItems ||
-    pricingMode !== existing.pricingMode ||
-    placeOfSupplyCode !== String(existing.placeOfSupplyCode ?? "").trim();
 
   const updated = await prisma.quotation.update({
     where: { id },
-    data: rewriteItems
-      ? {
-          ...data,
-          items: {
-            deleteMany: {},
-            create: items.map((it, idx) => {
-              const line = totals.lines[idx];
-              const prod = it.productId ? productById[it.productId] : undefined;
-              return {
-                productId: it.productId,
-                productName: it.productName || (prod ? prod.name : it.productName),
-                sku: it.sku || (prod ? prod.sku : null),
-                hsnSac: it.hsnSac || (prod ? prod.hsnSac : null),
-                unit: it.unit || (prod ? prod.unit : "Pcs"),
-                quantity: it.quantity,
-                rate: it.rate,
-                pricingMode,
-                gstRate: it.gstRate,
-                taxableAmount: line.taxable,
-                cgst: line.cgst,
-                sgst: line.sgst,
-                igst: line.igst,
-                taxAmount: line.taxAmount,
-                totalAmount: line.totalAmount,
-              };
-            }),
-          },
-        }
-      : data,
+    data: { status: target },
     include: quotationInclude(),
   });
 
@@ -626,34 +566,32 @@ export async function updateQuotation(
 }
 
 /**
- * DELETE — physical removal allowed ONLY for Draft quotations. An issued
- * quotation (Sent/Accepted/Rejected/Expired) is protected with a 409 (the
- * caller should use Rejected/Expired instead), and a quotation that was
- * converted into an invoice is ALWAYS protected because that would corrupt the
- * conversion history.
+ * DELETE — NEVER. Quotations are not deletable in ANY status, by ANY user,
+ * through ANY API.
+ *
+ * This supersedes the earlier policy, which permitted physical removal of a
+ * Draft quotation. A draft has already consumed a QT- number from its
+ * DocumentSequence for the pinned financial year, so removing it leaves a
+ * permanent gap in an auditable numbering run — and, when the quotation is the
+ * source of a conversion, it would also orphan the destination invoice's
+ * provenance (`convertedInvoiceId` is SetNull on delete, leaving a dangling
+ * `convertedInvoiceNumber`).
+ *
+ * The route is kept (rather than removed) for API compatibility, but it can
+ * only ever reach this rejection: `prisma.quotation.delete` and `deleteMany`
+ * are NOT called from anywhere in the application. A quotation that was sent
+ * and is no longer wanted is closed with Rejected or Expired, never erased.
+ *
+ * Authorization is still evaluated FIRST, so an unauthenticated caller gets 401
+ * and a caller without `invoices.delete` on the business gets 403. Only an
+ * authorized caller reaches the 409.
  */
 export async function deleteQuotation(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  const id = validateId(idInput);
+  validateId(idInput);
   await requireBusinessPermission(businessId, "invoices", "delete");
 
-  const existing = await prisma.quotation.findFirst({
-    where: { id, businessId },
-    select: { id: true, status: true, convertedInvoiceId: true },
-  });
-  if (!existing) throw new ResourceNotFoundError("Quotation not found");
-
-  if (existing.status !== "Draft") {
-    throw new ConflictError(
-      "Only draft quotations can be deleted; issued quotations must be rejected or expired",
-    );
-  }
-  if (existing.convertedInvoiceId) {
-    throw new ConflictError(
-      "Quotation has been converted to an invoice and cannot be deleted",
-    );
-  }
-
-  await prisma.quotation.delete({ where: { id } });
-  return { id };
+  throw new ConflictError(
+    "Quotations cannot be deleted. Reject or expire the quotation instead.",
+  );
 }

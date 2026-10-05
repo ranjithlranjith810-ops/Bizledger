@@ -12,6 +12,8 @@
 import "server-only";
 import { NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
+import { resolveIpAddressConfig } from "@/lib/auth/trust-config";
+import { getClientIpFromRequest } from "@/lib/auth/client-ip";
 
 export interface RateLimitDecision {
   allowed: boolean;
@@ -27,6 +29,9 @@ export const APP_RATE_LIMITS = {
   "team-invite": { window: 60, max: 10 },
   "expense-approve": { window: 60, max: 30 },
   "invoice-status": { window: 60, max: 60 },
+  "estimate-status": { window: 60, max: 60 },
+  "quotation-status": { window: 60, max: 60 },
+  "purchase-order-status": { window: 60, max: 60 },
   "directory-save": { window: 60, max: 30 },
   "directory-submit": { window: 300, max: 5 },
   "directory-unlist": { window: 60, max: 10 },
@@ -58,17 +63,40 @@ export async function enforceRateLimit(
 }
 
 /**
- * Resolve the caller IP for rate limiting. Trusts the first `x-forwarded-for`
- * hop (the platform proxy writes it on ingress). In local dev/tests there is
- * no proxy, so fall back to a stable per-process identifier — the limiter
- * still works, it just keys all dev traffic together.
+ * Resolve the caller IP for rate limiting.
+ *
+ * SECURITY: this must never let an external client choose its own rate-limit
+ * identity. It previously trusted the FIRST `x-forwarded-for` token, which is
+ * precisely the client-controlled end of the chain — every standard proxy
+ * (nginx `$proxy_add_x_forwarded_for`, AWS ALB, Vercel, Cloudflare) APPENDS the
+ * real connecting address to whatever the client sent, so a caller could send
+ * `X-Forwarded-For: <anything>` and receive a fresh bucket on every request,
+ * defeating team-invite, checkout, directory-submit and admin-mutation
+ * throttling outright.
+ *
+ * The trust decision is delegated to `resolveIpAddressConfig` — the SAME pure
+ * function and the SAME `TRUSTED_PROXIES` value that configure Better Auth's
+ * limiter in `@/lib/auth` — so the two can never disagree about which proxies
+ * are trusted. `@/lib/auth/client-ip` then walks the chain right-to-left and
+ * returns the first hop that is not a trusted proxy.
+ *
+ * Fail-closed: when no trustworthy address can be established (production with
+ * no proxy declared, a malformed header, or a chain of nothing but proxies) the
+ * caller shares ONE bucket. That over-throttles; it never under-throttles.
+ *
+ * Local development keeps Better Auth's documented behavior (a single-value
+ * header is honored, else a stable per-process identifier) so the throttling
+ * suites can still isolate runs with `X-Forwarded-For`.
  */
 export function getClientIp(request: Request): string {
-  const forwarded = request.headers.get("x-forwarded-for");
-  if (forwarded) {
-    const first = forwarded.split(",")[0]?.trim();
-    if (first) return first;
-  }
+  const config = resolveIpAddressConfig(
+    process.env.NODE_ENV ?? "development",
+    process.env.TRUSTED_PROXIES,
+  );
+  const resolved = getClientIpFromRequest(request, config);
+  if (resolved) return resolved;
+  // No trustworthy client IP: collapse to a single shared bucket for this
+  // bucket name. Never fall back to a client-supplied header value.
   return process.env.NODE_ENV === "development" ? "dev-local" : "unknown";
 }
 

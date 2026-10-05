@@ -31,6 +31,9 @@ import {
 } from "@/lib/business/business-service";
 import {
   MEMBER_ROLES,
+  canGrantRole,
+  effectivePermissions,
+  findPermissionEscalations,
   mergePermissions,
   roleDefaultPermissions,
   type AuthzRole,
@@ -212,6 +215,44 @@ export async function inviteTeamMember(businessIdInput: unknown, raw: Record<str
   assertActiveMember(ctx);
 
   const data = normalizeInviteInput(raw);
+
+  // Privilege-escalation guard: only a business OWNER may grant the OWNER role
+  // (mirrors the revoke rule "only an owner can remove another owner"). Without
+  // this, an ADMIN caller could mint a new OWNER membership via invite.
+  if (!canGrantRole(ctx.membership.role, data.role)) {
+    throw new ForbiddenError("Only an owner can grant the owner role");
+  }
+
+  // Privilege-escalation guard for the PARALLEL `permissions` channel.
+  // `canGrantRole` above bounds the `role` field only. The override was, until
+  // now, merged onto the target role's baseline with no ceiling at all, so any
+  // actor in ["OWNER", "ADMIN"] could hand out an arbitrary allowlisted
+  // permission — including `settings.edit` (GSTIN / bank account numbers /
+  // subscription) which the ADMIN baseline deliberately withholds, and including
+  // permissions that lift a STAFF seat above its documented baseline.
+  //
+  // Rule: an override may DELEGATE only what the actor already holds
+  // (actor effective permissions = role baseline merged with the actor's own
+  // stored override). Requesting `false` is always allowed — narrowing a seat
+  // is never an escalation. The target role's baseline is left untouched: the
+  // checks above already decide whether the actor may grant that role at all.
+  const requestedOverride =
+    raw.permissions === undefined || raw.permissions === null
+      ? null
+      : assertPlainObject(raw.permissions);
+  if (requestedOverride) {
+    const actorPermissions = effectivePermissions(
+      ctx.membership.role as AuthzRole,
+      ctx.membership.permissions,
+    );
+    const escalations = findPermissionEscalations(requestedOverride, actorPermissions);
+    if (escalations.length > 0) {
+      const first = escalations[0];
+      throw new ForbiddenError(
+        `You cannot grant '${first.module}.${first.action}' — your own role does not have that permission`,
+      );
+    }
+  }
 
   const created = await prisma.$transaction(
     async (tx) => {

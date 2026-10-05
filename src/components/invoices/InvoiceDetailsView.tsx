@@ -1,9 +1,18 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
+import { Invoice } from "@/types";
 import { sumStoredInvoiceTotals } from "@/lib/invoice";
+import { invoicesApi, fromBackendInvoice } from "@/lib/api/invoices";
+import { isTemporaryId } from "@/lib/optimistic-id";
+import { ApiError } from "@/lib/api-client";
+import { nextInvoiceStatuses } from "@/lib/sales-document/status-transitions";
+import {
+  renderGstInvoicePdf,
+  invoicePdfFilename,
+} from "@/lib/invoice/gst-invoice-pdf";
 import {
   resolveGstSupportInfo,
   resolveInvoiceTerms,
@@ -17,43 +26,168 @@ import {
   Share2,
   CheckCircle2,
   Landmark,
+  LoaderCircle,
   Pencil,
   Truck,
 } from "lucide-react";
 
 export const InvoiceDetailsView: React.FC = () => {
-  const { invoices, companyProfile, updateInvoiceStatus, addNotification } =
-    useApp();
+  const {
+    invoices,
+    companyProfile,
+      updateInvoiceStatus,
+      addNotification,
+      activeBusinessId,
+      transitioningDocument,
+    } = useApp();
   const router = useRouter();
   const params = useParams<{ id: string }>();
   const [editing, setEditing] = useState(false);
+  const [downloadingPdf, setDownloadingPdf] = useState(false);
+  const [pdfError, setPdfError] = useState<string | null>(null);
+  const [fetchResult, setFetchResult] = useState<{
+    id: string;
+    record: Invoice | null;
+    error: "missing" | "error" | null;
+  } | null>(null);
 
-  const invoice =
-    invoices.find((inv) => inv.id === params.id) || invoices[0];
+  // Fix C: the `|| invoices[0]` fallback silently rendered the WRONG invoice -
+  // a bad id showed another customer's invoice instead of an error. The id from
+  // the route is now authoritative, with a real fetch when state is empty.
+  const invoiceFromState = invoices.find((inv) => inv.id === params.id);
+  const current = fetchResult?.id === params.id ? fetchResult : null;
+  const invoice = invoiceFromState ?? current?.record ?? null;
+  const fetchStatus: "idle" | "loading" | "saving" | "missing" | "error" = (() => {
+    if (invoiceFromState) return "idle";
+    if (isTemporaryId(params.id)) return "saving";
+    if (!activeBusinessId) return "idle";
+    if (current === null) return "loading";
+    return current.error ?? "idle";
+  })();
 
-  const displayedTotals = sumStoredInvoiceTotals(invoice?.items || []);
+  useEffect(() => {
+    if (invoiceFromState) return;
+    if (isTemporaryId(params.id)) return;
+    if (!activeBusinessId) return;
+    let cancelled = false;
+    invoicesApi
+      .get(activeBusinessId, params.id)
+      .then((r) => fromBackendInvoice(r.invoice))
+      .then((record) => {
+        if (cancelled) return;
+        setFetchResult({ id: params.id, record, error: null });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setFetchResult({
+          id: params.id,
+          record: null,
+          error: err instanceof ApiError && err.status === 404 ? "missing" : "error",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [invoiceFromState, activeBusinessId, params.id]);
+
+  if (!invoice) {
+    let message = "Invoice not found.";
+    if (fetchStatus === "loading")
+      message = "Syncing your invoice data from the server.";
+    else if (fetchStatus === "saving")
+      message = "This invoice is still being saved...";
+    else if (fetchStatus === "error")
+      message = "This invoice could not be loaded.";
+    return (
+      <div className="space-y-6 animate-in fade-in max-w-4xl mx-auto">
+        <button
+          onClick={() => router.push("/invoices")}
+          className="p-2 bg-white border border-[#eceef0] hover:bg-gray-100 text-gray-600 rounded-xl transition-colors shadow-xs"
+          title="Back to Invoices"
+        >
+          <ArrowLeft className="w-5 h-5" />
+        </button>
+        <div className="bg-white rounded-2xl border border-[#eceef0] shadow-sm p-10 text-center space-y-2">
+          <div className="text-sm font-semibold text-gray-800">{message}</div>
+          {fetchStatus === "loading" && (
+            <div className="text-xs text-gray-500">
+              Syncing your invoice data from the server.
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const displayedTotals = sumStoredInvoiceTotals(invoice.items);
 
   const handlePrint = () => {
     window.print();
   };
 
-  const handleDownloadPdf = () => {
-    // No PDF library is bundled in this app, so the browser print dialog is
-    // the supported path to "Save as PDF" (choose PDF as the destination).
-    window.print();
+  // Download a real .pdf generated client-side from the SAME stored invoice
+  // and company-profile data the on-screen TAX-INVOICE document shows. This
+  // intentionally replaces the old "Print / Save as PDF" behaviour, which only
+  // opened the browser print dialog.
+  const handleDownloadPdf = async () => {
+    if (downloadingPdf) return;
+    setDownloadingPdf(true);
+    setPdfError(null);
+    try {
+      const bytes = await renderGstInvoicePdf(invoice, companyProfile);
+      const blob = new Blob([new Uint8Array(bytes)], { type: "application/pdf" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = invoicePdfFilename(invoice.invoiceNumber);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      // Revoke on a later tick so the browser keeps the download alive.
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      setPdfError(
+        err instanceof Error
+          ? err.message
+          : "Could not generate the PDF. Use Print instead."
+      );
+    } finally {
+      setDownloadingPdf(false);
+    }
   };
 
+  // Open a real WhatsApp chat pre-filled with the invoice summary + amount.
   const handleShare = () => {
-    addNotification({
-      type: "info",
-      title: "WhatsApp Invoice Link Dispatched",
-      message: `Digital invoice payment link sent to ${invoice.customerPhone}.`,
-    });
+    const phone = (invoice.customerPhone || "").replace(/\D/g, "");
+    const amount = new Intl.NumberFormat("en-IN", {
+      style: "currency",
+      currency: "INR",
+      maximumFractionDigits: 0,
+    }).format(invoice.grandTotal || 0);
+    const text = `BizLedger Invoice *${invoice.invoiceNumber}*\nCustomer: ${invoice.customerName}\nAmount: ${amount}`;
+    if (phone) {
+      window.open(`https://wa.me/${phone}?text=${encodeURIComponent(text)}`, "_blank");
+    } else {
+      addNotification({
+        type: "info",
+        title: "No phone number on this invoice",
+        message:
+          "Add a customer phone number, then Share via WhatsApp will open a chat.",
+      });
+    }
   };
 
-  const toggleStatus = () => {
-    const nextStatus = invoice.status === "Paid" ? "Pending" : "Paid";
-    updateInvoiceStatus(invoice.id, nextStatus);
+  // Invoice is the reference lifecycle. Options come from the SAME matrix
+  // transitionInvoiceStatus enforces, so the control can never offer an edge the
+  // server would reject (the previous hard-coded "Mark as Paid" toggle offered
+  // Draft -> Paid, which that matrix forbids). UX only; the server re-validates.
+  const nextStatusOptions: readonly string[] = nextInvoiceStatuses(
+    invoice.status,
+  );
+  const isTransitioning = transitioningDocument?.id === invoice.id;
+
+  const handleStatusChange = (status: string) => {
+    void updateInvoiceStatus(invoice.id, status as Invoice["status"]);
   };
 
   return (
@@ -93,19 +227,41 @@ export const InvoiceDetailsView: React.FC = () => {
 
         {/* Action Buttons */}
         <div className="flex items-center gap-2 flex-wrap">
-          <button
-            onClick={toggleStatus}
-            className={`px-3 py-2 rounded-lg text-xs font-semibold border transition-colors flex items-center gap-1.5 ${
-              invoice.status === "Paid"
-                ? "bg-amber-50 text-amber-800 border-amber-200 hover:bg-amber-100"
-                : "bg-emerald-50 text-emerald-800 border-emerald-200 hover:bg-emerald-100"
-            }`}
-          >
-            <CheckCircle2 className="w-3.5 h-3.5" />
-            <span>
-              {invoice.status === "Paid" ? "Mark as Pending" : "Mark as Paid"}
+          {/*
+            A terminal invoice (Paid / Cancelled) has no legal successor, so the
+            control is replaced by a read-only label instead of a dead button.
+          */}
+          {nextStatusOptions.length === 0 ? (
+            <span
+              className="px-3 py-2 rounded-lg text-xs font-semibold border border-[#eceef0] bg-white text-gray-500"
+              title={`${invoice.status} is a final status and cannot be changed`}
+            >
+              {invoice.status}
             </span>
-          </button>
+          ) : (
+            <div className="flex items-center gap-1.5">
+              <CheckCircle2 className="w-3.5 h-3.5 text-gray-500" />
+              <select
+                value={invoice.status}
+                onChange={(e) => handleStatusChange(e.target.value)}
+                disabled={isTransitioning}
+                aria-busy={isTransitioning}
+                className="px-3 py-2 rounded-lg text-xs font-semibold border border-emerald-200 bg-emerald-50 text-emerald-800 outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                title={
+                  isTransitioning
+                    ? "Saving status…"
+                    : `Change status (next: ${nextStatusOptions.join(", ")})`
+                }
+              >
+                <option value={invoice.status}>{invoice.status}</option>
+                {nextStatusOptions.map((s) => (
+                  <option key={s} value={s}>
+                    {s}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <button
             onClick={() => setEditing(true)}
@@ -133,14 +289,31 @@ export const InvoiceDetailsView: React.FC = () => {
 
           <button
             onClick={handleDownloadPdf}
-            className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-semibold shadow-xs transition-colors"
-            title="Print or save this invoice as a PDF"
+            disabled={downloadingPdf}
+            className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-semibold shadow-xs transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            title="Download this invoice as a PDF file"
           >
-            <Download className="w-4 h-4" />
-            <span>Print / Save as PDF</span>
+            {downloadingPdf ? (
+              <LoaderCircle className="w-4 h-4 animate-spin" />
+            ) : (
+              <Download className="w-4 h-4" />
+            )}
+            <span>{downloadingPdf ? "Generating PDF..." : "Download PDF"}</span>
           </button>
         </div>
       </div>
+
+      {pdfError && (
+        <div className="flex items-center justify-between gap-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-2.5 text-xs">
+          <span>{pdfError}</span>
+          <button
+            onClick={handlePrint}
+            className="shrink-0 font-semibold text-[#93000b] hover:underline"
+          >
+            Open Print Dialog
+          </button>
+        </div>
+      )}
 
       {/* Printable GST Tax Invoice Document Card (Stitch Design #7) */}
       <div className="bg-white rounded-2xl border border-[#eceef0] shadow-sm p-6 sm:p-8 space-y-6 text-xs text-gray-800">
@@ -160,7 +333,7 @@ export const InvoiceDetailsView: React.FC = () => {
                 <img
                   src={companyProfile.logoUrl}
                   alt="Logo"
-                  className="w-8 h-8 rounded-lg object-cover"
+                  className="h-8 max-w-24 rounded-lg object-contain bg-white"
                 />
               ) : (
                 <div className="w-8 h-8 rounded-lg bg-rose-50 text-[#93000b] flex items-center justify-center font-bold text-xs">

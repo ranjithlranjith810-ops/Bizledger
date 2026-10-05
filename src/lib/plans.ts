@@ -43,6 +43,7 @@ export const PLAN_CATALOG: SubscriptionPlan[] = [
       "Up to 2 Customers",
       "Up to 5 Products & Inventory",
       "5 Invoices / Bills per month",
+      "5 Estimates, Quotations & Purchase Orders per month",
       "Basic GST Invoicing",
       "Basic Inventory",
       "PDF Invoices",
@@ -55,6 +56,11 @@ export const PLAN_CATALOG: SubscriptionPlan[] = [
       teamMembers: 0,
       products: 5,
       invoicesPerMonth: 5,
+      // Estimates / quotations / Purchase Orders track the SAME monthly ceiling
+      // as invoices (pricing policy), each as its own separate counter.
+      estimatesPerMonth: 5,
+      quotationsPerMonth: 5,
+      purchaseOrdersPerMonth: 5,
       directoryListings: 0,
     },
   },
@@ -81,6 +87,9 @@ export const PLAN_CATALOG: SubscriptionPlan[] = [
       teamMembers: 3,
       products: 500,
       invoicesPerMonth: "Unlimited",
+      estimatesPerMonth: "Unlimited",
+      quotationsPerMonth: "Unlimited",
+      purchaseOrdersPerMonth: "Unlimited",
       directoryListings: 1,
     },
   },
@@ -95,6 +104,7 @@ export const PLAN_CATALOG: SubscriptionPlan[] = [
       "Unlimited Customers & Vendors",
       "Unlimited Products & Multi-warehouse",
       "100+ Invoices / Bills per month",
+      "Unlimited Estimates, Quotations & Purchase Orders",
       "Advanced Permissions & Reporting",
       "Priority Support & API Access",
       "Custom Tally / ERP Integrations",
@@ -107,6 +117,9 @@ export const PLAN_CATALOG: SubscriptionPlan[] = [
       teamMembers: 999,
       products: 9999,
       invoicesPerMonth: "Unlimited",
+      estimatesPerMonth: "Unlimited",
+      quotationsPerMonth: "Unlimited",
+      purchaseOrdersPerMonth: "Unlimited",
       directoryListings: 20,
     },
   },
@@ -229,8 +242,13 @@ export function getEffectivePlan(
   }
   // Everything else (never-paid, expired, failed, suspended-payment state) falls
   // back to the Free plan so an account owner is never locked out of product
-  // basics.
-  return getPlanById(catalog, FREE_PLAN_ID);
+  // basics. Contract: NEVER returns null for a valid account — even when the
+  // supplied catalog is partial (a DB catalog always contains `base`, but a
+  // defensive static fallback keeps the promise regardless of the source).
+  return (
+    getPlanById(catalog, FREE_PLAN_ID) ??
+    getPlanById(PLAN_CATALOG, FREE_PLAN_ID)
+  );
 }
 
 // Typed accessor for a plan's configured ceiling for a resource kind.
@@ -246,6 +264,12 @@ export function getLimitFor(
   switch (kind) {
     case "invoices":
       return limits.invoicesPerMonth;
+    case "estimates":
+      return limits.estimatesPerMonth;
+    case "quotations":
+      return limits.quotationsPerMonth;
+    case "purchaseOrders":
+      return limits.purchaseOrdersPerMonth;
     case "customers":
       return limits.customers;
     case "teamMembers":

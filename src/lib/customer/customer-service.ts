@@ -20,16 +20,66 @@ import type { Prisma } from "@/generated/prisma/client";
 
 const MAX_LENGTH = 500;
 
+// Per-field max lengths (input validation hardening). Each value is capped
+// well below anything a legitimate form produces; oversized payloads fail
+// fast with a sanitized 400 instead of being persisted or pushed toward the
+// DB. Monetary fields have explicit bounds and reject negatives (a negative
+// credit limit / balance is never meaningful for this domain).
+const FIELD_MAX = {
+  code: 50,
+  avatarInitials: 20,
+  businessType: 100,
+  website: 300,
+  contactName: 100,
+  contactDesignation: 100,
+  contactMobile: 20,
+  contactEmail: 254,
+  addressLine: 300,
+  city: 100,
+  state: 100,
+  country: 100,
+  pincode: 20,
+  stateCode: 10,
+  paymentTerms: 100,
+  notes: 1000,
+} as const;
+
+const MAX_MONEY = 99_999_999_999.99;
+
 function str(v: unknown): string | undefined {
   if (v == null) return undefined;
   const s = String(v).trim();
   return s === "" ? undefined : s;
 }
 
+function strCap(v: unknown, field: keyof typeof FIELD_MAX, label: string): string | undefined {
+  const s = str(v);
+  if (s === undefined) return undefined;
+  if (s.length > FIELD_MAX[field]) {
+    throw new ValidationError(`${label} is too long`);
+  }
+  return s;
+}
+
 function num(v: unknown): number | undefined {
   if (v == null) return undefined;
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
+}
+
+/**
+ * Money field guard. Absent -> undefined (caller picks the default). Present
+ * values must be finite, non-negative and within MAX_MONEY; anything else is a
+ * sanitized 400 rather than a silent coercion.
+ */
+function money(v: unknown, label: string): number | undefined {
+  if (v == null) return undefined;
+  if (typeof v === "boolean" || v === "") return undefined;
+  const n = num(v);
+  if (n === undefined) throw new ValidationError(`${label} must be a number`);
+  if (n < 0) throw new ValidationError(`${label} cannot be negative`);
+  if (n > MAX_MONEY) throw new ValidationError(`${label} is unreasonably large`);
+  return n;
 }
 
 function validateEnum<T extends string>(
@@ -79,45 +129,56 @@ function normalizeCustomerInput(raw: Record<string, unknown>) {
     validateEnum(raw.status, CUSTOMER_STATUSES, "status") ?? "Active";
 
   const gstin = str(raw.gstin);
-  if (gstin && gstin.length > 15) throw new ValidationError("GSTIN is too long");
+  if (gstin && gstin.length > 16) throw new ValidationError("GSTIN is too long");
   const pan = str(raw.panNumber);
   if (pan && pan.length > 10) throw new ValidationError("PAN is too short or long");
 
+  // Input validation hardening: every free-text field is length-capped and
+  // monetary fields reject negative / unreasonable values (sanitized 400).
+  const capped = (v: unknown, field: keyof typeof FIELD_MAX, label: string) =>
+    strCap(v, field, label);
+
   return {
-    code: str(raw.code),
+    code: capped(raw.code, "code", "Code"),
     type,
     name,
-    avatarInitials: str(raw.avatarInitials) ?? "CU",
-    businessType: str(raw.businessType),
+    avatarInitials: capped(raw.avatarInitials, "avatarInitials", "Initials") ?? "CU",
+    businessType: capped(raw.businessType, "businessType", "Business type"),
     gstStatus,
     gstin,
     panNumber: pan,
-    website: str(raw.website),
-    contactName: str(raw.contactName),
-    contactDesignation: str(raw.contactDesignation),
-    contactMobile: str(raw.contactMobile),
-    contactEmail: str(raw.contactEmail),
-    billingAddressLine1: str(raw.billingAddressLine1),
-    billingAddressLine2: str(raw.billingAddressLine2),
-    billingCity: str(raw.billingCity),
-    billingState: str(raw.billingState),
-    billingPincode: str(raw.billingPincode),
-    billingCountry: str(raw.billingCountry),
-    shippingAddressLine1: str(raw.shippingAddressLine1),
-    shippingAddressLine2: str(raw.shippingAddressLine2),
-    shippingCity: str(raw.shippingCity),
-    shippingState: str(raw.shippingState),
-    shippingPincode: str(raw.shippingPincode),
-    shippingCountry: str(raw.shippingCountry),
+    website: capped(raw.website, "website", "Website"),
+    contactName: capped(raw.contactName, "contactName", "Contact name"),
+    contactDesignation: capped(raw.contactDesignation, "contactDesignation", "Contact designation"),
+    contactMobile: capped(raw.contactMobile, "contactMobile", "Contact mobile"),
+    contactEmail: capped(raw.contactEmail, "contactEmail", "Contact email"),
+    billingAddressLine1: capped(raw.billingAddressLine1, "addressLine", "Billing address"),
+    billingAddressLine2: capped(raw.billingAddressLine2, "addressLine", "Billing address"),
+    billingCity: capped(raw.billingCity, "city", "Billing city"),
+    billingState: capped(raw.billingState, "state", "Billing state"),
+    billingPincode: capped(raw.billingPincode, "pincode", "Billing pincode"),
+    billingCountry: capped(raw.billingCountry, "country", "Billing country"),
+    shippingAddressLine1: capped(raw.shippingAddressLine1, "addressLine", "Shipping address"),
+    shippingAddressLine2: capped(raw.shippingAddressLine2, "addressLine", "Shipping address"),
+    shippingCity: capped(raw.shippingCity, "city", "Shipping city"),
+    shippingState: capped(raw.shippingState, "state", "Shipping state"),
+    shippingPincode: capped(raw.shippingPincode, "pincode", "Shipping pincode"),
+    shippingCountry: capped(raw.shippingCountry, "country", "Shipping country"),
     sameAsBilling: raw.sameAsBilling == null ? true : Boolean(raw.sameAsBilling),
-    stateCode: str(raw.stateCode),
-    creditLimit: num(raw.creditLimit) ?? 0,
-    paymentTerms: str(raw.paymentTerms),
-    notes: str(raw.notes),
+    stateCode: capped(raw.stateCode, "stateCode", "State code"),
+    creditLimit: money(raw.creditLimit, "Credit limit") ?? 0,
+    paymentTerms: capped(raw.paymentTerms, "paymentTerms", "Payment terms"),
+    notes: capped(raw.notes, "notes", "Notes"),
     status,
-    outstandingBalance: num(raw.outstandingBalance) ?? 0,
-    totalSales: num(raw.totalSales) ?? 0,
-    totalInvoices: Math.trunc(num(raw.totalInvoices) ?? 0),
+    outstandingBalance: money(raw.outstandingBalance, "Outstanding balance") ?? 0,
+    totalSales: money(raw.totalSales, "Total sales") ?? 0,
+    totalInvoices: (() => {
+      const n = num(raw.totalInvoices);
+      if (n === undefined) return 0;
+      if (n < 0 || !Number.isInteger(n)) throw new ValidationError("Total invoices must be a non-negative integer");
+      if (n > 1_000_000_000) throw new ValidationError("Total invoices is unreasonably large");
+      return Math.trunc(n);
+    })(),
     sinceDate: str(raw.sinceDate),
   };
 }
@@ -254,6 +315,7 @@ export async function listCustomers(businessIdInput: unknown, opts: { q?: string
   await requireBusinessPermission(businessId, "customers", "view");
 
   const q = String(opts?.q ?? "").trim().toLowerCase();
+  if (q.length > 200) throw new ValidationError("Search query is too long");
 
   const where: Prisma.CustomerWhereInput = { businessId };
   if (q) {

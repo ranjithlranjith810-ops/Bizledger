@@ -17,6 +17,11 @@ import {
 import type { Prisma } from "@/generated/prisma/client";
 
 const MAX_LENGTH = 500;
+const MAX_UNIT_PRICE = 99_999_999_999.99;
+const MAX_STOCK_QTY = 1_000_000_000;
+const MAX_SKU = 100;
+const MAX_CATEGORY = 100;
+const MAX_UNIT = 20;
 
 function str(v: unknown): string | undefined {
   if (v == null) return undefined;
@@ -28,6 +33,25 @@ function num(v: unknown): number | undefined {
   if (v == null) return undefined;
   const n = Number(v);
   return Number.isFinite(n) ? n : undefined;
+}
+
+/** Present monetary/quantity fields must be finite, non-negative and bounded;
+ * absent fields stay undefined. Anything else is a sanitized 400 (no silent
+ * coercion of junk/negative values to 0). */
+function boundedNum(v: unknown, label: string, max: number): number | undefined {
+  if (v == null) return undefined;
+  const n = num(v);
+  if (n === undefined) throw new ValidationError(`${label} must be a number`);
+  if (n < 0) throw new ValidationError(`${label} cannot be negative`);
+  if (n > max) throw new ValidationError(`${label} is unreasonably large`);
+  return n;
+}
+
+function strCap(v: unknown, max: number, label: string): string | undefined {
+  const s = str(v);
+  if (s === undefined) return undefined;
+  if (s.length > max) throw new ValidationError(`${label} is too long`);
+  return s;
 }
 
 function validateBusinessId(businessId: unknown): string {
@@ -71,29 +95,30 @@ function normalizeProductInput(raw: Record<string, unknown>, partial = false) {
   if (gstRate != null && (gstRate < 0 || gstRate > 100)) {
     throw new ValidationError("GST rate must be between 0 and 100");
   }
-  const unitPrice = num(raw.unitPrice);
-  if (unitPrice != null && unitPrice < 0) {
-    throw new ValidationError("Unit price cannot be negative");
-  }
-  const stockQuantity = num(raw.stockQuantity);
-  if (stockQuantity != null && stockQuantity < 0) {
-    throw new ValidationError("Stock quantity cannot be negative");
-  }
+  const unitPrice = boundedNum(raw.unitPrice, "Unit price", MAX_UNIT_PRICE);
+  const stockQuantity = boundedNum(raw.stockQuantity, "Stock quantity", MAX_STOCK_QTY);
   const hsnSac = str(raw.hsnSac);
   if (hsnSac && !/^\d{2,8}$/.test(hsnSac)) {
     // Match frontend validateHsnSAC: 2-8 numeric digits, optional.
     throw new ValidationError("HSN/SAC code must be 2 to 8 digits (numeric)");
   }
 
+  const sku = strCap(raw.sku, MAX_SKU, "SKU");
+  const category =
+    resolvedCategory === undefined
+      ? undefined
+      : strCap(resolvedCategory, MAX_CATEGORY, "Category");
+  const unit = strCap(raw.unit, MAX_UNIT, "Unit");
+
   const out: Record<string, unknown> = {};
   if (name !== undefined) out.name = name;
-  if (str(raw.sku) !== undefined || !partial) out.sku = str(raw.sku);
+  if (sku !== undefined || !partial) out.sku = sku;
   if (rawCategory !== undefined || rawCustom !== undefined || !partial) {
     out.category = partial && (rawCategory === undefined && rawCustom === undefined)
       ? undefined
-      : resolvedCategory;
+      : category;
   }
-  if (raw.unit !== undefined || !partial) out.unit = str(raw.unit) ?? "Pcs";
+  if (raw.unit !== undefined || !partial) out.unit = unit ?? "Pcs";
   if (raw.unitPrice !== undefined || !partial) out.unitPrice = unitPrice ?? 0;
   if (raw.stockQuantity !== undefined || !partial) out.stockQuantity = stockQuantity ?? 0;
   if (raw.hsnSac !== undefined || !partial) out.hsnSac = hsnSac ? hsnSac.toUpperCase() : undefined;
@@ -182,6 +207,7 @@ export async function listProducts(businessIdInput: unknown, opts: { q?: string 
   await requireBusinessPermission(businessId, "invoices", "view");
 
   const q = String(opts?.q ?? "").trim().toLowerCase();
+  if (q.length > 200) throw new ValidationError("Search query is too long");
 
   const where: Prisma.ProductWhereInput = { businessId };
   if (q) {

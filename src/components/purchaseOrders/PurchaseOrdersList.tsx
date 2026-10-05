@@ -7,8 +7,8 @@ import { PurchaseOrder } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
 import { matchesSearch } from "@/lib/search";
 import { isPersistedId } from "@/lib/optimistic-id";
-import { Plus, Search, Eye, Pencil } from "lucide-react";
-import { AddPurchaseOrderModal } from "@/components/purchaseOrders/AddPurchaseOrderModal";
+import { Plus, Search, Eye } from "lucide-react";
+import { Icon } from "../ui/Icon";
 
 const STATUS_COLORS: Record<string, string> = {
   Draft: "bg-gray-100 text-gray-700 border-gray-200",
@@ -25,7 +25,6 @@ export const PurchaseOrdersList: React.FC = () => {
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("All");
-  const [editing, setEditing] = useState<PurchaseOrder | null>(null);
 
   const activeFy = getActiveFinancialYear();
   const fyStart = activeFy?.startDate || "";
@@ -48,9 +47,7 @@ export const PurchaseOrdersList: React.FC = () => {
   });
 
   const openPo = (p: PurchaseOrder) => {
-    // Fix C: a row that is still optimistic has no database id. Navigating to
-    // it would land on a URL the detail page can never resolve. Wait for the
-    // create to reconcile instead of routing to a temp id.
+    // Fix C: never route to an optimistic temp id (see EstimatesList).
     if (!isPersistedId(p.id)) return;
     router.push(`/purchase-orders/${p.id}`);
   };
@@ -93,9 +90,7 @@ export const PurchaseOrdersList: React.FC = () => {
               Total Ordered (Incl. GST)
             </span>
             <div className="w-8 h-8 rounded-lg bg-gray-100 text-gray-700 flex items-center justify-center">
-              <span className="material-symbols-outlined text-[18px]">
-                shopping_cart
-              </span>
+              <Icon name="shopping_cart" className="text-[18px]" />
             </div>
           </div>
           <div className="mt-2">
@@ -165,9 +160,7 @@ export const PurchaseOrdersList: React.FC = () => {
               {filtered.length === 0 ? (
                 <tr>
                   <td colSpan={9} className="py-8 text-center text-gray-400">
-                    <span className="material-symbols-outlined text-[30px] text-gray-300 block mx-auto mb-1.5">
-                      shopping_cart
-                    </span>
+                    <Icon name="shopping_cart" className="text-[30px] text-gray-300 block mx-auto mb-1.5" />
                     {purchaseOrders.length === 0
                       ? "No purchase orders yet — create your first."
                       : "No purchase orders match your filter criteria."}
@@ -227,13 +220,6 @@ export const PurchaseOrdersList: React.FC = () => {
                         >
                           <Eye className="w-4 h-4" />
                         </button>
-                        <button
-                          onClick={() => setEditing(p)}
-                          className="p-1.5 text-gray-500 hover:text-[#166534] hover:bg-[#f0fdf4] rounded-lg transition-colors"
-                          title="Edit Purchase Order"
-                        >
-                          <Pencil className="w-4 h-4" />
-                        </button>
                       </div>
                     </td>
                   </tr>
@@ -244,9 +230,6 @@ export const PurchaseOrdersList: React.FC = () => {
         </div>
       </div>
 
-      {editing && (
-        <AddPurchaseOrderModal po={editing} onClose={() => setEditing(null)} />
-      )}
-    </div>
+      </div>
   );
 };

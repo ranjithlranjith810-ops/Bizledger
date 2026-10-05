@@ -242,7 +242,8 @@ export const PaymentView: React.FC = () => {
                 </span>
               </div>
               <p className="text-[11px] text-gray-400">
-                Demo checkout — Test Mode only. Razorpay test card / UPI credentials can be used.
+                Payments are processed by our payment partner. In Razorpay Test Mode,
+                Razorpay test card / UPI credentials can be used.
               </p>
             </div>
           </div>
@@ -290,12 +291,9 @@ export const PaymentView: React.FC = () => {
             </div>
 
             {isFree ? (
-              <button
-                disabled
-                className="mt-6 w-full bg-gray-100 text-gray-500 py-3 rounded-xl text-xs font-bold cursor-default"
-              >
+              <span className="mt-6 w-full inline-flex items-center justify-center bg-gray-100 text-gray-500 py-3 rounded-xl text-xs font-bold">
                 Base plan is free — no payment required
-              </button>
+              </span>
             ) : (
               <button
                 onClick={() => void handlePay()}
@@ -365,7 +363,7 @@ export const PaymentView: React.FC = () => {
             )}
 
             <p className="mt-3 text-[11px] text-gray-400 text-center">
-              Demo checkout via Razorpay Test Mode — no real money is charged.
+              Payment is processed via Razorpay; in Test Mode no real money is charged.
             </p>
           </div>
         </div>

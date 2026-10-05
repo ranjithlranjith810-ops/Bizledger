@@ -3,44 +3,49 @@
 import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { VehicleType, VehicleStatus } from "@/types";
+import { normalizeBusinessText } from "@/lib/validation";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
 import { X, Truck, User, ShieldCheck, Check } from "lucide-react";
 
 export const AddVehicleModal: React.FC = () => {
   const { addVehicle, setOpenModal } = useApp();
 
-  const [registrationNumber, setRegistrationNumber] = useState("TN 38 JK 7890");
-  const [makeModel, setMakeModel] = useState("Tata Ace Gold Diesel");
+  const [registrationNumber, setRegistrationNumber] = useState("");
+  const [makeModel, setMakeModel] = useState("");
   const [vehicleType, setVehicleType] = useState<VehicleType>("Mini Truck");
   const [fuelType, setFuelType] = useState<"Diesel" | "Petrol" | "CNG" | "Electric">("Diesel");
-  const [manufacturingYear, setManufacturingYear] = useState("2024");
-  const [chassisNumber] = useState("MAT612999P445566");
-  const [engineNumber] = useState("275ID09AB1122");
-  const [assignedRoute, setAssignedRoute] = useState("Pollachi & Udumalpet Delivery Line");
+  const [manufacturingYear, setManufacturingYear] = useState("");
+  const [chassisNumber] = useState("");
+  const [engineNumber] = useState("");
+  const [assignedRoute, setAssignedRoute] = useState("");
 
-  const [driverName, setDriverName] = useState("Gopalakrishnan M.");
-  const [driverPhone, setDriverPhone] = useState("+91 98433 77889");
-  const [driverLicense, setDriverLicense] = useState("TN3820190008899");
-  const [driverLicenseExpiry, setDriverLicenseExpiry] = useState("2029-08-30");
+  const [driverName, setDriverName] = useState("");
+  const [driverPhone, setDriverPhone] = useState("");
+  const [driverLicense, setDriverLicense] = useState("");
+  const [driverLicenseExpiry, setDriverLicenseExpiry] = useState("");
 
-  const [insurancePolicyNumber, setInsurancePolicyNumber] = useState("ROYAL-SUND-554411");
-  const [insuranceExpiry, setInsuranceExpiry] = useState("2027-08-15");
-  const [fcExpiry, setFcExpiry] = useState("2029-08-15");
-  const [pucExpiry, setPucExpiry] = useState("2027-02-10");
-  const [currentOdometer, setCurrentOdometer] = useState("8500");
+  const [insurancePolicyNumber, setInsurancePolicyNumber] = useState("");
+  const [insuranceExpiry, setInsuranceExpiry] = useState("");
+  const [fcExpiry, setFcExpiry] = useState("");
+  const [pucExpiry, setPucExpiry] = useState("");
+  const [currentOdometer, setCurrentOdometer] = useState("");
+
+  const closeModal = () => setOpenModal(null);
+  const dialogRef = useModalBehavior(closeModal);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!registrationNumber.trim() || !makeModel.trim()) return;
 
     addVehicle({
-      registrationNumber: registrationNumber.toUpperCase(),
-      makeModel,
+      registrationNumber: registrationNumber.trim().toUpperCase(),
+      makeModel: normalizeBusinessText(makeModel),
       vehicleType,
       fuelType,
       manufacturingYear: parseInt(manufacturingYear) || 2024,
       chassisNumber,
       engineNumber,
-      driverName,
+      driverName: normalizeBusinessText(driverName),
       driverPhone,
       driverLicense,
       driverLicenseExpiry,
@@ -50,7 +55,7 @@ export const AddVehicleModal: React.FC = () => {
       pucExpiry,
       currentOdometer: parseInt(currentOdometer) || 0,
       status: "Active" as VehicleStatus,
-      assignedRoute,
+      assignedRoute: normalizeBusinessText(assignedRoute),
       lastServiceDate: new Date().toISOString().split("T")[0],
     });
 
@@ -58,7 +63,14 @@ export const AddVehicleModal: React.FC = () => {
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-vehicle-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
           <div className="flex items-center gap-3">
@@ -66,12 +78,13 @@ export const AddVehicleModal: React.FC = () => {
               <Truck className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">Register Fleet Vehicle</h3>
+              <h3 id="add-vehicle-title" className="text-base font-bold text-[#191c1e]">Register Fleet Vehicle</h3>
               <p className="text-xs text-gray-500">Add commercial truck, driver credentials, and RTO compliance dates</p>
             </div>
           </div>
           <button
-            onClick={() => setOpenModal(null)}
+            onClick={closeModal}
+            aria-label="Close register vehicle dialog"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -94,7 +107,7 @@ export const AddVehicleModal: React.FC = () => {
                   type="text"
                   required
                   value={registrationNumber}
-                  onChange={(e) => setRegistrationNumber(e.target.value)}
+                  onChange={(e) => setRegistrationNumber(e.target.value.toUpperCase())}
                   placeholder="e.g. TN 38 AB 1234"
                   className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-mono font-bold uppercase"
                 />
@@ -108,9 +121,9 @@ export const AddVehicleModal: React.FC = () => {
                   type="text"
                   required
                   value={makeModel}
-                  onChange={(e) => setMakeModel(e.target.value)}
+                  onChange={(e) => setMakeModel(e.target.value.toUpperCase())}
                   placeholder="e.g. Tata Ace Gold 0.7L BS6"
-                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium"
+                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium uppercase"
                 />
               </div>
 
@@ -179,9 +192,9 @@ export const AddVehicleModal: React.FC = () => {
                 <input
                   type="text"
                   value={assignedRoute}
-                  onChange={(e) => setAssignedRoute(e.target.value)}
+                  onChange={(e) => setAssignedRoute(e.target.value.toUpperCase())}
                   placeholder="e.g. Coimbatore City & Tiruppur Delivery Line"
-                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
                 />
               </div>
             </div>
@@ -202,9 +215,9 @@ export const AddVehicleModal: React.FC = () => {
                   type="text"
                   required
                   value={driverName}
-                  onChange={(e) => setDriverName(e.target.value)}
+                  onChange={(e) => setDriverName(e.target.value.toUpperCase())}
                   placeholder="e.g. Ramesh Kumar"
-                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium"
+                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium uppercase"
                 />
               </div>
 

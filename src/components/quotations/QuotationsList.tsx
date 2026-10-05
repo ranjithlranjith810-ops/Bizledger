@@ -7,8 +7,8 @@ import { Quotation } from "@/types";
 import { dateInRange, fyShortName } from "@/lib/utils";
 import { matchesSearch } from "@/lib/search";
 import { isPersistedId } from "@/lib/optimistic-id";
-import { Plus, Search, Eye, Pencil } from "lucide-react";
-import { SalesDocumentModal } from "@/components/shared/SalesDocumentModal";
+import { Plus, Search, Eye } from "lucide-react";
+import { Icon } from "../ui/Icon";
 
 const STATUS_COLORS: Record<string, string> = {
   Draft: "bg-gray-100 text-gray-700 border-gray-200",
@@ -24,7 +24,6 @@ export const QuotationsList: React.FC = () => {
 
   const [searchQuery, setSearchQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<string>("All");
-  const [editing, setEditing] = useState<Quotation | null>(null);
 
   const activeFy = getActiveFinancialYear();
   const fyStart = activeFy?.startDate || "";
@@ -48,9 +47,7 @@ export const QuotationsList: React.FC = () => {
   });
 
   const openQuotation = (q: Quotation) => {
-    // Fix C: a row that is still optimistic has no database id. Navigating to
-    // it would land on a URL the detail page can never resolve. Wait for the
-    // create to reconcile instead of routing to a temp id.
+    // Fix C: never route to an optimistic temp id (see EstimatesList).
     if (!isPersistedId(q.id)) return;
     router.push(`/quotations/${q.id}`);
   };
@@ -93,9 +90,7 @@ export const QuotationsList: React.FC = () => {
               Total Quoted (Incl. GST)
             </span>
             <div className="w-8 h-8 rounded-lg bg-gray-100 text-gray-700 flex items-center justify-center">
-              <span className="material-symbols-outlined text-[18px]">
-                request_quote
-              </span>
+              <Icon name="request_quote" className="text-[18px]" />
             </div>
           </div>
           <div className="mt-2">
@@ -159,9 +154,7 @@ export const QuotationsList: React.FC = () => {
               {filtered.length === 0 ? (
                 <tr>
                   <td colSpan={9} className="py-8 text-center text-gray-400">
-                    <span className="material-symbols-outlined text-[30px] text-gray-300 block mx-auto mb-1.5">
-                      request_quote
-                    </span>
+                    <Icon name="request_quote" className="text-[30px] text-gray-300 block mx-auto mb-1.5" />
                     {quotations.length === 0
                       ? "No quotations yet — create your first."
                       : "No quotations match your filter criteria."}
@@ -221,13 +214,6 @@ export const QuotationsList: React.FC = () => {
                         >
                           <Eye className="w-4 h-4" />
                         </button>
-                        <button
-                          onClick={() => setEditing(q)}
-                          className="p-1.5 text-gray-500 hover:text-[#166534] hover:bg-[#f0fdf4] rounded-lg transition-colors"
-                          title="Edit Quotation"
-                        >
-                          <Pencil className="w-4 h-4" />
-                        </button>
                       </div>
                     </td>
                   </tr>
@@ -238,13 +224,6 @@ export const QuotationsList: React.FC = () => {
         </div>
       </div>
 
-      {editing && (
-        <SalesDocumentModal
-          kind="quotation"
-          doc={editing}
-          onClose={() => setEditing(null)}
-        />
-      )}
-    </div>
+      </div>
   );
 };

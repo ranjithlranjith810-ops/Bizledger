@@ -62,6 +62,12 @@ export const navigationSections: NavSection[] = [
       { label: "Pricing Plans", href: "/pricing", icon: "sell" },
     ],
   },
+  {
+    title: "Support",
+    items: [
+      { label: "Help & Guides", href: "/help", icon: "help" },
+    ],
+  },
 ];
 
 export const ROUTES = {
@@ -82,6 +88,7 @@ export const ROUTES = {
   billing: "/settings/billing",
   billingHistory: "/settings/billing/history",
   pricing: "/pricing",
+  help: "/help",
   onboarding: "/onboarding",
   onboardingBusiness: "/onboarding/business",
   onboardingTax: "/onboarding/tax",
@@ -106,6 +113,75 @@ export function onboardingRouteForStep(step: number): string {
   const clamped = Math.min(6, Math.max(1, step || 1));
   const found = ONBOARDING_STEPS.find((s) => s.step === clamped);
   return found ? found.href : "/onboarding/business";
+}
+
+// Routes the app is allowed to RESUME into on entry at `/` (post-login routing
+// and app reopen), derived from the stored `lastRoute`.
+//
+// `lastRoute` is a single "return the user to their last working surface" slot
+// persisted in localStorage, and it outlives the session. Every route that
+// passes `isValidAppRoute` used to be written to it, which included `/help`:
+// Help is reference/learning content, not a working surface. The consequence was
+// that a single visit to Help permanently hijacked app entry — the stored value
+// survived sign-out/sign-in and app restarts, so every later entry at `/` was
+// redirected back to Help and the user could not get away from it.
+//
+// Help is still a first-class app route (reachable, guarded, and its own tab
+// preserved across a refresh, because a refresh never re-enters `/`). It is only
+// excluded from being a RESUME TARGET, so entering the app normally lands on the
+// user's real work surface, falling back to the dashboard.
+const NON_RESUMABLE_ROUTES: ReadonlySet<string> = new Set([ROUTES.help]);
+
+export function isResumableAppRoute(path: string): boolean {
+  if (NON_RESUMABLE_ROUTES.has(path)) return false;
+  const baseRoutes = Object.values(ROUTES);
+  if (baseRoutes.some((r) => path === r || path.startsWith(r + "/"))) {
+    return true;
+  }
+  return /^\/(invoices|vehicles|expenses|team)\//.test(path);
+}
+
+// Home (`/`) routing decision, kept pure so the onboarding/guest routing paths
+// are unit-testable without a browser.
+//
+// - `exitedToLanding` is the explicit "Home" signal set by the onboarding
+//   wizard: it lets an authenticated user with an incomplete wizard view the
+//   public landing page. It is consumed once on the home page and never
+//   disables the onboarding guard for other entry points (signup/login
+//   redirects, direct visits, refreshes).
+// - An unauthenticated visitor always sees the landing page.
+// - An incomplete account is sent to the pending wizard step (the server has
+//   not confirmed a business for it yet).
+// - A completed account is sent to its last app route, else the dashboard.
+export function resolveHomeRoute(input: {
+  isAuthenticated: boolean;
+  onboarding: OnboardingState;
+  lastRoute: string | null;
+  exitedToLanding: boolean;
+}): { redirectTo: string | null; showLanding: boolean } {
+  if (input.exitedToLanding) {
+    return { redirectTo: null, showLanding: true };
+  }
+  if (!input.isAuthenticated) {
+    return { redirectTo: null, showLanding: true };
+  }
+  if (!input.onboarding.completed) {
+    return {
+      redirectTo: onboardingRouteForStep(input.onboarding.currentStep),
+      showLanding: false,
+    };
+  }
+  const last = input.lastRoute;
+  // `isResumableAppRoute` (not a bare "is it an app route" check) so a Help
+  // value ALREADY sitting in localStorage from before this fix can no longer
+  // hijack entry. The persisted value outlives the session, so the read site has
+  // to be guarded as well as the write site — otherwise the bug would only be
+  // fixed for users who never visit Help again, and every existing account
+  // would stay pinned to Help.
+  if (last && last !== "/" && last !== "/login" && last !== "/signup" && isResumableAppRoute(last)) {
+    return { redirectTo: last, showLanding: false };
+  }
+  return { redirectTo: "/dashboard", showLanding: false };
 }
 
 // Resolve the initial onboarding state for an authenticated account.

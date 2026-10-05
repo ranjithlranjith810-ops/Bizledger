@@ -2,6 +2,10 @@
 const nextConfig = {
   reactStrictMode: true,
   outputFileTracingRoot: import.meta.dirname,
+  // Do not advertise the framework. Next.js sets `X-Powered-By: Next.js` by
+  // default, which needlessly fingerprints the stack for no functional benefit.
+  // Purely a response-header change: no routing, rendering, or auth effect.
+  poweredByHeader: false,
   experimental: {
     optimizePackageImports: ['lucide-react'],
   },

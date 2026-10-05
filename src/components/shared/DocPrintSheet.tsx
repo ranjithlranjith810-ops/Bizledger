@@ -2,6 +2,7 @@
 
 import React from "react";
 import { useApp } from "@/context/AppContext";
+import { Icon } from "../ui/Icon";
 
 export interface PrintItem {
   id: string;
@@ -75,9 +76,9 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
   const { companyProfile } = useApp();
 
   return (
-    <div className="bg-white rounded-2xl border border-[#eceef0] shadow-sm p-6 sm:p-8 space-y-6 text-xs text-gray-800">
+    <div className="w-full max-w-full overflow-hidden bg-white rounded-2xl border border-[#eceef0] shadow-sm p-5 sm:p-6 space-y-5 text-xs text-gray-800">
       {/* Document Banner */}
-      <div className="text-center pb-4 border-b border-gray-200">
+      <div className="text-center pb-3 border-b border-gray-200">
         <span className="text-[11px] font-bold tracking-widest text-[#93000b] uppercase">
           {banner}
         </span>
@@ -89,7 +90,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
       </div>
 
       {/* Company Header & Meta */}
-      <div className="flex flex-col sm:flex-row justify-between gap-6 pb-6 border-b border-gray-100">
+      <div className="flex flex-col sm:flex-row justify-between gap-5 pb-5 border-b border-gray-100">
         {/* Company / Supplier */}
         <div className="space-y-1 max-w-sm">
           <div className="flex items-center gap-2">
@@ -97,7 +98,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
               <img
                 src={companyProfile.logoUrl}
                 alt="Logo"
-                className="w-8 h-8 rounded-lg object-cover"
+                className="h-8 max-w-24 rounded-lg object-contain bg-white"
               />
             ) : (
               <div className="w-8 h-8 rounded-lg bg-rose-50 text-[#93000b] flex items-center justify-center font-bold text-xs">
@@ -132,7 +133,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
         </div>
 
         {/* Document Identification */}
-        <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] sm:min-w-64 space-y-2 text-xs">
+        <div className="bg-[#f7f9fb] p-3 rounded-xl border border-[#eceef0] sm:min-w-64 space-y-2 text-xs">
           <div className="flex justify-between gap-4">
             <span className="text-gray-500 font-medium">Document #:</span>
             <span className="font-mono font-bold text-[#93000b] text-right">
@@ -152,7 +153,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
 
       {/* Buyer (for Purchase Order) */}
       {buyerBlock && (
-        <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] space-y-2 text-xs">
+        <div className="bg-[#f7f9fb] p-3 rounded-xl border border-[#eceef0] space-y-2 text-xs">
           <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
             {buyerBlock.title}
           </span>
@@ -179,7 +180,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
 
       {/* Bill To / Party */}
       {party && (
-        <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] space-y-2 text-xs">
+        <div className="bg-[#f7f9fb] p-3 rounded-xl border border-[#eceef0] space-y-2 text-xs">
           <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
             {party.title}
           </span>
@@ -220,7 +221,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
         (deliveryBlock.deliveryDate ||
           deliveryBlock.deliveryAddress ||
           deliveryBlock.deliveryMode) && (
-          <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] space-y-1 text-xs">
+          <div className="bg-[#f7f9fb] p-3 rounded-xl border border-[#eceef0] space-y-1 text-xs">
             <span className="text-[10px] font-bold uppercase tracking-wider text-gray-500">
               Delivery Information
             </span>
@@ -306,9 +307,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
         {showBank ? (
           <div className="sm:max-w-xs space-y-2 bg-[#f7f9fb] p-3.5 rounded-xl border border-[#eceef0] text-[11px]">
             <div className="font-bold text-gray-800 flex items-center gap-1.5">
-              <span className="material-symbols-outlined text-[16px] text-[#93000b]">
-                account_balance
-              </span>
+              <Icon name="account_balance" className="text-[16px] text-[#93000b]" />
               <span>Remittance Bank Details</span>
             </div>
             <div className="text-gray-600 space-y-0.5 font-mono">
@@ -356,7 +355,7 @@ export const DocPrintSheet: React.FC<DocPrintSheetProps> = ({
       </div>
 
       {/* Footer & Signature */}
-      <div className="pt-6 border-t border-gray-200 flex flex-col sm:flex-row items-end justify-between gap-6">
+      <div className="pt-5 border-t border-gray-200 flex flex-col sm:flex-row items-end justify-between gap-6">
         <div className="space-y-1 text-[10px] text-gray-400 max-w-sm">
           <div className="font-bold uppercase text-gray-500">
             Terms &amp; Conditions:

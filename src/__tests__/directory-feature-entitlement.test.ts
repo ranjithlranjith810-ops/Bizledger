@@ -99,6 +99,9 @@ function dbWithFeatures(features: FeatureEntitlements | null): EntitlementDb {
     product: { count: async () => 0 },
     businessMember: { count: async () => 0 },
     invoice: { count: async () => 0 },
+    estimate: { count: async () => 0 },
+    quotation: { count: async () => 0 },
+    purchaseOrder: { count: async () => 0 },
     businessDirectoryProfile: { count: async () => 0 },
   };
 }

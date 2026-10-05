@@ -39,8 +39,8 @@ export async function PATCH(
   }
 }
 
-// DELETE /api/estimates/[id]?businessId=... -- delete ONLY a draft estimate.
-// Issued or converted estimates are 409.
+// DELETE /api/estimates/[id]?businessId=... -- rejected unconditionally (409).
+// There is no estimate deletion path.
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },

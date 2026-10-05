@@ -1,10 +1,8 @@
 // Central legal / policy configuration (single source of truth).
 //
-// BizLedger is currently a frontend demo build: all data is stored locally in
-// the user's browser (localStorage). No server, database, or on-file legal
-// relationship exists yet. As a result every company identifier below is a
-// PLACEHOLDER and must be replaced before launch. We deliberately do NOT
-// invent a legal entity, registered address, trademarks, or statutory details.
+// Some company identifiers below are PLACEHOLDERs and must be replaced with the
+// real legal entity details before launch. We deliberately do NOT invent a
+// legal entity, registered address, trademarks, or statutory details.
 //
 // Legal basis referenced by the policy documents:
 //   - DPDP Act 2023 & DPDP Rules 2025 (notified 13 Nov 2025; phased commencement)
@@ -13,7 +11,7 @@
 //   - CBIC GST invoicing & e-way bill rules (Rule 138: ₹50,000 threshold)
 //   - RBI payment guidance
 //
-// NOTE: This is a policy DOCUMENTATION layer only. Browser localStorage is not
+// NOTE: This is a policy DOCUMENTATION layer. Browser localStorage is not
 // "cookies" in the statutory web-cookie sense; we do not run a cookie consent
 // banner and we never state that we issue or process cookies for tracking.
 
@@ -26,12 +24,14 @@ export const LEGAL = {
   cin: "[CIN/LLPIN]",
   gstin: "[GSTIN]",
   pan: "[PAN]",
+  // Transactional email stays on the verified bizledger.io mail domain
+  // (Resend). Only the public WEBSITE domain moved to bizledger.dev.
   contactEmail: "support@bizledger.io",
   grievanceEmail: "[GRIEVANCE OFFICER EMAIL]",
   supportPhone: "[SUPPORT PHONE]",
   grievanceOfficerName: "[GRIEVANCE OFFICER NAME]",
   grievanceOfficerDesignation: "[GRIEVANCE OFFICER DESIGNATION]",
-  website: "https://bizledger.io",
+  website: "https://bizledger.dev",
 } as const;
 
 export interface LegalDocMeta {

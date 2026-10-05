@@ -22,6 +22,7 @@ export interface InvoiceBackendInput {
   invoiceDate: string;
   status: Invoice["status"];
   pricingMode: PricingMode;
+  invoiceNumber?: string;
   notes?: string;
   terms?: string;
   placeOfSupply?: string;
@@ -102,7 +103,14 @@ export function toBackendInput(
   invoice: Omit<Invoice, "id">,
   ctx: InvoiceCreateContext,
 ): InvoiceBackendInput {
+  // `invoiceNumber` is OPTIONAL and is included only when the user explicitly
+  // typed one. In auto mode the field is empty here, which tells the server to
+  // allocate the authoritative number inside the create transaction. Sending a
+  // preview value would (a) re-introduce the stale-number class of bug and
+  // (b) give the client a say it must not have.
+  const requestedNumber = invoice.invoiceNumber?.trim();
   return {
+    ...(requestedNumber ? { invoiceNumber: requestedNumber } : {}),
     customerId: invoice.customerId,
     financialYearId: ctx.financialYearId,
     items: invoice.items.map((it) => ({
@@ -181,6 +189,33 @@ export function fromBackendInvoice(inv: InvoiceBackendJson): Invoice {
   };
 }
 
+/** One line edit allowed on an existing invoice: product, quantity, price. */
+export interface InvoiceUpdateLineInput {
+  productId?: string;
+  quantity: number;
+  rate: number;
+}
+
+/** Narrow PATCH payload for updating an existing invoice (number + lines only). */
+export interface InvoiceUpdateInput {
+  invoiceNumber?: string;
+  items?: InvoiceUpdateLineInput[];
+}
+
+/** Frontend Invoice -> the narrow edit patch. Snapshot fields and totals are
+ * intentionally excluded: the server re-derives them from the product master
+ * and recomputes every total with the GST engine. */
+export function toUpdateInput(invoice: Invoice): InvoiceUpdateInput {
+  const out: InvoiceUpdateInput = {};
+  if (invoice.invoiceNumber?.trim()) out.invoiceNumber = invoice.invoiceNumber;
+  out.items = invoice.items.map((it) => ({
+    productId: it.productId ?? undefined,
+    quantity: it.quantity,
+    rate: it.unitPrice,
+  }));
+  return out;
+}
+
 export const invoicesApi = {
   list: (businessId: string) =>
     http.get<{ invoices: InvoiceBackendJson[]; count: number }>("/api/invoices", {
@@ -194,10 +229,23 @@ export const invoicesApi = {
     http.get<{ invoice: InvoiceBackendJson }>(`/api/invoices/${id}`, {
       businessId,
     }),
-  update: (businessId: string, id: string, input: Partial<InvoiceBackendInput>) =>
+  update: (
+    businessId: string,
+    id: string,
+    input: InvoiceUpdateInput,
+  ) =>
     http.patch<{ invoice: InvoiceBackendJson }>(`/api/invoices/${id}`, input, {
       businessId,
     }),
+  // Authoritative lifecycle move (the existing /status route). `status` is a
+  // requested destination; the server validates the edge against
+  // INVOICE_STATUS_TRANSITIONS.
+  transitionStatus: (businessId: string, id: string, status: Invoice["status"]) =>
+    http.patch<{ invoice: InvoiceBackendJson }>(
+      `/api/invoices/${id}/status`,
+      { status },
+      { businessId },
+    ),
   remove: (businessId: string, id: string) =>
     http.del<{ id: string }>(`/api/invoices/${id}`, { businessId }),
 };

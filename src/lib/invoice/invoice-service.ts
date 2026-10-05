@@ -25,6 +25,7 @@ import {
   ValidationError,
   ResourceNotFoundError,
   ConflictError,
+  DuplicateResourceError,
 } from "@/lib/business/api-error";
 import {
   buildCompanySnapshot,
@@ -33,18 +34,24 @@ import {
 } from "@/lib/sales-document/shared";
 import {
   assertFinancialYearActive,
-  assertDocumentDateInFinancialYear,
   financialYearForBusinessDate,
 } from "@/lib/financial-year/financial-year-service";
-import { allocateDocumentNumber } from "@/lib/sequence/sequence-service";
+import {
+  allocateDocumentNumber,
+  parseTrailingSequence,
+  reserveSequenceAtLeast,
+} from "@/lib/sequence/sequence-service";
+import { drawDownInvoiceStock } from "@/lib/inventory/stock";
+import { INVOICE_STATUS_TRANSITIONS as SHARED_INVOICE_STATUS_TRANSITIONS } from "@/lib/sales-document/status-transitions";
 import { INDIAN_STATES } from "@/lib/india";
 import {
   calculateInvoiceTotals,
   round2,
   resolveTaxType,
   buildInvoiceNumber,
+  normalizeManualInvoiceNumber,
 } from "@/lib/invoice";
-import type { Prisma } from "@/generated/prisma/client";
+import { Prisma } from "@/generated/prisma/client";
 
 const MAX_STRING = 1000;
 const MAX_ITEMS = 100;
@@ -138,14 +145,25 @@ function validateMoney(v: unknown, field: string): number {
   return n;
 }
 
-// Identity/numbering fields are immutable once minted. Attempting to supply any
-// of them on an update is rejected (400) — the number, financial-year binding
-// and conversion linkage are engine-owned and never client-editable.
+// Identity and accounting fields are immutable once minted (id, tenant binding,
+// financial-year binding, prefix, conversion linkage). Attempting to supply any
+// of them on the ordinary PATCH is rejected (400) — those are engine-owned and
+// never client-editable.
+//
+// `invoiceNumber` and `items` are intentionally NOT in this list: under the
+// document-edit rule they are the ONLY post-creation fields a business may
+// change, through a strict allowlist inside updateInvoice (the database's
+// business-scoped unique constraint on (businessId, invoiceNumber) is the
+// concurrency backstop for renumbering). Editing a line may change the product
+// (swap in another product from the tenant's master), the quantity, or the
+// price — never the HSN/SAC, unit, GST rate, discount or snapshot fields, which
+// are re-derived from the product master (or kept frozen for custom lines) and
+// recalculated by the GST engine. Everything else — customer, dates, notes/
+// terms, place of supply, e-way bill, company snapshot — is created-and-frozen.
 const INVOICE_PROTECTED_KEYS = [
   "id",
   "businessId",
   "financialYearId",
-  "invoiceNumber",
   "createdAt",
   "updatedAt",
   "prefix",
@@ -163,24 +181,6 @@ const INVOICE_TOTAL_KEYS = [
   "igst",
   "totalTax",
   "grandTotal",
-] as const;
-
-// F4 — financial-substance keys that freeze once an invoice leaves Draft.
-const INVOICE_FINANCIAL_OVERRIDE_KEYS = [
-  "items",
-  "pricingMode",
-  "customerId",
-  "invoiceDate",
-  "placeOfSupplyCode",
-] as const;
-
-// F4 — remaining mutability also locks once an invoice is Paid or Cancelled
-// (only notes / terms / e-way bill remain editable).
-const INVOICE_FINALIZED_LOCKED_KEYS = [
-  "dueDate",
-  "placeOfSupply",
-  "vehicle",
-  "company",
 ] as const;
 
 // --------------------------------------------------------------------------
@@ -239,12 +239,13 @@ function normalizeInvoicePayload(raw: Record<string, unknown>) {
     invoiceDate: str(raw.invoiceDate),
     status: (str(raw.status) ?? "Pending") as InvoiceStatusT,
     notes: shortText(raw.notes, "notes"),
-    notesTerms: shortText(raw.terms, "terms"),
-    placeOfSupply: str(raw.placeOfSupply),
-    placeOfSupplyCode: str(raw.placeOfSupplyCode),
-    prefix: str(raw.invoicePrefix ?? raw.prefix) ?? undefined,
-    company: (raw.company ?? null) as Record<string, unknown> | null,
-    vehicle: (raw.vehicle ?? null) as Record<string, unknown> | null,
+  notesTerms: shortText(raw.terms, "terms"),
+  placeOfSupply: str(raw.placeOfSupply),
+  placeOfSupplyCode: str(raw.placeOfSupplyCode),
+  prefix: str(raw.invoicePrefix ?? raw.prefix) ?? undefined,
+  invoiceNumber: str(raw.invoiceNumber) ?? undefined,
+  company: (raw.company ?? null) as Record<string, unknown> | null,
+  vehicle: (raw.vehicle ?? null) as Record<string, unknown> | null,
     dueDate: str(raw.dueDate),
     ewayBillNumber: shortText(raw.ewayBillNumber, "ewayBillNumber"),
     ewayBillDate: str(raw.ewayBillDate),
@@ -632,21 +633,111 @@ export async function createInvoice(
       // the number is allocated and the record inserted.
       await assertCreateAllowed(tx, businessId, "invoices");
 
-      // Mint the number from the same FY-scoped sequence as the frontend.
-      const allocated = await allocateDocumentNumber(
-        businessId,
-        fyId,
-        "invoice",
-        payload.prefix,
-        { db: tx },
-      );
+      // Conversion guard, AUTHORITATIVE and in-transaction.
+      //
+      // `assertCreateAllowed` above takes an exclusive lock on the Business row,
+      // so every other governed create for this business is serialized behind
+      // this transaction. Re-reading the SOURCE document here — after the lock,
+      // inside the same transaction that inserts the invoice — is what makes
+      // "already converted" a real invariant.
+      //
+      // The pre-transaction read above is only a fast path: two concurrent
+      // conversions of the SAME source both observe `convertedInvoiceId = null`
+      // there, and (before the marker was written in this transaction) both
+      // would insert an invoice and consume two quota slots. Re-checking under
+      // the lock lets exactly one win; the loser gets the same 400 it would
+      // have received sequentially.
+      if (sourceDocument) {
+        if (sourceDocument.type === "quotation" && sourceQuotation) {
+          const lockedQuotation = await tx.quotation.findFirst({
+            where: { id: sourceQuotation.id, businessId },
+            select: { convertedInvoiceId: true },
+          });
+          if (lockedQuotation?.convertedInvoiceId) {
+            throw new ValidationError(
+              "Quotation has already been converted to an invoice",
+            );
+          }
+        }
+        if (sourceDocument.type === "estimate" && sourceEstimate) {
+          const lockedEstimate = await tx.estimate.findFirst({
+            where: { id: sourceEstimate.id, businessId },
+            select: { convertedInvoiceId: true },
+          });
+          if (lockedEstimate?.convertedInvoiceId) {
+            throw new ValidationError(
+              "Estimate has already been converted to an invoice",
+            );
+          }
+        }
+      }
 
-      const financialYearName = fy.name;
-      const invoiceNumber = buildInvoiceNumber(
-        allocated.prefix,
-        financialYearName,
-        allocated.allocated,
+      // Stock draw-down — AUTHORITATIVE, server-side, and in the SAME
+      // transaction as the invoice insert below. Duplicate lines are aggregated
+      // and each product is drawn with one conditional UPDATE, so concurrent
+      // invoices cannot both take the last unit and stock can never go
+      // negative. A rejection must throw so the transaction aborts and undoes
+      // any decrements already applied in this loop.
+      const drawDown = await drawDownInvoiceStock(
+        tx,
+        businessId,
+        payload.items,
+        productById,
       );
+      if (!drawDown.ok) {
+        throw new ValidationError(drawDown.message);
+      }
+
+      // Number allocation. The server is the ONLY authority for an
+      // auto-generated number: it is minted here, inside the same transaction
+      // as the insert, from the FY-scoped sequence. A client preview is never
+      // trusted and never sent in auto mode.
+      //
+      // A number is only honoured when the user explicitly asked for one
+      // (invoiceNumberMode === "manual" upstream). It is normalized and checked
+      // for business-scoped uniqueness; a collision is a 409 and the number is
+      // never silently swapped for a different one. When a manual number is
+      // used the counter is still advanced past it, so a later auto create
+      // cannot hand out a number that is already taken.
+      const requested = payload.invoiceNumber;
+      let invoiceNumber: string;
+      if (requested !== undefined && String(requested).trim() !== "") {
+        const parsedManual = normalizeManualInvoiceNumber(requested);
+        if (!parsedManual.ok) throw new ValidationError(parsedManual.error);
+        invoiceNumber = parsedManual.value;
+
+        const clash = await tx.invoice.findFirst({
+          where: { businessId, invoiceNumber },
+          select: { id: true },
+        });
+        if (clash) {
+          throw new DuplicateResourceError(
+            `Invoice number "${invoiceNumber}" is already in use in this business`,
+          );
+        }
+
+        // Advance the counter beyond a manually chosen number so the next auto
+        // allocation cannot collide with it. Best-effort: a manual number far
+        // outside the sequence still cannot be reissued, because the unique
+        // (businessId, invoiceNumber) constraint is the backstop.
+        const manualSeq = parseTrailingSequence(invoiceNumber);
+        if (manualSeq !== null) {
+          await reserveSequenceAtLeast(tx, businessId, fyId, "invoice", manualSeq, payload.prefix);
+        }
+      } else {
+        const allocated = await allocateDocumentNumber(
+          businessId,
+          fyId,
+          "invoice",
+          payload.prefix,
+          { db: tx },
+        );
+        invoiceNumber = buildInvoiceNumber(
+          allocated.prefix,
+          fy.name,
+          allocated.allocated,
+        );
+      }
 
       const invoice = await tx.invoice.create({
       data: {
@@ -700,43 +791,43 @@ export async function createInvoice(
           }),
         },
       },
-      include: { items: true },
-    });
+        include: { items: true },
+      });
+
+      // The conversion marker is written in the SAME transaction as the insert.
+      // That is what makes the in-transaction guard above authoritative: the
+      // marker becomes visible atomically with the invoice, and is already
+      // committed by the time the Business-row lock is released, so a competing
+      // conversion that acquires the lock next is guaranteed to observe it.
+      // (It was previously a second, separate transaction, leaving a window in
+      // which a duplicate invoice could be created with no marker at all.)
+      if (sourceDocument?.type === "quotation" && sourceQuotation) {
+        await tx.quotation.update({
+          where: { id: sourceQuotation.id },
+          data: {
+            status: "Accepted",
+            convertedInvoiceId: invoice.id,
+            convertedInvoiceNumber: invoice.invoiceNumber,
+            convertedAt: new Date(),
+          },
+        });
+      }
+      if (sourceDocument?.type === "estimate" && sourceEstimate) {
+        await tx.estimate.update({
+          where: { id: sourceEstimate.id },
+          data: {
+            status: "Accepted",
+            convertedInvoiceId: invoice.id,
+            convertedInvoiceNumber: invoice.invoiceNumber,
+            convertedAt: new Date(),
+          },
+        });
+      }
 
       return invoice;
     },
     { timeout: 30000, maxWait: 30000 },
   );
-
-  if (sourceDocument) {
-    await prisma.$transaction(
-      async (tx) => {
-        if (sourceDocument.type === "quotation" && sourceQuotation) {
-          await tx.quotation.update({
-            where: { id: sourceQuotation.id },
-            data: {
-              status: "Accepted",
-              convertedInvoiceId: created.id,
-              convertedInvoiceNumber: created.invoiceNumber,
-              convertedAt: new Date(),
-            },
-          });
-        }
-        if (sourceDocument.type === "estimate" && sourceEstimate) {
-          await tx.estimate.update({
-            where: { id: sourceEstimate.id },
-            data: {
-              status: "Accepted",
-              convertedInvoiceId: created.id,
-              convertedInvoiceNumber: created.invoiceNumber,
-              convertedAt: new Date(),
-            },
-          });
-        }
-      },
-      { timeout: 30000, maxWait: 30000 },
-    );
-  }
 
   return toInvoiceJson(created);
 }
@@ -774,25 +865,107 @@ export async function getInvoice(businessIdInput: unknown, idInput: unknown) {
 }
 
 // ---------------------------------------------------------------------------
-// PATCH — an operational edit of a member's invoice.
+// PATCH — the allowed post-creation edits: the invoice NUMBER and the PRODUCT /
+// QUANTITY / PRICE of its lines.
 //
-// POLICY:
-//  - Mass assignment: only a strict whitelist of fields is ever written; the
-//    body is NEVER spread into `prisma.invoice.update`. Unknown keys are
-//    ignored, protected identity keys are rejected (400).
-//  - Totals: ALWAYS recomputed server-side with the shared GST engine. Client
-//    totals (subtotal/tax/grandTotal) are ignored — fake numbers never persist.
-//  - Tax type: derived again from the seller's own Business state code vs the
-//    effective place-of-supply code (after the patch).
-//  - Snapshots are historical. The company (seller) snapshot is only refreshed
-//    when `company` is explicitly supplied; the vehicle snapshot only when
-//    `vehicle` is supplied; the customer snapshot is refreshed ONLY when
-//    `customerId` changes (the document then references a different party).
-//    Everything else keeps the stored snapshot.
-//  - Item rows are rewritten only when `items` is supplied or pricing
-//    mode / place-of-supply changed (their GST split depends on those).
-//  - line totals are recomputed from the CURRENT stored lines otherwise.
+// An invoice is created-and-frozen EXCEPT for this strict allowlist:
+//   - `invoiceNumber` — the display number, validated by the pure, shared
+//     invoice-number validator, business-scoped unique (database constraint is
+//     the concurrency backstop, P2002 -> 409 DuplicateResourceError), and
+//     applied without touching any other column.
+//   - `items` — a line-for-line replacement of the EXISTING items (same length,
+//     same product/custom structure). Each element may change the product
+//     (swap in another product from the tenant's own master), the quantity, or
+//     the price. The HSN/SAC, unit, GST rate and description are NEVER taken
+//     from the client: for product-backed lines they are re-snapshotted from
+//     the product master; for custom lines (no product) the frozen snapshot is
+//     preserved and only quantity/price may change. All invoice and per-line
+//     totals are recomputed by the GST engine using the invoice's stored
+//     pricing mode and tax type.
+//
+// Status is a lifecycle fact owned by the dedicated /status endpoint; totals
+// are engine-computed and never accepted from the client. Every other field
+// (customer, dates, financial year, tax settings, discount, notes/terms, place
+// of supply, e-way bill, snapshots) is rejected rather than silently ignored,
+// so a stale edit form surfaces its failure instead of pretending success.
 // ---------------------------------------------------------------------------
+function normalizeInvoiceUpdateItems(
+  rawItems: unknown,
+  existingItems: {
+    productId: string | null;
+    productName: string;
+    sku: string | null;
+    hsnSac: string | null;
+    unit: string | null;
+    gstRate: Prisma.Decimal | number;
+  }[],
+): NormalizedItem[] {
+  if (!Array.isArray(rawItems) || rawItems.length === 0) {
+    throw new ValidationError("At least one invoice item is required");
+  }
+  if (rawItems.length > MAX_ITEMS) {
+    throw new ValidationError(`Invoice cannot have more than ${MAX_ITEMS} items`);
+  }
+  // Editing never restructures the invoice: lines map 1:1 to the stored ones,
+  // so custom lines (no product) cannot be reordered, merged, or product-ified
+  // behind the engine's back. Only product / quantity / price change on a line.
+  if (rawItems.length !== existingItems.length) {
+    throw new ValidationError(
+      "The number of items cannot change when editing an invoice; modify the product, quantity or price of the existing lines",
+    );
+  }
+  return rawItems.map((it, idx) => {
+    const item = (it ?? {}) as Record<string, unknown>;
+    const prefix = `items[${idx}]`;
+    const prior = existingItems[idx];
+    const productIdRaw = str(item.productId);
+    const productId = productIdRaw
+      ? validateId(productIdRaw, `${prefix}.productId is invalid`)
+      : null;
+
+    // A line cannot flip between a product-backed line and a custom line; the
+    // snapshot fields of a custom line are frozen (only quantity/price change).
+    if (Boolean(productId) !== Boolean(prior.productId)) {
+      throw new ValidationError(
+        `${prefix}.productId cannot change whether a line refers to a product; edit the existing ${prior.productId ? "product" : "custom"} line in place instead`,
+      );
+    }
+
+    const quantity = num(item.quantity);
+    if (quantity == null || quantity <= 0) {
+      throw new ValidationError(`${prefix}.quantity must be greater than 0`);
+    }
+    if (quantity > 1_000_000) throw new ValidationError(`${prefix}.quantity is too large`);
+    const rate = validateMoney(item.rate, `${prefix}.rate`);
+    if (rate > 100_000_000) throw new ValidationError(`${prefix}.rate is too large`);
+
+    if (productId == null) {
+      return {
+        productId: null,
+        productName: prior.productName,
+        sku: prior.sku ?? null,
+        hsnSac: prior.hsnSac ?? null,
+        unit: prior.unit ?? "Pcs",
+        quantity,
+        rate,
+        gstRate: Number(prior.gstRate),
+      };
+    }
+    // Product-backed line: tax fields are re-snapshotted from the master below
+    // after the tenant-scoped product lookup.
+    return {
+      productId,
+      productName: "",
+      sku: null,
+      hsnSac: null,
+      unit: "Pcs",
+      quantity,
+      rate,
+      gstRate: 0,
+    };
+  });
+}
+
 export async function updateInvoice(
   businessIdInput: unknown,
   idInput: unknown,
@@ -800,20 +973,12 @@ export async function updateInvoice(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
-  const business = ctx.business;
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
   rejectProtectedKeys(raw, INVOICE_PROTECTED_KEYS);
 
-  const existing = await prisma.invoice.findFirst({
-    where: { id, businessId },
-    include: { items: true },
-  });
-  if (!existing) throw new ResourceNotFoundError("Invoice not found");
-
   // F4 — status is a lifecycle fact, transitioned ONLY through the dedicated
-  // status endpoint (Draft -> Pending -> Paid, Overdue/Cancelled by server flow).
-  // A forged status on PATCH is rejected outright.
+  // status endpoint. A forged status on PATCH is rejected outright.
   if (raw.status !== undefined) {
     throw new ValidationError(
       "Invoice status must be changed via the invoice status endpoint",
@@ -830,246 +995,219 @@ export async function updateInvoice(
     }
   }
 
-  // F4 — issued/finalized lockdown. A Draft is fully editable per RBAC; an
-  // issued invoice (Pending/Overdue) keeps its financial substance frozen
-  // (items, pricing mode, date, customer association, place-of-supply code);
-  // a finalized invoice (Paid/Cancelled) is immutable except for non-financial
-  // annotations (notes, terms, e-way bill). Violations are a state conflict
-  // (409) — the record is an accounting document, not a client-editable form.
-  if (existing.status !== "Draft") {
-    for (const k of INVOICE_FINANCIAL_OVERRIDE_KEYS) {
-      if (Object.prototype.hasOwnProperty.call(raw, k)) {
-        throw new ConflictError(
-          existing.status === "Paid" || existing.status === "Cancelled"
-            ? "Paid or cancelled invoices are immutable financial records and cannot be rewritten"
-            : `Issued ${existing.status} invoices cannot have their financial fields rewritten`,
-        );
-      }
-    }
-    if (existing.status === "Paid" || existing.status === "Cancelled") {
-      for (const k of INVOICE_FINALIZED_LOCKED_KEYS) {
-        if (Object.prototype.hasOwnProperty.call(raw, k)) {
-          throw new ConflictError(
-            "Paid or cancelled invoices are immutable financial records and cannot be rewritten",
-          );
-        }
-      }
-    }
-  }
-
-  const hasItems = raw.items !== undefined;
-  const items = hasItems
-    ? normalizeInvoiceItems(raw.items)
-    : existing.items.map((it) => ({
-        productId: it.productId,
-        productName: it.productName,
-        sku: it.sku,
-        hsnSac: it.hsnSac,
-        unit: it.unit,
-        quantity: Number(it.quantity),
-        rate: Number(it.rate),
-        gstRate: Number(it.gstRate),
-      }));
-
-  const pricingMode =
-    raw.pricingMode !== undefined
-      ? normalizePricingMode(str(raw.pricingMode) ?? "")
-      : (existing.pricingMode as PricingModeT);
-
-  let placeOfSupplyCode = String(existing.placeOfSupplyCode ?? "").trim();
-  if (raw.placeOfSupplyCode !== undefined) {
-    const s = str(raw.placeOfSupplyCode) ?? "";
-    if (s && !/^\d{2}$/.test(s)) {
-      throw new ValidationError("placeOfSupplyCode must be a 2-digit state code");
-    }
-    placeOfSupplyCode = s;
-  }
-
-  // Server-side recomputation. Client totals are ignored.
-  const businessStateCode = sellerStateCode(business);
-  const taxType = resolveTaxType(businessStateCode, placeOfSupplyCode);
-  const lineTotals = calculateInvoiceTotals(
-    items.map((it) => ({
-      quantity: it.quantity,
-      unitPrice: it.rate,
-      gstRate: it.gstRate,
-      pricingMode,
-    })),
-    pricingMode,
-    taxType,
+  // Mass-assignment guard: `invoiceNumber` and `items` are the ONLY fields the
+  // client may send on an update. Everything else is a content edit and is
+  // rejected (400) instead of being dropped, so callers cannot drift the
+  // database. Passing `items` as a non-array is also rejected (not treated as
+  // "no edit").
+  const allowedEditKeys = new Set(["invoiceNumber", "items"]);
+  const contentKeys = Object.keys(raw).filter(
+    (k) => !allowedEditKeys.has(k),
   );
-  const subtotal = round2(lineTotals.subtotal);
-  const cgst = round2(lineTotals.cgst);
-  const sgst = round2(lineTotals.sgst);
-  const igst = round2(lineTotals.igst);
-  const totalTax = round2(lineTotals.totalTax);
-  const grandTotal = round2(lineTotals.grandTotal);
-  const taxableAmount = round2(lineTotals.subtotal);
-
-  // Tenant-verify all referenced masters for this edit.
-  const productIds = [
-    ...new Set(items.map((it) => it.productId).filter((v): v is string => v !== null)),
-  ];
-  const [found] = await Promise.all([
-    productIds.length > 0
-      ? prisma.product.findMany({
-          where: { id: { in: productIds }, businessId },
-          select: { id: true, name: true, sku: true, hsnSac: true, unit: true },
-        })
-      : Promise.resolve([] as {
-          id: string;
-          name: string;
-          sku: string | null;
-          hsnSac: string | null;
-          unit: string | null;
-        }[]),
-  ]);
-  if (found.length !== productIds.length) {
-    throw new ResourceNotFoundError("One or more products were not found");
-  }
-  const productById = Object.fromEntries(found.map((p) => [p.id, p]));
-
-  // ---------- build the strict whitelist of mutable fields ----------
-  const data: Prisma.InvoiceUncheckedUpdateInput = {
-    taxType,
-    subtotal,
-    taxableAmount,
-    cgst,
-    sgst,
-    igst,
-    totalTax,
-    grandTotal,
-  };
-
-  if (raw.pricingMode !== undefined) {
-    data.pricingMode = normalizePricingMode(str(raw.pricingMode) ?? "");
-  }
-  if (raw.notes !== undefined) {
-    const s = shortText(raw.notes, "notes");
-    data.notes = s ?? null;
-  }
-  if (raw.terms !== undefined) {
-    const s = shortText(raw.terms, "terms");
-    data.terms = s ?? null;
-  }
-  if (raw.placeOfSupply !== undefined) {
-    const s = str(raw.placeOfSupply);
-    data.placeOfSupply = s ?? null;
-  }
-  if (raw.placeOfSupplyCode !== undefined) {
-    data.placeOfSupplyCode = placeOfSupplyCode || null;
-  }
-  if (raw.ewayBillNumber !== undefined) {
-    const s = shortText(raw.ewayBillNumber, "ewayBillNumber");
-    data.ewayBillNumber = s ?? null;
-  }
-  if (raw.invoiceDate !== undefined) {
-    const s = str(raw.invoiceDate);
-    if (!s) throw new ValidationError("invoiceDate is required");
-    const d = new Date(s);
-    if (Number.isNaN(d.getTime())) throw new ValidationError("invoiceDate is not a valid date");
-    // F11 — the invoice's financial-year binding is immutable; a changed date
-    // must stay inside it. Only Draft invoices can reach here (issued/finalized
-    // invoiceDate edits are rejected above as state conflicts).
-    await assertDocumentDateInFinancialYear(
-      businessId,
-      existing.financialYearId,
-      d,
-      "Invoice",
+  if (contentKeys.length > 0) {
+    throw new ValidationError(
+      `Invoices are immutable after creation; only the invoice number and product lines (product, quantity, price) can be edited (field${contentKeys.length === 1 ? "" : "s"}: ${contentKeys.join(", ")})`,
     );
-    data.invoiceDate = d;
   }
-  if (raw.dueDate !== undefined) {
-    const s = str(raw.dueDate);
-    if (s) {
-      const d = new Date(s);
-      if (Number.isNaN(d.getTime())) throw new ValidationError("dueDate is not a valid date");
-      data.dueDate = d;
-    } else {
-      data.dueDate = null;
-    }
-  }
-  if (raw.ewayBillDate !== undefined) {
-    const s = str(raw.ewayBillDate);
-    if (s) {
-      const d = new Date(s);
-      if (Number.isNaN(d.getTime())) throw new ValidationError("ewayBillDate is not a valid date");
-      data.ewayBillDate = d;
-    } else {
-      data.ewayBillDate = null;
-    }
+  if (raw.items !== undefined && !Array.isArray(raw.items)) {
+    throw new ValidationError("items must be an array of invoice lines");
   }
 
-  // Snapshot policy (see header comment).
-  if (raw.customerId !== undefined) {
-    const customerId = validateId(raw.customerId, "customerId is invalid");
-    const customer = await prisma.customer.findFirst({
-      where: { id: customerId, businessId },
-    });
-    if (!customer) throw new ResourceNotFoundError("Customer not found");
-    data.customerId = customer.id;
-    data.customerSnapshot = buildCustomerSnapshot(customer) as Prisma.InputJsonValue;
-  }
-  if (raw.company !== undefined) {
-    if (raw.company !== null && typeof raw.company !== "object") {
-      throw new ValidationError("company must be a company snapshot object or null");
-    }
-    // A refresh is still opt-in, but the snapshot is always rebuilt from the
-    // authoritative stored profile - never from the request body.
-    data.companySnapshot = buildCompanySnapshot(
-      companyProfileRecord(business),
-    ) as Prisma.InputJsonValue;
-  }
-  if (raw.vehicle !== undefined) {
-    if (raw.vehicle !== null && typeof raw.vehicle !== "object") {
-      throw new ValidationError("vehicle must be a vehicle snapshot object or null");
-    }
-    data.vehicleSnapshot = buildVehicleSnapshot(
-      (raw.vehicle ?? null) as Record<string, unknown> | null,
-    ) as Prisma.InputJsonValue;
-  }
-
-  // Rewrite item rows when the lines themselves changed.
-  const rewriteItems =
-    hasItems ||
-    pricingMode !== existing.pricingMode ||
-    placeOfSupplyCode !== String(existing.placeOfSupplyCode ?? "").trim();
-
-  const updated = await prisma.invoice.update({
-    where: { id },
-    data: rewriteItems
-      ? {
-          ...data,
-          items: {
-            deleteMany: {},
-            create: items.map((it, idx) => {
-              const line = lineTotals.lines[idx];
-              const prod = it.productId ? productById[it.productId] : undefined;
-              return {
-                productId: it.productId,
-                productName: it.productName || (prod ? prod.name : it.productName),
-                sku: it.sku || (prod ? prod.sku : null),
-                hsnSac: it.hsnSac || (prod ? prod.hsnSac : null),
-                unit: it.unit || (prod ? prod.unit : "Pcs"),
-                quantity: it.quantity,
-                rate: it.rate,
-                pricingMode,
-                gstRate: it.gstRate,
-                taxableAmount: line.taxable,
-                cgst: line.cgst,
-                sgst: line.sgst,
-                igst: line.igst,
-                taxAmount: line.taxAmount,
-                totalAmount: line.totalAmount,
-              };
-            }),
-          },
-        }
-      : data,
+  // Load the record scoped to the authorized business (404 for foreign/unknown,
+  // no existence disclosure). An empty PATCH is a harmless no-op.
+  const existing = await prisma.invoice.findFirst({
+    where: { id, businessId },
     include: { items: true },
   });
+  if (!existing) throw new ResourceNotFoundError("Invoice not found");
 
-  return toInvoiceJson(updated);
+  const hasNumber = raw.invoiceNumber !== undefined;
+  const hasItems = raw.items !== undefined;
+  if (!hasNumber && !hasItems) return toInvoiceJson(existing);
+
+  let nextNumber = existing.invoiceNumber;
+  if (hasNumber) {
+    const parsed = normalizeManualInvoiceNumber(raw.invoiceNumber);
+    if (!parsed.ok) throw new ValidationError(parsed.error);
+    nextNumber = parsed.value;
+  }
+
+  // Business-scoped uniqueness. The explicit pre-check gives a clear user error
+  // for the common sequential-UI case; the database unique constraint on
+  // (businessId, invoiceNumber) is the authoritative backstop for the race.
+  if (nextNumber !== existing.invoiceNumber) {
+    const duplicate = await prisma.invoice.findFirst({
+      where: { id: { not: id }, businessId, invoiceNumber: nextNumber },
+      select: { id: true },
+    });
+    if (duplicate) {
+      throw new DuplicateResourceError(
+        "An invoice with this number already exists in this business",
+      );
+    }
+  }
+
+  // Pure no-op: same number and no items edit -> no write at all.
+  if (nextNumber === existing.invoiceNumber && !hasItems) {
+    return toInvoiceJson(existing);
+  }
+
+  // Product/quantity/price edits produce a FULL server-side recomputation of
+  // every line total and the invoice totals with the shared GST engine, using
+  // the invoice's STORED pricing mode and tax type (both are frozen). The
+  // client never supplies snapshot fields or totals.
+  let itemEdit: {
+    createRows: Prisma.InvoiceItemCreateWithoutInvoiceInput[];
+    subtotal: number;
+    taxableAmount: number;
+    cgst: number;
+    sgst: number;
+    igst: number;
+    totalTax: number;
+    grandTotal: number;
+  } | null = null;
+  if (hasItems) {
+    const normalizedItems = normalizeInvoiceUpdateItems(
+      raw.items,
+      existing.items,
+    );
+    const productIds = [
+      ...new Set(
+        normalizedItems
+          .map((it) => it.productId)
+          .filter((v): v is string => v !== null),
+      ),
+    ];
+    const found = await prisma.product.findMany({
+      where: { id: { in: productIds }, businessId },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        hsnSac: true,
+        unit: true,
+        gstRate: true,
+      },
+    });
+    if (productIds.length > 0 && found.length !== productIds.length) {
+      throw new ResourceNotFoundError("One or more products were not found");
+    }
+    const productById = new Map(found.map((p) => [p.id, p]));
+
+    // Tax settings are frozen: the stored pricing mode and the stored tax type
+    // (itself derived at create time from seller state vs place of supply)
+    // drive the recalculation. Product GST rates come from the master.
+    const pricingMode = existing.pricingMode as PricingModeT;
+    const taxType = String(existing.taxType || "intrastate") as ReturnType<
+      typeof resolveTaxType
+    >;
+
+    const lines = normalizedItems.map((it) => {
+      if (!it.productId) {
+        return { ...it };
+      }
+      const prod = productById.get(it.productId);
+      if (!prod) {
+        throw new ResourceNotFoundError("One or more products were not found");
+      }
+      return {
+        ...it,
+        productName: prod.name,
+        sku: prod.sku ?? null,
+        hsnSac: prod.hsnSac ?? null,
+        unit: prod.unit ?? "Pcs",
+        gstRate: Number(prod.gstRate),
+      };
+    });
+
+    const lineTotals = calculateInvoiceTotals(
+      lines.map((it) => ({
+        quantity: it.quantity,
+        unitPrice: it.rate,
+        gstRate: it.gstRate,
+      })),
+      pricingMode,
+      taxType,
+    );
+
+    const createRows = lines.map((it, idx) => {
+      const line = lineTotals.lines[idx];
+      return {
+        productId: it.productId,
+        productName: it.productName || "ITEM",
+        sku: it.sku,
+        hsnSac: it.hsnSac,
+        unit: it.unit || "Pcs",
+        quantity: it.quantity,
+        rate: it.rate,
+        pricingMode,
+        gstRate: it.gstRate,
+        taxableAmount: line.taxable,
+        cgst: line.cgst,
+        sgst: line.sgst,
+        igst: line.igst,
+        taxAmount: line.taxAmount,
+        totalAmount: line.totalAmount,
+      };
+    });
+
+    itemEdit = {
+      createRows,
+      subtotal: round2(lineTotals.subtotal),
+      taxableAmount: round2(lineTotals.subtotal),
+      cgst: round2(lineTotals.cgst),
+      sgst: round2(lineTotals.sgst),
+      igst: round2(lineTotals.igst),
+      totalTax: round2(lineTotals.totalTax),
+      grandTotal: round2(lineTotals.grandTotal),
+    };
+  }
+
+  try {
+    const updated = await prisma.$transaction(
+      async (tx) => {
+        const data = {
+          ...(nextNumber !== existing.invoiceNumber
+            ? { invoiceNumber: nextNumber }
+            : {}),
+          ...(itemEdit
+            ? {
+                subtotal: itemEdit.subtotal,
+                taxableAmount: itemEdit.taxableAmount,
+                cgst: itemEdit.cgst,
+                sgst: itemEdit.sgst,
+                igst: itemEdit.igst,
+                totalTax: itemEdit.totalTax,
+                grandTotal: itemEdit.grandTotal,
+                items: {
+                  deleteMany: {},
+                  create: itemEdit.createRows,
+                },
+              }
+            : {}),
+        };
+        return tx.invoice.update({
+          where: { id },
+          // Strict allowlist: the update data is built ONLY from the validated
+          // number and the recomputed items — never a spread of the request body.
+          data,
+          include: { items: true },
+        });
+      },
+      { timeout: 30000, maxWait: 30000 },
+    );
+    return toInvoiceJson(updated);
+  } catch (err) {
+    if (
+      err instanceof Prisma.PrismaClientKnownRequestError &&
+      err.code === "P2002"
+    ) {
+      throw new DuplicateResourceError(
+        "An invoice with this number already exists in this business",
+      );
+    }
+    throw err;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1090,13 +1228,11 @@ export async function updateInvoice(
 // status FORWARD on the lifecycle and requires `invoices.edit` — the same gate
 // that guards editing any invoice. Unpermitted edges are a 409 (state conflict).
 // ---------------------------------------------------------------------------
-const INVOICE_STATUS_TRANSITIONS: Record<string, readonly string[]> = {
-  Draft: ["Pending"],
-  Pending: ["Paid", "Overdue", "Cancelled"],
-  Overdue: ["Paid", "Pending", "Cancelled"],
-  Paid: [],
-  Cancelled: [],
-};
+// The matrix itself is imported from the shared, dependency-free module so the
+// Invoice status select in the UI and this service read one definition and
+// cannot drift. Its VALUES are unchanged from the previous local literal.
+const INVOICE_STATUS_TRANSITIONS: Record<string, readonly string[]> =
+  SHARED_INVOICE_STATUS_TRANSITIONS;
 
 export async function transitionInvoiceStatus(
   businessIdInput: unknown,
@@ -1132,43 +1268,30 @@ export async function transitionInvoiceStatus(
 }
 
 // ---------------------------------------------------------------------------
-// DELETE — physical removal allowed ONLY for Draft invoices.
+// DELETE — NEVER. Invoices are accounting records and are not deletable in
+// ANY status, by ANY user, through ANY API.
 //
-// POLICY: an invoice is (or has become) an accounting record. Issued /
-// finalized invoices (any status other than Draft) are protected with a 409 —
-// the caller must use the Cancelled status instead. Invoices referenced by a
-// conversion history (a quotation or estimate that was converted into THIS
-// invoice) are never physically deleted, because that would corrupt the
-// source document's conversion reference (409). Cross-tenant or unknown ids
-// remain a 404.
+// This supersedes the earlier policy, which permitted physical removal of a
+// Draft invoice. A draft is still a numbered, financial-year-scoped document
+// that has already consumed an invoice number from its DocumentSequence, so
+// removing it leaves a permanent gap in an auditable numbering run.
+//
+// The route is kept (rather than removed) for API compatibility, but it can
+// only ever reach this rejection: `prisma.invoice.delete` and `deleteMany` are
+// NOT called from anywhere in the application. Correcting a mistake is done by
+// the status lifecycle (Draft -> Pending -> Paid / Cancelled), never by
+// erasing the row.
+//
+// Authorization is still evaluated FIRST, so an unauthenticated caller gets
+// 401 and a caller without `invoices.delete` on the business gets 403 — the
+// same as before. Only an authorized caller reaches the 409.
 // ---------------------------------------------------------------------------
 export async function deleteInvoice(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  const id = validateId(idInput);
+  validateId(idInput);
   await requireBusinessPermission(businessId, "invoices", "delete");
 
-  const existing = await prisma.invoice.findFirst({
-    where: { id, businessId },
-    select: { id: true, status: true },
-  });
-  if (!existing) throw new ResourceNotFoundError("Invoice not found");
-
-  if (existing.status !== "Draft") {
-    throw new ConflictError(
-      "Only draft invoices can be deleted; issued invoices must be cancelled",
-    );
-  }
-
-  const [quoteRefs, estimateRefs] = await Promise.all([
-    prisma.quotation.count({ where: { businessId, convertedInvoiceId: id } }),
-    prisma.estimate.count({ where: { businessId, convertedInvoiceId: id } }),
-  ]);
-  if (quoteRefs > 0 || estimateRefs > 0) {
-    throw new ConflictError(
-      "Invoice is referenced by a document conversion and cannot be deleted",
-    );
-  }
-
-  await prisma.invoice.delete({ where: { id } });
-  return { id };
+  throw new ConflictError(
+    "Invoices cannot be deleted. Correct the invoice with its status (for example, cancel it) instead.",
+  );
 }

@@ -217,3 +217,43 @@ export function buildDocumentNumber(
   const slugPart = slug ? `/${slug}/` : "/";
   return `${p}${slugPart}${num}`;
 }
+
+// ------------------------------------------------------ manual invoice number
+// Invoice numbers are minted server-side (PREFIX/FY-slug/seq) at creation.
+// Under the document-immutability rule a business may RE-NUMBER an invoice
+// through the document edit flow; that manual input is validated here. This
+// module is pure and runtime-dependency-free, so the validator runs unchanged
+// on the server (invoice-service) and in the client edit modal, and is testable
+// without a database. Uniqueness itself is NOT validated here: it is enforced
+// by the database's business-scoped unique constraint on (businessId,
+// invoiceNumber), with a P2002 collision mapped to a 409.
+export const MAX_INVOICE_NUMBER_LENGTH = 64;
+
+export type InvoiceNumberValidationResult =
+  | { ok: true; value: string }
+  | { ok: false; error: string };
+
+// Trim-when-the-convention-supports: `str()` trimming is the app-wide rule, so
+// a hand-typed number is trimmed before it is compared/stored. No arbitrary
+// format is invented — a manual number may be "INV/26-27/051", "SA-2026", or
+// any other business-chosen label; the only hard stops are "not empty", a sane
+// length cap, and no control characters that would corrupt a printed document.
+export function normalizeManualInvoiceNumber(
+  input: unknown
+): InvoiceNumberValidationResult {
+  if (typeof input !== "string") {
+    return { ok: false, error: "invoiceNumber must be a string" };
+  }
+  const value = input.trim();
+  if (!value) return { ok: false, error: "invoiceNumber is required" };
+  if (value.length > MAX_INVOICE_NUMBER_LENGTH) {
+    return {
+      ok: false,
+      error: `invoiceNumber must be at most ${MAX_INVOICE_NUMBER_LENGTH} characters`,
+    };
+  }
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    return { ok: false, error: "invoiceNumber contains invalid characters" };
+  }
+  return { ok: true, value };
+}

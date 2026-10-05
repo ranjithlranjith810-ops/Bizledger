@@ -1,9 +1,10 @@
 import React from "react";
+import { Icon, type IconName } from "./Icon";
 
 export interface ButtonProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: 'primary' | 'secondary' | 'outline' | 'ghost' | 'danger';
   size?: 'sm' | 'md' | 'lg';
-  icon?: string;
+  icon?: IconName;
   iconPosition?: 'left' | 'right';
   loading?: boolean;
 }
@@ -42,15 +43,15 @@ export const Button: React.FC<ButtonProps> = ({
       {...props}
     >
       {loading ? (
-        <span className="material-symbols-outlined animate-spin text-[18px]">progress_activity</span>
+        <Icon name="progress_activity" className="animate-spin text-[18px]" />
       ) : icon && iconPosition === 'left' ? (
-        <span className="material-symbols-outlined text-[18px]">{icon}</span>
+        <Icon name={icon} className="text-[18px]" />
       ) : null}
 
       {children && <span>{children}</span>}
 
       {!loading && icon && iconPosition === 'right' && (
-        <span className="material-symbols-outlined text-[18px]">{icon}</span>
+        <Icon name={icon} className="text-[18px]" />
       )}
     </button>
   );

@@ -1,4 +1,5 @@
 import React from "react";
+import { Icon } from "./Icon";
 
 export interface SelectOption {
   value: string | number;
@@ -42,9 +43,7 @@ export const Select = React.forwardRef<HTMLSelectElement, SelectProps>(
               </option>
             ))}
           </select>
-          <span className="material-symbols-outlined absolute right-2.5 top-1/2 -translate-y-1/2 text-outline text-[18px] pointer-events-none">
-            expand_more
-          </span>
+          <Icon name="expand_more" className="absolute right-2.5 top-1/2 -translate-y-1/2 text-outline text-[18px] pointer-events-none" />
         </div>
         {error ? (
           <p className="text-[11px] text-error mt-1">{error}</p>

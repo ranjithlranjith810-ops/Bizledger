@@ -25,6 +25,7 @@ import {
 } from "@/lib/business/api-error";
 import { allocateDocumentNumber } from "@/lib/sequence/sequence-service";
 import { buildDocumentNumber } from "@/lib/invoice";
+import { assertCreateAllowed } from "@/lib/billing/entitlements-server";
 import {
   str,
   shortText,
@@ -40,13 +41,14 @@ import {
   buildCustomerSnapshot,
   sellerStateCode,
   rejectProtectedKeys,
-  ESTIMATE_STATUSES,
-} from "@/lib/sales-document/shared";
-import type { EstimateStatusT, PricingModeT } from "@/lib/sales-document/shared";
+    ESTIMATE_STATUSES,
+    ESTIMATE_STATUS_TRANSITIONS,
+    isLegalTransition,
+  } from "@/lib/sales-document/shared";
+import type { EstimateStatusT } from "@/lib/sales-document/shared";
 import type { Prisma } from "@/generated/prisma/client";
 import {
   assertFinancialYearActive,
-  assertDocumentDateInFinancialYear,
   financialYearForBusinessDate,
 } from "@/lib/financial-year/financial-year-service";
 
@@ -288,6 +290,10 @@ export async function createEstimate(
 
   const created = await prisma.$transaction(
     async (tx) => {
+      // The plan's estimate monthly quota is enforced server-side inside this
+      // transaction (business-row lock → calendar-month count → check) BEFORE
+      // the number is allocated and the record inserted.
+      await assertCreateAllowed(tx, businessId, "estimates");
       const allocated = await allocateDocumentNumber(
         businessId,
         fyId,
@@ -386,6 +392,14 @@ export async function getEstimate(businessIdInput: unknown, idInput: unknown) {
 }
 
 // Identity/numbering and conversion-linkage fields are immutable once minted.
+//
+// `status` is deliberately NOT PATCH-settable, matching the Invoice rule
+// (INVOICE_PROTECTED_KEYS + the explicit status rejection in updateInvoice):
+// status is a lifecycle fact, not a form field. Accepting an arbitrary
+// client-chosen status on PATCH would let a caller assert "Accepted" or
+// "Rejected" with no corresponding event having occurred, and — because the
+// status also decided whether the old DELETE policy would allow removal —
+// would couple a forged status to record destruction.
 const ESTIMATE_PROTECTED_KEYS = [
   "id",
   "businessId",
@@ -395,6 +409,7 @@ const ESTIMATE_PROTECTED_KEYS = [
   "updatedAt",
   "prefix",
   "estimatePrefix",
+  "status",
   "convertedQuotationId",
   "convertedQuotationNumber",
   "convertedInvoiceId",
@@ -403,8 +418,12 @@ const ESTIMATE_PROTECTED_KEYS = [
 ] as const;
 
 /**
- * PATCH — operational edit of a member's estimate (whitelist-only; totals
- * recomputed server-side). Same snapshot policy as Invoice/Quotation.
+ * PATCH — immutable after creation. An estimate is created-and-frozen: none of
+ * its content fields may be edited through the ordinary PATCH. The ONLY
+ * post-creation change is the status lifecycle (transitionEstimateStatus). Any
+ * payload field supplied here is rejected (400) rather than silently ignored,
+ * so a stale edit form surfaces its failure instead of pretending success.
+ * An empty PATCH is a harmless no-op returning the current document.
  */
 export async function updateEstimate(
   businessIdInput: unknown,
@@ -413,10 +432,21 @@ export async function updateEstimate(
 ) {
   const businessId = validateBusinessId(businessIdInput);
   const id = validateId(idInput);
-  const ctx = await requireBusinessPermission(businessId, "invoices", "edit");
-  const business = ctx.business;
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
+  // Identity/conversion/status guard: `status` is a lifecycle fact owned by the
+  // status endpoint, never a PATCH-settable field. `estimateNumber` and the
+  // conversion markers are engine-owned and immutable.
   rejectProtectedKeys(raw, ESTIMATE_PROTECTED_KEYS);
+
+  // Mass-assignment guard: NOTHING is editable on PATCH. Any residual key (i.e.
+  // any content field a client tried to change) aborts the request.
+  const contentKeys = Object.keys(raw);
+  if (contentKeys.length > 0) {
+    throw new ValidationError(
+      `Estimates are immutable after creation; ${contentKeys.join(", ")} cannot be changed. Only the status can be updated, through the estimate status endpoint.`,
+    );
+  }
 
   const existing = await prisma.estimate.findFirst({
     where: { id, businessId },
@@ -424,169 +454,55 @@ export async function updateEstimate(
   });
   if (!existing) throw new ResourceNotFoundError("Estimate not found");
 
-  const hasItems = raw.items !== undefined;
-  const items = hasItems
-    ? normalizeItems(raw.items, "estimate")
-    : existing.items.map((it) => ({
-        productId: it.productId,
-        productName: it.productName,
-        sku: it.sku,
-        hsnSac: it.hsnSac,
-        unit: it.unit,
-        quantity: Number(it.quantity),
-        rate: Number(it.rate),
-        gstRate: Number(it.gstRate),
-      }));
+  return toEstimateJson(existing);
+}
 
-  const pricingMode =
-    raw.pricingMode !== undefined
-      ? normalizePricingMode(str(raw.pricingMode) ?? "")
-      : (existing.pricingMode as PricingModeT);
+/**
+ * STATUS LIFECYCLE — the only path that changes an estimate's status.
+ *
+ * Mirrors transitionInvoiceStatus in the Invoice service, which is the
+ * repository's existing reference implementation:
+ *   1. authorize the caller against `businessId` BEFORE reading any document,
+ *      so a foreign tenant cannot probe for existence;
+ *   2. load the document scoped to that business — the CURRENT status comes
+ *      from the database row, never from the request body;
+ *   3. validate the requested edge against ESTIMATE_STATUS_TRANSITIONS;
+ *   4. apply the single status write and return the authoritative document.
+ *
+ * `requestedStatus` means "please move to this status", NOT "set the column to
+ * this value": an illegal edge (including any jump out of a terminal status)
+ * is rejected with 409 and the row is left untouched.
+ *
+ * No edit-lock semantics are added here. The repository defines no per-status
+ * field lockdown for estimates, so updateEstimate's behaviour is unchanged.
+ */
+export async function transitionEstimateStatus(
+  businessIdInput: unknown,
+  idInput: unknown,
+  requestedStatus: unknown,
+) {
+  const businessId = validateBusinessId(businessIdInput);
+  const id = validateId(idInput);
+  await requireBusinessPermission(businessId, "invoices", "edit");
 
-  let placeOfSupplyCode = String(existing.placeOfSupplyCode ?? "").trim();
-  if (raw.placeOfSupplyCode !== undefined) {
-    const s = str(raw.placeOfSupplyCode) ?? "";
-    if (s && !/^\d{2}$/.test(s)) {
-      throw new ValidationError("placeOfSupplyCode must be a 2-digit state code");
-    }
-    placeOfSupplyCode = s;
-  }
+  const target = normalizeStatus(str(requestedStatus) ?? "");
 
-  const totals = computeDocumentTotals(
-    items,
-    pricingMode,
-    sellerStateCode(business),
-    placeOfSupplyCode,
-  );
+  // Authoritative current status, scoped to the authorized business.
+  const existing = await prisma.estimate.findFirst({
+    where: { id, businessId },
+    select: { id: true, status: true },
+  });
+  if (!existing) throw new ResourceNotFoundError("Estimate not found");
 
-  const productIds = [
-    ...new Set(items.map((it) => it.productId).filter((v): v is string => v !== null)),
-  ];
-  const found =
-    productIds.length > 0
-      ? await prisma.product.findMany({
-          where: { id: { in: productIds }, businessId },
-          select: { id: true, name: true, sku: true, hsnSac: true, unit: true },
-        })
-      : [];
-  if (found.length !== productIds.length) {
-    throw new ResourceNotFoundError("One or more products were not found");
-  }
-  const productById = Object.fromEntries(found.map((p) => [p.id, p]));
-
-  const data: Prisma.EstimateUncheckedUpdateInput = {
-    taxType: totals.taxType,
-    placeOfSupplyCode: totals.placeOfSupplyCode || null,
-    subtotal: totals.subtotal,
-    taxableAmount: totals.taxableAmount,
-    cgst: totals.cgst,
-    sgst: totals.sgst,
-    igst: totals.igst,
-    totalTax: totals.totalTax,
-    grandTotal: totals.grandTotal,
-  };
-
-  if (raw.status !== undefined) {
-    data.status = normalizeStatus(str(raw.status) ?? "");
-  }
-  if (raw.pricingMode !== undefined) {
-    data.pricingMode = normalizePricingMode(str(raw.pricingMode) ?? "");
-  }
-  if (raw.scope !== undefined) {
-    const s = shortText(raw.scope, "scope");
-    data.scope = s ?? null;
-  }
-  if (raw.notes !== undefined) {
-    const s = shortText(raw.notes, "notes");
-    data.notes = s ?? null;
-  }
-  if (raw.terms !== undefined) {
-    const s = shortText(raw.terms, "terms");
-    data.terms = s ?? null;
-  }
-  if (raw.placeOfSupply !== undefined) {
-    data.placeOfSupply = str(raw.placeOfSupply) ?? null;
-  }
-  if (raw.estimateDate !== undefined || raw.date !== undefined) {
-    const d = requiredIsoDate(str(raw.estimateDate ?? raw.date), "estimateDate");
-    // F11 — the estimate's financial-year binding is immutable; a changed date
-    // must stay inside it (no cross-FY draft moves).
-    await assertDocumentDateInFinancialYear(
-      businessId,
-      existing.financialYearId,
-      d,
-      "Estimate",
+  if (!isLegalTransition(ESTIMATE_STATUS_TRANSITIONS, existing.status, target)) {
+    throw new ConflictError(
+      `Estimate cannot transition from ${existing.status} to ${target}`,
     );
-    data.estimateDate = d;
   }
-  if (raw.validUntil !== undefined) {
-    const s = str(raw.validUntil);
-    if (s) {
-      const d = new Date(s);
-      if (Number.isNaN(d.getTime())) throw new ValidationError("validUntil is not a valid date");
-      data.validUntil = d;
-    } else {
-      data.validUntil = null;
-    }
-  }
-
-  // Snapshot policy (same as Invoice/Quotation).
-  if (raw.customerId !== undefined) {
-    const customerId = validateId(raw.customerId, "customerId is invalid");
-    const customer = await prisma.customer.findFirst({
-      where: { id: customerId, businessId },
-    });
-    if (!customer) throw new ResourceNotFoundError("Customer not found");
-    data.customerId = customer.id;
-    data.customerSnapshot = buildCustomerSnapshot(customer) as Prisma.InputJsonValue;
-  }
-  if (raw.company !== undefined) {
-    if (raw.company !== null && typeof raw.company !== "object") {
-      throw new ValidationError("company must be a company snapshot object or null");
-    }
-    // A refresh is still opt-in, but the snapshot is always rebuilt from the
-    // authoritative stored profile - never from the request body.
-    data.companySnapshot = buildCompanySnapshot(
-      companyProfileRecord(business),
-    ) as Prisma.InputJsonValue;
-  }
-
-  const rewriteItems =
-    hasItems ||
-    pricingMode !== existing.pricingMode ||
-    placeOfSupplyCode !== String(existing.placeOfSupplyCode ?? "").trim();
 
   const updated = await prisma.estimate.update({
     where: { id },
-    data: rewriteItems
-      ? {
-          ...data,
-          items: {
-            deleteMany: {},
-            create: items.map((it, idx) => {
-              const line = totals.lines[idx];
-              const prod = it.productId ? productById[it.productId] : undefined;
-              return {
-                productId: it.productId,
-                productName: it.productName || (prod ? prod.name : it.productName),
-                sku: it.sku || (prod ? prod.sku : null),
-                hsnSac: it.hsnSac || (prod ? prod.hsnSac : null),
-                unit: it.unit || (prod ? prod.unit : "Pcs"),
-                quantity: it.quantity,
-                rate: it.rate,
-                pricingMode,
-                gstRate: it.gstRate,
-                taxableAmount: line.taxable,
-                cgst: line.cgst,
-                sgst: line.sgst,
-                igst: line.igst,
-                taxAmount: line.taxAmount,
-                totalAmount: line.totalAmount,
-              };
-            }),
-          },
-        }
-      : data,
+    data: { status: target },
     include: estimateInclude(),
   });
 
@@ -594,37 +510,31 @@ export async function updateEstimate(
 }
 
 /**
- * DELETE — physical removal allowed ONLY for Draft estimates. Issued estimates
- * are 409; estimates converted into a quotation or invoice are ALWAYS
- * protected (409) because deleting them would corrupt the conversion chain.
+ * DELETE — NEVER. Estimates are not deletable in ANY status, by ANY user,
+ * through ANY API.
+ *
+ * This supersedes the earlier policy, which permitted physical removal of a
+ * Draft estimate. A draft has already consumed an EST- number from its
+ * DocumentSequence for the pinned financial year, so removing it leaves a
+ * permanent gap in an auditable numbering run — and, when the estimate is the
+ * source of a conversion, it would also orphan the destination document's
+ * provenance.
+ *
+ * The route is kept (rather than removed) for API compatibility, but it can
+ * only ever reach this rejection: `prisma.estimate.delete` and `deleteMany` are
+ * NOT called from anywhere in the application. An estimate that was sent and is
+ * no longer wanted is closed with Rejected or Expired, never erased.
+ *
+ * Authorization is still evaluated FIRST, so an unauthenticated caller gets 401
+ * and a caller without `invoices.delete` on the business gets 403. Only an
+ * authorized caller reaches the 409.
  */
 export async function deleteEstimate(businessIdInput: unknown, idInput: unknown) {
   const businessId = validateBusinessId(businessIdInput);
-  const id = validateId(idInput);
+  validateId(idInput);
   await requireBusinessPermission(businessId, "invoices", "delete");
 
-  const existing = await prisma.estimate.findFirst({
-    where: { id, businessId },
-    select: {
-      id: true,
-      status: true,
-      convertedQuotationId: true,
-      convertedInvoiceId: true,
-    },
-  });
-  if (!existing) throw new ResourceNotFoundError("Estimate not found");
-
-  if (existing.status !== "Draft") {
-    throw new ConflictError(
-      "Only draft estimates can be deleted; issued estimates must be rejected or expired",
-    );
-  }
-  if (existing.convertedQuotationId || existing.convertedInvoiceId) {
-    throw new ConflictError(
-      "Estimate has been converted to another document and cannot be deleted",
-    );
-  }
-
-  await prisma.estimate.delete({ where: { id } });
-  return { id };
+  throw new ConflictError(
+    "Estimates cannot be deleted. Reject or expire the estimate instead.",
+  );
 }

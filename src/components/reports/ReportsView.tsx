@@ -1,7 +1,15 @@
 "use client";
 
-import React, { useState, useMemo } from "react";
+import React, { useState, useMemo, useCallback } from "react";
 import { useApp } from "@/context/AppContext";
+import {
+  downloadJson,
+  downloadCsv,
+  downloadXlsx,
+  downloadBlob,
+  renderReportPdf,
+  stamp,
+} from "@/lib/reportExport";
 import {
   Download,
   ArrowUpRight,
@@ -239,12 +247,163 @@ export const ReportsView: React.FC = () => {
       .slice(0, 4);
   }, [rangeInvoices, products]);
 
-  const handleDownloadReport = (reportName: string, format: string) => {
-    addNotification({
-      type: "success",
-      title: "Report Generated",
-      message: `${reportName} has been compiled and downloaded as .${format.toLowerCase()}.`,
-    });
+  const [exporting, setExporting] = useState<string | null>(null);
+
+  // Build the real report payload from the live computed data, then download a
+  // genuine file. No more "compiled and downloaded" toast without a download.
+  const handleDownloadReport = useCallback(
+    async (reportName: string, format: string) => {
+      const exportKey = `${reportName}:${format}`;
+      if (exporting === exportKey) return;
+      setExporting(exportKey);
+      try {
+        const period = `${new Intl.DateTimeFormat("en-IN", {
+          day: "2-digit",
+          month: "short",
+          year: "numeric",
+        }).format(startMs)} – ${new Intl.DateTimeFormat("en-IN", {
+          day: "2-digit",
+          month: "short",
+          year: "numeric",
+        }).format(endMs)}`;
+
+        const workbook = {
+          report: reportName,
+          generatedAt: new Date().toISOString(),
+          period: { range: dateRange, from: new Date(startMs).toISOString(), to: new Date(endMs).toISOString() },
+          summary: {
+            totalSales: Math.round(totalSales * 100) / 100,
+            totalPurchases: Math.round(totalPurchases * 100) / 100,
+            totalExpenses: Math.round(totalExpenses * 100) / 100,
+            payroll: Math.round(payroll * 100) / 100,
+            outstandingTotal: Math.round(outstandingTotal * 100) / 100,
+            netGstPayable: Math.round(netGst * 100) / 100,
+            grossMarginPct: Math.round(grossMarginPct * 100) / 100,
+            invoiceCount: rangeInvoices.length,
+            expenseCount: rangeExpenses.length,
+            purchaseOrderCount: rangePurchases.length,
+          },
+          invoices: rangeInvoices.map((i) => ({
+            number: i.invoiceNumber,
+            customer: i.customerName,
+            date: i.date,
+            status: i.status,
+            grandTotal: i.grandTotal,
+          })),
+          expenses: rangeExpenses.map((e) => ({
+            number: e.expenseNumber,
+            category: e.category,
+            title: e.title,
+            date: e.date,
+            amount: e.amount,
+          })),
+          topCustomers: topCustomers,
+          topProducts: topProducts,
+        };
+
+        const filenamePrefix = `${reportName}_${dateRange.replace(/ /g, "")}_${stamp()}`;
+        const fmt = format.toUpperCase();
+
+        if (fmt === "JSON") {
+          downloadJson(`${filenamePrefix}.json`, workbook);
+        } else if (fmt === "CSV") {
+          const rows: (string | number)[][] = [
+            ["Report", reportName],
+            ["Period", period],
+            ["Generated", new Date().toLocaleString("en-IN")],
+            [],
+            ["Metric", "Value"],
+            ["Total Sales", Math.round(totalSales)],
+            ["Total Purchases", Math.round(totalPurchases)],
+            ["Total Expenses", Math.round(totalExpenses)],
+            ["Labour & Wages", Math.round(payroll)],
+            ["Outstanding Due", Math.round(outstandingTotal)],
+            [" Net GST Payable", Math.round(netGst)],
+            ["Gross Margin %", Math.round(grossMarginPct * 100) / 100],
+            ["Invoices", rangeInvoices.length],
+            ["Expenses", rangeExpenses.length],
+            ["Purchase Orders", rangePurchases.length],
+          ];
+          downloadCsv(`${filenamePrefix}.csv`, rows);
+        } else if (fmt === "XLSX") {
+          const rows: (string | number)[][] = [
+            ["Metric", "Value"],
+            ["Total Sales", Math.round(totalSales)],
+            ["Total Purchases", Math.round(totalPurchases)],
+            ["Total Expenses", Math.round(totalExpenses)],
+            ["Labour & Wages", Math.round(payroll)],
+            ["Outstanding Due", Math.round(outstandingTotal)],
+            ["Net GST Payable", Math.round(netGst)],
+            ["Invoices", rangeInvoices.length],
+            ["Expenses", rangeExpenses.length],
+            ["Purchase Orders", rangePurchases.length],
+            [],
+            ["Invoice #", "Customer", "Date", "Status", "Grand Total"],
+            ...rangeInvoices.map((i) => [
+              i.invoiceNumber,
+              i.customerName,
+              i.date,
+              i.status,
+              i.grandTotal,
+            ]),
+          ];
+          downloadXlsx(`${filenamePrefix}.xlsx`, "Report", rows);
+        } else if (fmt === "PDF") {
+          const rows: { label: string; value: string }[] = [
+            { label: "Period", value: period },
+            { label: "Total Sales", value: inr(totalSales) },
+            { label: "Total Purchases", value: inr(totalPurchases) },
+            { label: "Total Expenses", value: inr(totalExpenses) },
+            { label: "Labour & Wages", value: inr(payroll) },
+            { label: "Outstanding Due", value: inr(outstandingTotal) },
+            { label: "Net GST Payable in Cash", value: inr(netGst) },
+            { label: "Gross Margin", value: `${grossMarginPct.toFixed(1)}%` },
+            { label: "Invoices in Period", value: String(rangeInvoices.length) },
+            { label: "Expenses in Period", value: String(rangeExpenses.length) },
+            { label: "Purchase Orders in Period", value: String(rangePurchases.length) },
+          ];
+          const bytes = await renderReportPdf(reportName, ["BizLedger Financial Report", period], rows);
+          downloadBlob(
+            `${filenamePrefix}.pdf`,
+            new Blob([new Uint8Array(bytes)], { type: "application/pdf" })
+          );
+        }
+      } catch (err) {
+        addNotification({
+          type: "error",
+          title: "Export failed",
+          message:
+            err instanceof Error
+              ? err.message
+              : "Could not build the export. Try again.",
+        });
+      } finally {
+        setExporting(null);
+      }
+    },
+    [
+      exporting,
+      addNotification,
+      dateRange,
+      startMs,
+      endMs,
+      totalSales,
+      totalPurchases,
+      totalExpenses,
+      payroll,
+      outstandingTotal,
+      netGst,
+      grossMarginPct,
+      rangeInvoices,
+      rangeExpenses,
+      rangePurchases,
+      topCustomers,
+      topProducts,
+    ]
+  );
+
+  const handlePrintReport = () => {
+    window.print();
   };
 
   if (invoices.length === 0 && expenses.length === 0 && purchaseOrders.length === 0) {
@@ -309,7 +468,7 @@ export const ReportsView: React.FC = () => {
           </div>
 
           <button
-            onClick={() => handleDownloadReport("BizLedger_Executive_Summary", "PDF")}
+            onClick={handlePrintReport}
             className="flex items-center gap-1.5 bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-semibold shadow-xs transition-colors"
           >
             <Printer className="w-4 h-4" />
@@ -473,10 +632,15 @@ export const ReportsView: React.FC = () => {
           <div className="pt-2">
             <button
               onClick={() => handleDownloadReport(`GSTR_3B_Computation_${fyMonthlyLabel.replace(/ /g, "")}`, "PDF")}
-              className="w-full bg-[#f2f4f6] hover:bg-[#eceef0] text-gray-800 font-semibold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-colors"
+              disabled={exporting !== null}
+              className="w-full bg-[#f2f4f6] hover:bg-[#eceef0] text-gray-800 font-semibold py-2 rounded-xl text-xs flex items-center justify-center gap-1.5 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-[#93000b]" />
-              <span>Download GSTR-3B Computation</span>
+              <span>
+                {exporting === `GSTR_3B_Computation_${fyMonthlyLabel.replace(/ /g, "")}:PDF`
+                  ? "Generating..."
+                  : "Download GSTR-3B Computation"}
+              </span>
             </button>
           </div>
         </div>
@@ -577,10 +741,15 @@ export const ReportsView: React.FC = () => {
             </div>
             <button
               onClick={() => handleDownloadReport(`GSTR1_Monthly_Sales_${fyMonthlyLabel.replace(/ /g, "")}`, "JSON")}
-              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs"
+              disabled={exporting !== null}
+              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <Download className="w-3.5 h-3.5 text-[#93000b]" />
-              <span>Export JSON / CSV</span>
+              <span>
+                {exporting === `GSTR1_Monthly_Sales_${fyMonthlyLabel.replace(/ /g, "")}:JSON`
+                  ? "Generating..."
+                  : "Export JSON / CSV"}
+              </span>
             </button>
           </div>
 
@@ -592,10 +761,15 @@ export const ReportsView: React.FC = () => {
             </div>
             <button
               onClick={() => handleDownloadReport(`Profit_and_Loss_Statement_${now.getFullYear()}`, "PDF")}
-              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs"
+              disabled={exporting !== null}
+              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <FileText className="w-3.5 h-3.5 text-[#93000b]" />
-              <span>Download PDF</span>
+              <span>
+                {exporting === `Profit_and_Loss_Statement_${now.getFullYear()}:PDF`
+                  ? "Generating..."
+                  : "Download PDF"}
+              </span>
             </button>
           </div>
 
@@ -609,10 +783,13 @@ export const ReportsView: React.FC = () => {
             </div>
             <button
               onClick={() => handleDownloadReport("Fleet_Fuel_Mileage_Audit", "CSV")}
-              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs"
+              disabled={exporting !== null}
+              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs disabled:opacity-60 disabled:cursor-not-allowed"
             >
               <Truck className="w-3.5 h-3.5 text-amber-700" />
-              <span>Download CSV</span>
+              <span>
+                {exporting === "Fleet_Fuel_Mileage_Audit:CSV" ? "Generating..." : "Download CSV"}
+              </span>
             </button>
           </div>
 
@@ -624,10 +801,14 @@ export const ReportsView: React.FC = () => {
             </div>
             <button
               onClick={() => handleDownloadReport("Customer_Debtors_Ageing_Report", "XLSX")}
-              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs"
+              disabled={exporting !== null}
+              className="bg-white hover:bg-gray-100 border border-[#eceef0] text-gray-800 font-semibold py-1.5 rounded-lg flex items-center justify-center gap-1.5 transition-colors text-xs disabled:opacity-60 disabled:cursor-not-allowed"
+              title="Download this report as an Excel workbook (.xlsx)"
             >
               <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-700" />
-              <span>Download Excel</span>
+              <span>
+                {exporting === "Customer_Debtors_Ageing_Report:XLSX" ? "Generating..." : "Download Excel"}
+              </span>
             </button>
           </div>
         </div>

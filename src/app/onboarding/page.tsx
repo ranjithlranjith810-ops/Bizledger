@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { onboardingRouteForStep } from "@/lib/constants";
+import { BizLedgerLoader } from "@/components/ui/BizLedgerLoader";
 
 export default function OnboardingIndex() {
   const router = useRouter();
@@ -15,7 +16,7 @@ export default function OnboardingIndex() {
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-background text-on-surface">
-      <span className="material-symbols-outlined animate-spin">progress_activity</span>
+      <BizLedgerLoader size="lg" label="Loading BizLedger" />
     </div>
   );
 }

@@ -9,6 +9,7 @@ import {
 } from "@/lib/invoice";
 import { Plus, Trash2, PackageSearch } from "lucide-react";
 import { SearchablePicker } from "@/components/invoices/SearchablePicker";
+import { normalizeBusinessText } from "@/lib/validation";
 
 export interface DocLineDraft {
   id: string;
@@ -63,7 +64,7 @@ export function LineItemsEditor({
       {
         id: `item-${Date.now()}-${lines.length}`,
         productId: prod.id,
-        description: prod.name,
+        description: normalizeBusinessText(prod.name),
         hsnSac: prod.hsnSac,
         quantity: 1,
         unit: prod.unit || "Pcs",
@@ -94,7 +95,17 @@ export function LineItemsEditor({
     value: string | number
   ) => {
     onChange(
-      lines.map((it, i) => (i === index ? { ...it, [field]: value } : it))
+      lines.map((it, i) =>
+        i === index
+          ? {
+              ...it,
+              [field]:
+                field === "description" || field === "hsnSac"
+                  ? String(value).toUpperCase()
+                  : value,
+            }
+          : it
+      )
     );
   };
 

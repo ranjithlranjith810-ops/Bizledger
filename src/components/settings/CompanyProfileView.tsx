@@ -1,15 +1,16 @@
 "use client";
 
-import React, { useState, useMemo, useRef } from "react";
+import React, { useEffect, useState, useMemo, useRef } from "react";
 import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { useAuth } from "@/context/AuthContext";
-import { EMPTY_COMPANY_PROFILE, INITIAL_COMPANY_PROFILE } from "@/data/mockData";
 import { normalizeInvoicePrefix, fySlug } from "@/lib/invoice";
-import { validateCompanyProfileForm } from "@/lib/validation";
+import { validateCompanyProfileForm, normalizeBusinessText } from "@/lib/validation";
 import { INDIAN_STATES } from "@/lib/india";
 import { saveBusinessSignature, deleteBusinessSignature } from "@/lib/signature";
+import { bakeLogoOrientation } from "@/lib/image-orientation";
 import { SignatureCanvasModal } from "@/components/settings/SignatureCanvasModal";
+import { Icon } from "../ui/Icon";
 import {
   Building2,
   UploadCloud,
@@ -17,9 +18,7 @@ import {
   MapPin,
   ShieldCheck,
   Landmark,
-  RefreshCcw,
   Trash2,
-  LoaderCircle,
   LogOut,
   Signature,
   Hash,
@@ -27,20 +26,43 @@ import {
 } from "lucide-react";
 
 export const CompanyProfileView: React.FC = () => {
-  const { companyProfile, updateCompanyProfile, resetBusinessData, resetEntireSetup, loadDemoData, getActiveFinancialYear } = useApp();
+  const { companyProfile, updateCompanyProfile, getActiveFinancialYear } = useApp();
   const { account, logout } = useAuth();
   const router = useRouter();
 
   const [formData, setFormData] = useState({ ...companyProfile });
-  // Single source of truth for the save form. Both the top and the bottom Save
-  // buttons submit through the SAME <form> element so there is one handler, one
-  // validation pass, one loading state and one success message (no double write).
-  const formRef = useRef<HTMLFormElement>(null);
+  // The server profile hydrates asynchronously AFTER this view mounts (the
+  // AppContext GET /api/businesses/[id] call). formData must not stay frozen on
+  // the empty pre-hydration snapshot: that made the Address field appear empty
+  // on first load, and a Save made from that state echoed the blank address back
+  // to the server, silently erasing a previously stored address. Adopt the
+  // authoritative profile as soon as it arrives, but never once the user has
+  // started editing (their in-progress input wins).
+  const dirtyRef = useRef(false);
+  const lastSyncedRef = useRef(companyProfile);
+  // Mount-time preview values: adoption only replaces the preview when it still
+  // matches what this mount initialized with, so an in-session logo/signature
+  // change (even one that never touched any form input) is never clobbered.
+  const mountLogoRef = useRef(companyProfile.logoUrl);
+  const mountSigRef = useRef(companyProfile.digitalSignatureUrl);
   const [logoPreview, setLogoPreview] = useState<string | undefined>(companyProfile.logoUrl);
   const [signaturePreview, setSignaturePreview] = useState<string | undefined>(companyProfile.digitalSignatureUrl);
-  const [confirmReset, setConfirmReset] = useState(false);
-  const [confirmLoadDemo, setConfirmLoadDemo] = useState(false);
-  const [confirmFullReset, setConfirmFullReset] = useState(false);
+  useEffect(() => {
+    if (dirtyRef.current) return;
+    if (companyProfile === lastSyncedRef.current) return;
+    setFormData({ ...companyProfile });
+    // The logo/signature previews have the same mount-time init race as the
+    // form: they are snapshot from the pre-hydration profile. Adopt the stored
+    // URLs alongside the rest of the profile so a persisted logo/signature is
+    // shown again right after a refresh.
+    setLogoPreview((prev) => (prev === mountLogoRef.current ? companyProfile.logoUrl ?? prev : prev));
+    setSignaturePreview((prev) => (prev === mountSigRef.current ? companyProfile.digitalSignatureUrl ?? prev : prev));
+    lastSyncedRef.current = companyProfile;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [companyProfile]);
+  // Single save path: the one Save Changes button submits through the <form>
+  // element (one handler, one validation pass, one loading state, one toast).
+  const formRef = useRef<HTMLFormElement>(null);
   const [signatureCanvasOpen, setSignatureCanvasOpen] = useState(false);
   const [confirmRemoveSignature, setConfirmRemoveSignature] = useState(false);
   const [validationErrors, setValidationErrors] = useState<Record<string, string>>({});
@@ -53,14 +75,21 @@ export const CompanyProfileView: React.FC = () => {
 
   const handleLogoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (file) {
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setLogoPreview(reader.result as string);
-        setFormData((prev) => ({ ...prev, logoUrl: reader.result as string }));
-      };
-      reader.readAsDataURL(file);
-    }
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const raw = reader.result as string;
+      void bakeLogoOrientation(raw).then((normalized) => {
+        setLogoPreview(normalized);
+        setFormData((prev) => ({ ...prev, logoUrl: normalized }));
+      });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleClearLogo = () => {
+    setLogoPreview(undefined);
+    setFormData((prev) => ({ ...prev, logoUrl: "" }));
   };
 
   const handleSignatureUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -106,29 +135,66 @@ export const CompanyProfileView: React.FC = () => {
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+
+    // Business/display text that is printed on invoices (company name, address,
+    // bank, terms) is stored in UPPERCASE. Registrations, contacts and account
+    // identifiers keep their natural case.
+    // The legacy split-address mirror fields (addressLine1/addressLine2) are
+    // NOT managed by this form and must stay out of the payload: AppContext's
+    // updateCompanyProfile mirrors streetAddress from those two whenever either
+    // key is present, so echoing the stored "" (they are empty for tenants that
+    // only ever used the Street Address field) silently CLOBBERED a freshly
+    // edited street back to blank. Exclude them so a settings save only ever
+    // affects the fields this view owns.
+    const {
+      addressLine1: _legacyAddressLine1,
+      addressLine2: _legacyAddressLine2,
+      ...formEditableFields
+    } = formData;
+    const normalized = {
+      ...formEditableFields,
+      companyName: normalizeBusinessText(formData.companyName),
+      ownerName: formData.ownerName
+        ? normalizeBusinessText(formData.ownerName)
+        : formData.ownerName,
+      streetAddress: normalizeBusinessText(formData.streetAddress),
+      city: normalizeBusinessText(formData.city),
+      bankName: formData.bankName
+        ? normalizeBusinessText(formData.bankName)
+        : formData.bankName,
+      paymentTerms: formData.paymentTerms
+        ? normalizeBusinessText(formData.paymentTerms)
+        : formData.paymentTerms,
+      invoiceTerms: formData.invoiceTerms
+        ? normalizeBusinessText(formData.invoiceTerms)
+        : formData.invoiceTerms,
+      invoicePrefix: formData.invoicePrefix.trim().toUpperCase(),
+    };
+
     const errors = validateCompanyProfileForm({
-      name: formData.companyName,
-      gstin: formData.gstin,
-      pan: formData.pan,
-      email: formData.email,
-      phone: formData.mobile,
+      name: normalized.companyName,
+      gstin: normalized.gstin,
+      gstRegistered: normalized.gstRegistered ?? "unregistered",
+      pan: normalized.pan,
+      email: normalized.email,
+      phone: normalized.mobile,
       state: stateOptionValue,
-      city: formData.city,
-      streetAddress: formData.streetAddress,
-      pincode: formData.pincode,
-      invoicePrefix: formData.invoicePrefix,
+      city: normalized.city,
+      streetAddress: normalized.streetAddress,
+      pincode: normalized.pincode,
+      invoicePrefix: normalized.invoicePrefix,
     });
     if (Object.keys(errors).length > 0) {
       setValidationErrors(errors);
       return;
     }
     setValidationErrors({});
-    updateCompanyProfile(formData);
+    updateCompanyProfile(normalized);
   };
 
-  const handleLogout = () => {
-    logout();
-    router.replace("/");
+  const handleLogout = async () => {
+    await logout();
+    router.replace("/login");
   };
 
   return (
@@ -152,7 +218,7 @@ export const CompanyProfileView: React.FC = () => {
       </div>
 
       {/* Form (Stitch Design #3) */}
-      <form ref={formRef} onSubmit={handleSubmit} className="space-y-6 text-xs">
+      <form ref={formRef} onSubmit={handleSubmit} onInput={() => { dirtyRef.current = true; }} className="space-y-6 text-xs">
         {Object.keys(validationErrors).length > 0 && (
           <div className="bg-red-50 border border-red-200 text-red-700 rounded-xl p-4">
             <div className="font-semibold">Please correct the following to save your profile:</div>
@@ -177,7 +243,7 @@ export const CompanyProfileView: React.FC = () => {
                 <img
                   src={logoPreview}
                   alt="Company Logo"
-                  className="w-24 h-24 rounded-2xl object-cover border-2 border-gray-200 shadow-xs"
+                  className="max-h-24 max-w-36 rounded-2xl object-contain border-2 border-gray-200 shadow-xs bg-white p-2"
                 />
               ) : (
                 <div className="w-24 h-24 rounded-2xl bg-rose-50 text-[#93000b] border-2 border-dashed border-rose-200 flex flex-col items-center justify-center font-bold text-lg">
@@ -200,6 +266,16 @@ export const CompanyProfileView: React.FC = () => {
                 Upload New Image (.PNG / .JPG up to 5MB)
                 <input type="file" accept="image/*" onChange={handleLogoUpload} className="hidden" />
               </label>
+              {logoPreview && (
+                <button
+                  type="button"
+                  onClick={handleClearLogo}
+                  className="mt-2 ml-3 inline-flex items-center gap-1.5 text-xs font-semibold text-rose-600 hover:text-rose-700"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Clear Logo
+                </button>
+              )}
             </div>
           </div>
 
@@ -212,8 +288,8 @@ export const CompanyProfileView: React.FC = () => {
                 type="text"
                 required
                 value={formData.companyName}
-                onChange={(e) => setFormData({ ...formData, companyName: e.target.value })}
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-semibold text-gray-900"
+                onChange={(e) => setFormData({ ...formData, companyName: e.target.value.toUpperCase() })}
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-semibold text-gray-900 uppercase"
               />
             </div>
 
@@ -241,8 +317,8 @@ export const CompanyProfileView: React.FC = () => {
               <input
                 type="text"
                 value={formData.ownerName}
-                onChange={(e) => setFormData({ ...formData, ownerName: e.target.value })}
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-medium"
+                onChange={(e) => setFormData({ ...formData, ownerName: e.target.value.toUpperCase() })}
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-medium uppercase"
               />
             </div>
           </div>
@@ -456,8 +532,8 @@ export const CompanyProfileView: React.FC = () => {
                 type="text"
                 required
                 value={formData.streetAddress}
-                onChange={(e) => setFormData({ ...formData, streetAddress: e.target.value })}
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none"
+                onChange={(e) => setFormData({ ...formData, streetAddress: e.target.value.toUpperCase() })}
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none uppercase"
               />
             </div>
 
@@ -469,8 +545,8 @@ export const CompanyProfileView: React.FC = () => {
                 type="text"
                 required
                 value={formData.city}
-                onChange={(e) => setFormData({ ...formData, city: e.target.value })}
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none"
+                onChange={(e) => setFormData({ ...formData, city: e.target.value.toUpperCase() })}
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none uppercase"
               />
             </div>
 
@@ -541,7 +617,7 @@ export const CompanyProfileView: React.FC = () => {
                 required
                 value={formData.pan}
                 onChange={(e) => setFormData({ ...formData, pan: e.target.value.toUpperCase() })}
-                placeholder="ABCDE1234F"
+                placeholder="ABCPE1234F"
                 className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-mono font-bold uppercase"
               />
             </div>
@@ -552,7 +628,7 @@ export const CompanyProfileView: React.FC = () => {
               </label>
               <input
                 type="text"
-                value={formData.udyamNo}
+                value={formData.udyamNo ?? ""}
                 onChange={(e) => setFormData({ ...formData, udyamNo: e.target.value })}
                 placeholder="UDYAM-TN-03-0012345"
                 className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-mono"
@@ -576,8 +652,8 @@ export const CompanyProfileView: React.FC = () => {
               <input
                 type="text"
                 value={formData.bankName}
-                onChange={(e) => setFormData({ ...formData, bankName: e.target.value })}
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-medium"
+                onChange={(e) => setFormData({ ...formData, bankName: e.target.value.toUpperCase() })}
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-medium uppercase"
               />
             </div>
 
@@ -625,10 +701,10 @@ export const CompanyProfileView: React.FC = () => {
             </label>
             <input
               type="text"
-              value={formData.paymentTerms}
-              onChange={(e) => setFormData({ ...formData, paymentTerms: e.target.value })}
+              value={formData.paymentTerms ?? ""}
+              onChange={(e) => setFormData({ ...formData, paymentTerms: e.target.value.toUpperCase() })}
               placeholder="Immediate (NEFT/RTGS/CHEQUE)"
-              className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-medium"
+              className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none font-medium uppercase"
             />
             <p className="text-[11px] text-gray-400 mt-1">
               Leave empty to use the default: “Immediate (NEFT/RTGS/CHEQUE)”.
@@ -642,9 +718,9 @@ export const CompanyProfileView: React.FC = () => {
             <textarea
               rows={3}
               value={formData.invoiceTerms}
-              onChange={(e) => setFormData({ ...formData, invoiceTerms: e.target.value })}
+              onChange={(e) => setFormData({ ...formData, invoiceTerms: e.target.value.toUpperCase() })}
               placeholder={"1. Goods once sold...\n2. Replacement only for manufacturing defects...\n3. Payment before dispatch...\n4. Interest @18% p.a. on overdue...\n5. Subject to Tamil Nadu jurisdiction."}
-              className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none resize-none font-mono text-[11px]"
+              className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none resize-none font-mono text-[11px] uppercase"
             />
             <p className="text-[11px] text-gray-400 mt-1">
               One clause per line. Leave empty to use the default 5-clause Terms
@@ -658,7 +734,7 @@ export const CompanyProfileView: React.FC = () => {
             </label>
             <textarea
               rows={2}
-              value={formData.gstSupportInfo}
+              value={formData.gstSupportInfo ?? ""}
               onChange={(e) => setFormData({ ...formData, gstSupportInfo: e.target.value })}
               placeholder="e.g. GST payments as per GSTIN; support available Mon–Sat 9am–6pm at support@bizledger.io"
               className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] focus:bg-white rounded-lg outline-none resize-none font-mono text-[11px]"
@@ -669,188 +745,7 @@ export const CompanyProfileView: React.FC = () => {
             </p>
           </div>
         </div>
-
-        {/* Submit */}
-        <div className="flex items-center justify-end gap-3 pt-2">
-          <button
-            type="submit"
-            className="bg-[#93000b] hover:bg-[#770008] text-white py-3 px-8 rounded-xl font-bold shadow-xs transition-colors flex items-center gap-2"
-          >
-            <Save className="w-4 h-4" />
-            <span>Save Profile & Invoicing Settings</span>
-          </button>
-        </div>
       </form>
-
-      {/* Load Demo Data */}
-      <div className="bg-[#f0fdf4] p-5 rounded-xl border border-[#bbf7d0] shadow-xs">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-start gap-2">
-            <div className="w-10 h-10 rounded-xl bg-[#dcfce7] text-[#166534] flex items-center justify-center shrink-0">
-              <LoaderCircle className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2 font-bold text-[#191c1e] uppercase tracking-wider">
-                <RefreshCcw className="w-4 h-4 text-[#15803d]" />
-                <span>Load Demo Data</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-1 max-w-lg">
-                Populate your account with the sample BizLedger demo dataset
-                (customers, products, invoices, expenses, vehicles, team and
-                plan) so you can explore the platform with realistic numbers.
-                This overwrites the current data in your account.
-              </p>
-            </div>
-          </div>
-
-          {confirmLoadDemo ? (
-            <div className="flex items-center gap-2 shrink-0">
-              <span className="text-xs font-semibold text-[#166534]">
-                Load demo data?
-              </span>
-              <button
-                onClick={() => {
-                  loadDemoData();
-                  setFormData({ ...INITIAL_COMPANY_PROFILE });
-                  setConfirmLoadDemo(false);
-                }}
-                className="bg-[#15803d] hover:bg-[#166534] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-xs transition-colors flex items-center gap-1.5"
-              >
-                <RefreshCcw className="w-3.5 h-3.5" />
-                Confirm Load
-              </button>
-              <button
-                onClick={() => setConfirmLoadDemo(false)}
-                className="px-3 py-2 rounded-lg border border-[#bbf7d0] text-xs font-semibold text-[#166534] hover:bg-[#dcfce7] transition-colors"
-              >
-                Cancel
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={() => setConfirmLoadDemo(true)}
-              className="bg-[#15803d] hover:bg-[#166534] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-xs transition-colors flex items-center gap-1.5 shrink-0"
-            >
-              <RefreshCcw className="w-3.5 h-3.5" />
-              Load Demo Data
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Reset Business Data */}
-      <div className="bg-white p-5 rounded-xl border border-red-100 shadow-xs">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-start gap-2">
-            <div className="w-10 h-10 rounded-xl bg-[#fef2f2] text-[#93000b] flex items-center justify-center shrink-0">
-              <Trash2 className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2 font-bold text-[#191c1e] uppercase tracking-wider">
-                <RefreshCcw className="w-4 h-4 text-[#93000b]" />
-                <span>Reset Business Data</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-1 max-w-lg">
-                Clears ALL business <span className="font-semibold">records</span>{" "}
-                (customers, products, invoices, expenses, vehicles, team and
-                notifications) back to a fresh, zero-value ledger. Your business
-                setup — company profile, financial years, invoice configuration
-                and plan — is preserved. Your account and sign-in are kept.
-              </p>
-            </div>
-          </div>
-
-          {confirmReset ? (
-            <div className="flex items-center gap-2 shrink-0">
-              <span className="text-xs font-semibold text-[#93000b]">
-                Clear all data?
-              </span>
-              <button
-                onClick={() => {
-                  resetBusinessData();
-                  setFormData({ ...companyProfile });
-                  setConfirmReset(false);
-                }}
-                className="bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-xs transition-colors flex items-center gap-1.5"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Confirm Reset
-              </button>
-              <button
-                onClick={() => setConfirmReset(false)}
-                className="px-3 py-2 rounded-lg border border-[#eceef0] text-xs font-semibold text-gray-600 hover:bg-gray-100 transition-colors"
-              >
-                Cancel
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={() => setConfirmReset(true)}
-              className="border border-red-200 text-[#93000b] hover:bg-[#fef2f2] px-4 py-2 rounded-lg text-xs font-bold transition-colors flex items-center gap-1.5 shrink-0"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              Reset Business Data
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Reset Entire Business Setup */}
-      <div className="bg-[#fef2f2] p-5 rounded-xl border border-[#fecaca] shadow-xs">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div className="flex items-start gap-2">
-            <div className="w-10 h-10 rounded-xl bg-[#fee2e2] text-[#93000b] flex items-center justify-center shrink-0">
-              <Trash2 className="w-5 h-5" />
-            </div>
-            <div>
-              <div className="flex items-center gap-2 font-bold text-[#191c1e] uppercase tracking-wider">
-                <Trash2 className="w-4 h-4 text-[#93000b]" />
-                <span>Reset Entire Business Setup</span>
-              </div>
-              <p className="text-xs text-gray-500 mt-1 max-w-lg">
-                Wipes the <span className="font-semibold">entire setup</span> back
-                to a brand-new account: company profile, financial years, invoice
-                configuration, records AND subscription/plan. You will be guided
-                through the onboarding wizard again on next navigation.
-              </p>
-            </div>
-          </div>
-
-          {confirmFullReset ? (
-            <div className="flex items-center gap-2 shrink-0">
-              <span className="text-xs font-semibold text-[#93000b]">
-                Reset everything?
-              </span>
-              <button
-                onClick={() => {
-                  resetEntireSetup();
-                  setFormData({ ...EMPTY_COMPANY_PROFILE });
-                  setConfirmFullReset(false);
-                  router.replace("/onboarding");
-                }}
-                className="bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-xs transition-colors flex items-center gap-1.5"
-              >
-                <Trash2 className="w-3.5 h-3.5" />
-                Confirm Full Reset
-              </button>
-              <button
-                onClick={() => setConfirmFullReset(false)}
-                className="px-3 py-2 rounded-lg border border-[#fecaca] text-xs font-semibold text-[#93000b] hover:bg-[#ffe4e6] transition-colors"
-              >
-                Cancel
-              </button>
-            </div>
-          ) : (
-            <button
-              onClick={() => setConfirmFullReset(true)}
-              className="bg-[#93000b] hover:bg-[#770008] text-white px-4 py-2 rounded-lg text-xs font-bold shadow-xs transition-colors flex items-center gap-1.5 shrink-0"
-            >
-              <Trash2 className="w-3.5 h-3.5" />
-              Reset Entire Business Setup
-            </button>
-          )}
-        </div>
-      </div>
 
       {/* Log out */}
       <div className="bg-white p-5 rounded-xl border border-outline-variant/50 shadow-xs">
@@ -870,7 +765,7 @@ export const CompanyProfileView: React.FC = () => {
                   {account?.email || "you"}
                 </span>
                 . Logging out returns you to the landing page. Your business
-                data stays saved in this browser for when you log back in.
+                data stays saved to your account for when you log back in.
               </p>
             </div>
           </div>
@@ -908,7 +803,7 @@ export const CompanyProfileView: React.FC = () => {
                 className="p-1 rounded-md text-secondary hover:text-on-surface hover:bg-surface-container-low transition-colors"
                 aria-label="Close"
               >
-                <span className="material-symbols-outlined text-[20px]">close</span>
+                <Icon name="close" className="text-[20px]" />
               </button>
             </div>
             <div className="px-6 py-4">

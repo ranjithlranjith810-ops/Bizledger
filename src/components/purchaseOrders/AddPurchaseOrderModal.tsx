@@ -1,14 +1,31 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 import { useApp } from "@/context/AppContext";
 import { PurchaseOrder, InvoiceItem, PricingMode } from "@/types";
 import { calculateLineTotals, calculateInvoiceTotals, buildDocumentNumber } from "@/lib/invoice";
 import { financialYearForDate, matchFinancialYear } from "@/lib/financialYear";
 import { localDateString, parseLocalDate } from "@/lib/dates";
 import { fyShortName } from "@/lib/utils";
-import { X, Check, Ship } from "lucide-react";
+import { X, Check, Ship, GraduationCap } from "lucide-react";
 import { LineItemsEditor, DocLineDraft, TotalsLabels } from "@/components/shared/LineItemsEditor";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
+import { normalizeBusinessText } from "@/lib/validation";
+import { useSubmitGuard } from "@/hooks/useSubmitGuard";
+import { DocumentImmutabilityWarning } from "@/components/documents/DocumentImmutabilityWarning";
+import { DocumentExperienceModal } from "@/components/documents/DocumentExperienceModal";
+import { DocumentCreateConfirmation } from "@/components/documents/DocumentCreateConfirmation";
+import { DocumentSubmitLoading } from "@/components/documents/DocumentSubmitLoading";
+import { DocumentCreateSuccess } from "@/components/documents/DocumentCreateSuccess";
+import {
+  isLearningDismissed,
+  isLearningSeen,
+  markLearningSeen,
+} from "@/lib/document-experience";
+import { openCreatedDocumentPdf } from "@/lib/open-document-pdf";
+import type { DocPdfItem, DocPdfMetaRow } from "@/lib/print/document-pdf";
+import { Icon } from "../ui/Icon";
 
 const STATUS_OPTIONS = [
   "Draft",
@@ -45,11 +62,13 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
     getActiveFinancialYear,
     financialYears,
     documentSequenceFor,
-    mintDocumentNumber,
+    isServerSequenceReady,
+    syncServerSequence,
   } = useApp();
 
   const isEdit = !!po;
   const activeFy = getActiveFinancialYear();
+  const router = useRouter();
 
   const companyAddress = [
     companyProfile.addressLine1,
@@ -83,13 +102,33 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
           )}, but the active financial year is ${activeFy ? fyShortName(activeFy.name) : "unset"}. The financial year is derived from the document date — saving will be rejected.`
         : null;
 
+  // Nothing is shown until the server has confirmed this (FY, kind) counter; the
+  // only earlier value is the localStorage seed, which starts at 1 on a fresh
+  // browser and can be arbitrarily wrong.
+  const seqReady = isServerSequenceReady(previewFy.id, "purchaseOrder");
   const displayedNumber = isEdit
     ? po?.poNumber || ""
-    : buildDocumentNumber(
-        "purchaseOrder",
-        previewFy.name,
-        documentSequenceFor(previewFy.id, "purchaseOrder")
-      );
+    : !seqReady
+      ? ""
+      : buildDocumentNumber(
+          "purchaseOrder",
+          previewFy.name,
+          documentSequenceFor(previewFy.id, "purchaseOrder")
+        );
+
+  // The preview must be the SERVER's counter, never a locally minted one. The
+  // local cache starts at 1 on a fresh browser and is otherwise never told what
+  // the server already handed out, so previewing from it can advertise a number
+  // that already exists. Reconcile ONE kind — purchase orders only — for the FY
+  // the document date actually falls in, whenever that FY changes.
+  //
+  // `syncServerSequence` is a read-only peek: it never allocates, never reserves
+  // and never blocks the form. The authoritative number is allocated by the
+  // server inside the create transaction.
+  useEffect(() => {
+    if (isEdit || !previewFy.id) return;
+    void syncServerSequence(previewFy.id, "purchaseOrder");
+  }, [isEdit, previewFy.id, syncServerSequence]);
 
   const [vendorName, setVendorName] = useState<string>(po?.vendor.name || "");
   const [vendorContact, setVendorContact] = useState<string>(
@@ -139,10 +178,44 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
     else setOpenModal(null);
   };
 
+  const dialogRef = useModalBehavior(handleClose);
+
   // Fix C: async so the modal closes only after the persisted purchase order
   // exists (see AddInvoiceModal.handleSubmit).
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  //
+  // `submitForm` holds the real work; `handleSubmit` wraps it in the
+  // single-flight guard so a rapid double click cannot dispatch two purchase
+  // order creates.
+  const { isSubmitting, run: runSubmit } = useSubmitGuard();
+
+  // Create-only experience: sample preview + learning tour (first run), the
+  // in-form immutability warning, a confirmation dialog before the API call, a
+  // loading overlay while it runs, and a success panel with View PDF / view /
+  // list actions. Edit mode is not part of this flow.
+  const [wantsSample, setWantsSample] = useState(false);
+  const [wantConfirm, setWantConfirm] = useState(false);
+  const [createdPo, setCreatedPo] = useState<PurchaseOrder | null>(null);
+  const [firstRunWantsSample] = useState(
+    () => !isLearningSeen("purchaseOrder") && !isLearningDismissed("purchaseOrder"),
+  );
+  const [learningDismissed] = useState(() => isLearningDismissed("purchaseOrder"));
+  useEffect(() => {
+    if (!firstRunWantsSample) return;
+    const t = window.setTimeout(() => setWantsSample(true), 350);
+    return () => window.clearTimeout(t);
+  }, [firstRunWantsSample]);
+
+  // Render-level totals preview (also used by the confirmation summary).
+  const totalsPreview = calculateInvoiceTotals(
+    items.map((it) => ({
+      quantity: it.quantity,
+      unitPrice: it.unitPrice,
+      gstRate: it.gstRate,
+    })),
+    pricingMode
+  );
+
+  const submitForm = async () => {
     if (!vendorName.trim()) return;
     if (items.length === 0) return;
 
@@ -158,7 +231,7 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
       return {
         id: it.id,
         productId: it.productId,
-        description: it.description?.trim() || "Item",
+        description: normalizeBusinessText(it.description) || "ITEM",
         hsnSac: it.hsnSac,
         quantity: it.quantity,
         unit: it.unit,
@@ -180,20 +253,23 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
     );
 
     const snapshot: Omit<PurchaseOrder, "id" | "createdAt"> = {
-      poNumber: isEdit
-        ? (po?.poNumber ?? displayedNumber)
-        : mintDocumentNumber(companyProfile.invoicePrefix || "PO", "purchaseOrder"),
+      // An edit keeps its own number; a create sends NO client number so the
+      // engine allocates the authoritative one inside the create transaction.
+      // `displayedNumber` is a read-only preview and must never be submitted.
+      // (The engine already ignores this field on create, so minting here was
+      // dead weight that only ever misled the user.)
+      poNumber: isEdit ? (po?.poNumber ?? displayedNumber) : "",
       vendor: {
-        name: vendorName.trim(),
-        contactPerson: vendorContact.trim() || undefined,
+        name: normalizeBusinessText(vendorName),
+        contactPerson: normalizeBusinessText(vendorContact) || undefined,
         email: vendorEmail.trim() || undefined,
         phone: vendorPhone.trim() || undefined,
-        gstin: vendorGstin.trim() || undefined,
-        address: vendorAddress.trim() || undefined,
+        gstin: vendorGstin.trim().toUpperCase(),
+        address: normalizeBusinessText(vendorAddress) || undefined,
       },
       date,
       deliveryDate: deliveryDate || undefined,
-      deliveryAddress: deliveryAddress.trim() || undefined,
+      deliveryAddress: normalizeBusinessText(deliveryAddress) || undefined,
       deliveryMode: deliveryMode.trim() || undefined,
       items: invoiceItems,
       subtotal: totals.subtotal,
@@ -204,19 +280,93 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
       grandTotal: totals.grandTotal,
       status: status as PurchaseOrder["status"],
       pricingMode,
-      notes,
-      terms,
+      notes: notes ? normalizeBusinessText(notes) : "",
+      terms: normalizeBusinessText(terms),
     };
 
     if (isEdit && po) {
       updatePurchaseOrder({ ...po, ...snapshot, poNumber: po.poNumber });
       handleClose();
-    } else {
-      // Fix C: only close when the server returned a persisted purchase order.
-      const created = await addPurchaseOrder(snapshot);
-      if (created) handleClose();
+      return;
+    }
+    // Fix C: only surface success once the server returned a persisted order.
+    const created = await addPurchaseOrder(snapshot);
+    if (!created) return;
+    setCreatedPo(created);
+  };
+
+  // The confirmation is the human gate; submission is single-flight so a
+  // double click can never dispatch two creates.
+  const confirmCreate = () => {
+    setWantConfirm(false);
+    void runSubmit(submitForm);
+  };
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isSubmitting) return;
+    if (isEdit) {
+      void runSubmit(submitForm);
+      return;
+    }
+    if (!vendorName.trim() || items.length === 0) return;
+    setWantConfirm(true);
+  };
+
+  const closeSample = () => {
+    markLearningSeen("purchaseOrder");
+    setWantsSample(false);
+  };
+
+  const handleCreatedPdf = async () => {
+    if (!createdPo) return;
+    const d = createdPo;
+    const metaRows: DocPdfMetaRow[] = [
+      { label: "PO Date", value: d.date },
+      ...(d.deliveryDate ? [{ label: "Delivery Date", value: d.deliveryDate }] : []),
+    ];
+    const itemsPdf: DocPdfItem[] = d.items.map((it) => ({
+      description: it.description,
+      hsnSac: it.hsnSac,
+      quantity: it.quantity,
+      unit: it.unit,
+      unitPrice: it.unitPrice,
+      taxableAmount: it.taxableAmount,
+      gstRate: it.gstRate,
+      totalAmount: it.totalAmount,
+    }));
+    try {
+      await openCreatedDocumentPdf(companyProfile, {
+        banner: "Purchase Order",
+        subtitle: "An official order issued by you to a supplier (buyer → seller).",
+        docNumber: d.poNumber,
+        metaRows,
+        party: {
+          title: "Vendor (Supplier)",
+          name: d.vendor.name,
+          address: d.vendor.address,
+          phone: d.vendor.phone,
+          gstin: d.vendor.gstin,
+        },
+        deliveryBlock: {
+          deliveryDate: d.deliveryDate,
+          deliveryAddress: d.deliveryAddress,
+          deliveryMode: d.deliveryMode,
+        },
+        items: itemsPdf,
+        subtotal: d.subtotal,
+        cgst: d.cgst,
+        sgst: d.sgst,
+        total: d.grandTotal,
+        notes: d.notes,
+        terms: d.terms,
+        footerNote: "This purchase order is not a tax invoice.",
+      });
+    } catch {
+      // Popup blocked / render failure: the list still shows it.
     }
   };
+
 
   const totalsLabels: TotalsLabels = {
     subtotal: "GST Exclusive Amount",
@@ -225,8 +375,67 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
     total: "Total Including GST",
   };
 
+  // Create-success panel: the server has persisted the purchase order; offer
+  // View PDF (rendered from the created record) / View / Go to list / Close.
+  if (createdPo) {
+    return (
+      <div
+        ref={dialogRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="purchase-order-title"
+        className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+      >
+        <div className="bg-white rounded-2xl shadow-2xl max-w-xl w-full overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
+          <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-[#eef2ff] text-[#3730a3] flex items-center justify-center">
+                <Ship className="w-5 h-5" />
+              </div>
+              <h3
+                id="purchase-order-title"
+                className="text-base font-bold text-[#191c1e]"
+              >
+                Purchase Order Created
+              </h3>
+            </div>
+            <button
+              onClick={handleClose}
+              aria-label="Close purchase order dialog"
+              className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
+          <DocumentCreateSuccess
+            kind="purchaseOrder"
+            number={createdPo.poNumber}
+            onViewPdf={handleCreatedPdf}
+            onViewDocument={() => {
+              handleClose();
+              router.push(`/purchase-orders/${createdPo.id}`);
+            }}
+            onGoToList={() => {
+              handleClose();
+              router.push("/purchase-orders");
+            }}
+            onClose={handleClose}
+          />
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="purchase-order-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
           <div className="flex items-center gap-3">
@@ -234,7 +443,7 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
               <Ship className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">
+              <h3 id="purchase-order-title" className="text-base font-bold text-[#191c1e]">
                 {isEdit ? "Edit Purchase Order" : "Create New Purchase Order"}
               </h3>
               <p className="text-xs text-gray-500">
@@ -245,6 +454,7 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
           </div>
           <button
             onClick={handleClose}
+            aria-label="Close purchase order dialog"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -255,11 +465,19 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
           onSubmit={handleSubmit}
           className="flex-1 overflow-y-auto p-6 space-y-6 text-xs"
         >
+          {!isEdit && !learningDismissed && (
+            <button
+              type="button"
+              onClick={() => setWantsSample(true)}
+              className="self-start inline-flex items-center gap-1.5 text-[#93000b] hover:text-[#770008] border border-[#ecd7d7] hover:border-[#93000b] bg-white rounded-xl px-3.5 py-2 text-xs font-semibold transition-colors"
+            >
+              <GraduationCap className="w-4 h-4" />
+              View sample purchase order &amp; learn
+            </button>
+          )}
           <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] space-y-4">
             <div className="flex items-center gap-2">
-              <span className="material-symbols-outlined text-[16px] text-[#3730a3]">
-                local_shipping
-              </span>
+              <Icon name="local_shipping" className="text-[16px] text-[#3730a3]" />
               <span className="font-bold text-gray-800 uppercase tracking-wider text-[11px]">
                 Vendor (Supplier) Details
               </span>
@@ -273,9 +491,9 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
                   type="text"
                   required
                   value={vendorName}
-                  onChange={(e) => setVendorName(e.target.value)}
+                  onChange={(e) => setVendorName(e.target.value.toUpperCase())}
                   placeholder="e.g. Shree Radhe Auto Parts"
-                  className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                  className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
                 />
               </div>
               <div>
@@ -285,8 +503,8 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
                 <input
                   type="text"
                   value={vendorContact}
-                  onChange={(e) => setVendorContact(e.target.value)}
-                  className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                  onChange={(e) => setVendorContact(e.target.value.toUpperCase())}
+                  className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
                 />
               </div>
               <div>
@@ -442,9 +660,7 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
           {/* Price Type selector */}
           <div className="bg-[#f7f9fb] p-4 rounded-xl border border-[#eceef0] flex flex-col sm:flex-row sm:items-center gap-3">
             <div className="flex items-center gap-2 min-w-64">
-              <span className="material-symbols-outlined text-[16px] text-[#93000b]">
-                percent
-              </span>
+              <Icon name="percent" className="text-[16px] text-[#93000b]" />
               <label className="font-bold text-gray-800 uppercase tracking-wider text-[11px]">
                 Price Type
               </label>
@@ -482,9 +698,9 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
               <textarea
                 rows={3}
                 value={notes}
-                onChange={(e) => setNotes(e.target.value)}
+                onChange={(e) => setNotes(e.target.value.toUpperCase())}
                 placeholder="Special instructions for the supplier..."
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none"
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none uppercase"
               />
             </div>
             <div className="flex-1 space-y-2">
@@ -494,9 +710,9 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
               <textarea
                 rows={3}
                 value={terms}
-                onChange={(e) => setTerms(e.target.value)}
+                onChange={(e) => setTerms(e.target.value.toUpperCase())}
                 placeholder="Payment terms, delivery terms, acceptance..."
-                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none"
+                className="w-full py-2 px-3 bg-[#f7f9fb] border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none uppercase"
               />
             </div>
           </div>
@@ -510,15 +726,57 @@ export const AddPurchaseOrderModal: React.FC<AddPurchaseOrderModalProps> = ({
               Cancel
             </button>
             <button
-              type="submit"
-              disabled={!vendorName.trim() || items.length === 0}
-              className="bg-[#93000b] hover:bg-[#770008] text-white py-2.5 px-6 rounded-xl font-bold shadow-xs transition-colors flex items-center gap-2 disabled:opacity-40"
-            >
-              <Check className="w-4 h-4" />
-              <span>{isEdit ? "Save Changes" : "Save Purchase Order"}</span>
-            </button>
+                type="submit"
+                disabled={isSubmitting || !vendorName.trim() || items.length === 0}
+                aria-busy={isSubmitting}
+                className="bg-[#93000b] hover:bg-[#770008] text-white py-2.5 px-6 rounded-xl font-bold shadow-xs transition-colors flex items-center gap-2 disabled:opacity-40"
+              >
+                {/* Fixed-size icon slot: the check and the spinner swap in place
+                    so the label change cannot shift the button's width. */}
+                <span className="flex h-4 w-4 shrink-0 items-center justify-center">
+                  {isSubmitting ? (
+                    <Icon name="progress_activity" className="h-4 w-4 animate-spin text-[16px] leading-none" aria-hidden="true" />
+                  ) : (
+                    <Check className="w-4 h-4" aria-hidden="true" />
+                  )}
+                </span>
+                <span>
+                  {isSubmitting
+                    ? isEdit
+                      ? "Saving…"
+                      : "Creating…"
+                    : isEdit
+                      ? "Save Changes"
+                      : "Save Purchase Order"}
+                </span>
+              </button>
           </div>
         </form>
+
+        {wantConfirm && (
+          <DocumentCreateConfirmation
+            kind="purchaseOrder"
+            summary={{
+              number: displayedNumber,
+              customer: vendorName.trim(),
+              itemCount: items.length,
+              total: totalsPreview.grandTotal,
+              note: "The financial year is derived from the PO date.",
+            }}
+            isSubmitting={isSubmitting}
+            onCancel={() => setWantConfirm(false)}
+            onConfirm={confirmCreate}
+          >
+            <DocumentImmutabilityWarning kind="purchaseOrder" stacked />
+          </DocumentCreateConfirmation>
+        )}
+        {wantsSample && !isEdit && (
+          <DocumentExperienceModal
+            kind="purchaseOrder"
+            onClose={closeSample}
+          />
+        )}
+        <DocumentSubmitLoading kind="purchaseOrder" visible={isSubmitting} />
       </div>
     </div>
   );

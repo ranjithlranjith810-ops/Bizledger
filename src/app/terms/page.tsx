@@ -3,12 +3,12 @@ import { LEGAL, LEGAL_PLACEHOLDER } from "@/config/legal";
 
 const SECTIONS = [
   {
-    heading: "1. About this demo service",
-    body: `BizLedger is operated by ${LEGAL.entityName}. These Terms of Service govern your access to and use of the BizLedger web application. Because BizLedger is currently a frontend demo build, no paid or free service contract, hosting commitment, or data-processing relationship exists yet. Nothing in these Terms creates a binding legal relationship until the service is launched on a production backend.`,
+    heading: "1. About this service",
+    body: `BizLedger is operated by ${LEGAL.entityName}. These Terms of Service govern your access to and use of the BizLedger web application.`,
     items: [
-      "All data you enter is stored only in your own browser using localStorage.",
-      "Clearing your browser storage will erase your BizLedger data.",
-      "No server persists, processes, or transmits your data at this time.",
+      "Your account, ledger, and business data are stored securely by BizLedger and its service providers.",
+      "Clearing your browser storage does not erase your BizLedger account data.",
+      "Your data is processed only as described in the Privacy Policy.",
     ],
   },
   {
@@ -20,7 +20,7 @@ const SECTIONS = [
     items: [
       "Plan prices, GST, and billing-cycle terms are displayed on the Pricing page before you pay.",
       "A plan is only activated after a successful payment. Declined payments leave your current plan unchanged.",
-      "Payments in this demo are simulated and do not move money.",
+      "Payments are processed by our payment partner through the app's checkout flow.",
       "If a real paid subscription is offered later, refunds will be governed by our Refund & Cancellation Policy.",
     ],
   },
@@ -35,15 +35,15 @@ const SECTIONS = [
   {
     heading: "5. Intellectual property",
     items: [
-      `${LEGAL_PLACEHOLDER} (the operator) and its licensors own the BizLedger software, design, and brand. You get no rights beyond using the application for your own internal business record-keeping within this demo.`,
+      `${LEGAL_PLACEHOLDER} (the operator) and its licensors own the BizLedger software, design, and brand. You get no rights beyond using the application for your own internal business record-keeping.`,
     ],
   },
   {
     heading: "6. Disclaimers & limitation of liability",
     items: [
-      "The service is provided \"as is\" and \"as available\" for demonstration purposes.",
+      "The service is provided \"as is\" and \"as available\".",
       "BizLedger is a bookkeeping tool and is not accounting, tax, or legal advice.",
-      "To the maximum extent permitted by applicable law, we are not liable to you for indirect, incidental, or consequential damages arising from use of this demo.",
+      "To the maximum extent permitted by applicable law, we are not liable to you for indirect, incidental, or consequential damages arising from use of the service.",
     ],
   },
   {

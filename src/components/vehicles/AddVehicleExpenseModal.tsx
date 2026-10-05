@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
 import { X, Fuel, Check } from "lucide-react";
 
 type VehicleExpenseCategoryOption =
@@ -19,14 +20,14 @@ export const AddVehicleExpenseModal: React.FC = () => {
   const [vehicleId, setVehicleId] = useState<string>(selectedVehicleId || vehicles[0]?.id || "");
   const [date, setDate] = useState<string>(new Date().toISOString().split("T")[0]);
   const [category, setCategory] = useState<VehicleExpenseCategoryOption>("Fuel");
-  const [amount, setAmount] = useState<string>("4500");
-  const [odometerReading, setOdometerReading] = useState<string>("48500");
-  const [fuelLitres, setFuelLitres] = useState<string>("48.5");
-  const [fuelRate, setFuelRate] = useState<string>("92.78");
-  const [vendor, setVendor] = useState<string>("HPCL Auto Fuels, Trichy Road");
+  const [amount, setAmount] = useState<string>("");
+  const [odometerReading, setOdometerReading] = useState<string>("");
+  const [fuelLitres, setFuelLitres] = useState<string>("");
+  const [fuelRate, setFuelRate] = useState<string>("");
+  const [vendor, setVendor] = useState<string>("");
   const [paymentMethod, setPaymentMethod] = useState<string>("Cash");
-  const [referenceNumber, setReferenceNumber] = useState<string>("HPCL-REC-9018");
-  const [notes, setNotes] = useState<string>("Full tank refill before Tiruppur dispatch run.");
+  const [referenceNumber, setReferenceNumber] = useState<string>("");
+  const [notes, setNotes] = useState<string>("");
 
   const selectedVehicle = vehicles.find((v) => v.id === vehicleId) || vehicles[0];
 
@@ -43,8 +44,8 @@ export const AddVehicleExpenseModal: React.FC = () => {
       category,
       amount: numAmount,
       odometerReading: numOdo,
-      fuelLitres: category === "Fuel" ? parseFloat(fuelLitres) : undefined,
-      fuelRate: category === "Fuel" ? parseFloat(fuelRate) : undefined,
+      fuelLitres: category === "Fuel" ? parseFloat(fuelLitres) || undefined : undefined,
+      fuelRate: category === "Fuel" ? parseFloat(fuelRate) || undefined : undefined,
       vendor: vendor || "Fuel Station / Service Bay",
       paymentMethod,
       referenceNumber,
@@ -54,8 +55,18 @@ export const AddVehicleExpenseModal: React.FC = () => {
     setOpenModal(null);
   };
 
+  const closeModal = () => setOpenModal(null);
+  const dialogRef = useModalBehavior(closeModal);
+
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-vehicle-expense-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
           <div className="flex items-center gap-3">
@@ -63,12 +74,13 @@ export const AddVehicleExpenseModal: React.FC = () => {
               <Fuel className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">Add Vehicle Expense</h3>
+              <h3 id="add-vehicle-expense-title" className="text-base font-bold text-[#191c1e]">Add Vehicle Expense</h3>
               <p className="text-xs text-gray-500">Record fuel refills, maintenance work, or FASTag debits</p>
             </div>
           </div>
           <button
-            onClick={() => setOpenModal(null)}
+            onClick={closeModal}
+            aria-label="Close add vehicle expense"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />

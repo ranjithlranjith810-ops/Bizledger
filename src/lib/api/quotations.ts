@@ -183,6 +183,14 @@ export const quotationsApi = {
     http.patch<{ quotation: QuotationBackendJson }>(`/api/quotations/${id}`, input, {
       businessId,
     }),
+  // Authoritative lifecycle move. `status` is a requested destination; the
+  // server reads the current status from the DB and rejects an illegal edge.
+  transitionStatus: (businessId: string, id: string, status: Quotation["status"]) =>
+    http.patch<{ quotation: QuotationBackendJson }>(
+      `/api/quotations/${id}/status`,
+      { status },
+      { businessId },
+    ),
   remove: (businessId: string, id: string) =>
     http.del<{ id: string }>(`/api/quotations/${id}`, { businessId }),
 };

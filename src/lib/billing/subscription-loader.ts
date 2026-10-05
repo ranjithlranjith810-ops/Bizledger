@@ -27,7 +27,7 @@
 //     plan is locally active. The webhook-in-flight no-downgrade guard applies
 //     ONLY to null answers, never to an explicit EXPIRED answer.
 
-import { SubscriptionPlan, SubscriptionPlanId, SubscriptionState } from "@/types";
+import { SubscriptionPlan, SubscriptionState } from "@/types";
 import { PLAN_CATALOG } from "@/lib/plans";
 
 /** Client-bound shape returned by GET /api/billing/subscription. */
@@ -88,16 +88,21 @@ export function defaultSubscriptionState(): SubscriptionState {
  *                 plan is locally active (webhook may be in flight after a
  *                 just-verified payment). The Phase 4F no-downgrade guard is
  *                 deliberately limited to this null case.
+ *
+ * @param catalog the effective plan catalog (DB-fetched in the app; defaults to
+ *   the static PLAN_CATALOG so offline/demo callers keep working). Plan lookup
+ *   is by id — admin-created plan ids resolve here exactly like the shipped ids.
  */
 export function resolveServerSubscription(
   prev: SubscriptionState | null,
   serverSub: ServerSubscriptionShape | null | undefined,
+  catalog: SubscriptionPlan[] = PLAN_CATALOG,
 ): SubscriptionState {
   const base = prev ?? defaultSubscriptionState();
 
   if (serverSub) {
-    const plan = PLAN_CATALOG.find(
-      (p) => p.id === ((serverSub.effectivePlanId ?? serverSub.planId) as SubscriptionPlanId),
+    const plan = catalog.find(
+      (p) => p.id === (serverSub.effectivePlanId ?? serverSub.planId),
     );
     const period = serverSub.period === "year" ? "year" : "month";
     const now = Date.now();
@@ -149,7 +154,17 @@ export function resolveServerSubscription(
   ) {
     return base;
   }
-  return defaultSubscriptionState();
+  // The server has no paid subscription, so the ACTIVE plan stays free — but a
+  // checkout selection made seconds ago (pricing → sync refire on route entry)
+  // must SURVIVE: `pendingPlanId` is transient client intent, not server truth.
+  // Dropping it here is what produced "No plan selected" immediately after
+  // clicking "Continue to Checkout" whenever the subscription sync refired
+  // mid-transition (the business scope re-resolves on route entry).
+  return {
+    ...defaultSubscriptionState(),
+    pendingPlanId: base.pendingPlanId ?? null,
+    pendingPeriod: base.pendingPeriod ?? "month",
+  };
 }
 
 /**

@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { BizLedgerLogo } from "@/components/shared/BizLedgerLogo";
 import { LegalFooter } from "@/components/legal/LegalFooter";
-import { LEGAL_PLACEHOLDER, legalDoc } from "@/config/legal";
+import { legalDoc } from "@/config/legal";
 
 interface LegalSection {
   heading?: string;
@@ -87,12 +87,6 @@ export function LegalLayout({ slug, children, sections }: LegalLayoutProps) {
             {doc?.summary && (
               <p className="mt-2 text-sm text-outline max-w-2xl">{doc.summary}</p>
             )}
-            <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-[11px] leading-relaxed text-amber-800">
-              BizLedger is a frontend demo build. Your data is stored locally in
-              this browser ({LEGAL_PLACEHOLDER} is a placeholder). This document
-              describes intended policy and does not create a binding legal
-              relationship yet.
-            </div>
           </div>
 
           <div className="space-y-6">

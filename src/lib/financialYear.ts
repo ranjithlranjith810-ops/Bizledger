@@ -61,6 +61,16 @@ export function financialYearForDate(refDate: Date = new Date()): FinancialYearS
   };
 }
 
+// A synthetic FY id is the deterministic placeholder minted by
+// `financialYearForDate` for a calendar year that has no persisted row yet. It
+// is a local placeholder only: it is never written to the database, so it must
+// never be sent to an API that looks the FY up by id (that is what produced
+// `financialYearId=fy-2026-2027` -> 404). Persisted FY ids are backend-minted
+// cuids, so this test is safe and cheap.
+export function isSyntheticFinancialYearId(id: string | null | undefined): boolean {
+  return typeof id === "string" && /^fy-\d{4}-\d{4}$/.test(id);
+}
+
 // Equality: an existing FY "matches" today's current FY when they cover the
 // same date range (id match OR identical start/end dates OR the FY contains
 // today). Returns the matching FY or undefined.

@@ -2,7 +2,10 @@
 
 import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
+import { useAuth } from "@/context/AuthContext";
 import { ExpenseCategory } from "@/types";
+import { normalizeBusinessText } from "@/lib/validation";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
 import {
   X,
   Receipt,
@@ -15,37 +18,29 @@ import {
 
 export const AddExpenseModal: React.FC = () => {
   const { addExpense, setOpenModal, vehicles } = useApp();
+  const { account } = useAuth();
 
   const [category, setCategory] = useState<ExpenseCategory>("Raw Material");
-  const [amount, setAmount] = useState<string>("45000");
+  const [amount, setAmount] = useState<string>("");
   const [date, setDate] = useState<string>(() =>
     new Date().toISOString().split("T")[0]
   );
-  const [title, setTitle] = useState<string>(
-    "Steel Pipes & Fixtures Bulk Purchase"
-  );
-  const [vendor, setVendor] = useState<string>("Apex Steel & Alloys Ltd");
+  const [title, setTitle] = useState<string>("");
+  const [vendor, setVendor] = useState<string>("");
   const [expenseType] = useState<"Direct" | "Indirect">("Direct");
   const [paymentMethod, setPaymentMethod] = useState<string>("Bank Transfer");
-  const [paidFromAccount, setPaidFromAccount] = useState<string>(
-    "HDFC Current A/C (..5678)"
-  );
-  const [referenceNumber, setReferenceNumber] = useState<string>(
-    "HDFC9842104882"
-  );
+  const [paidFromAccount, setPaidFromAccount] = useState<string>("");
+  const [referenceNumber, setReferenceNumber] = useState<string>("");
   const [selectedVehicleId, setSelectedVehicleId] = useState<string>("");
-  const [notes, setNotes] = useState<string>(
-    "Q3 batch of high-tensile 2-inch seamless pipes for production line A."
-  );
-  const [receiptName, setReceiptName] = useState<string>(
-    "ApexSteel_Inv_8921.pdf"
-  );
-  const [receiptSize, setReceiptSize] = useState<string>("1.4 MB");
-  const [receiptUrl, setReceiptUrl] = useState<string>(
-    "https://images.unsplash.com/photo-1554224155-8d04cb21cd6c?w=600&auto=format&fit=crop&q=80"
-  );
+  const [notes, setNotes] = useState<string>("");
+  const [receiptName, setReceiptName] = useState<string>("");
+  const [receiptSize, setReceiptSize] = useState<string>("");
+  const [receiptUrl, setReceiptUrl] = useState<string>("");
 
   const numAmount = parseFloat(amount) || 0;
+
+  const closeModal = () => setOpenModal(null);
+  const dialogRef = useModalBehavior(closeModal);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -68,31 +63,38 @@ export const AddExpenseModal: React.FC = () => {
 
     addExpense({
       expenseNumber: `EXP-${Math.floor(100 + Math.random() * 900)}`,
-      title,
+      title: normalizeBusinessText(title),
       category,
       amount: numAmount,
       date,
       paymentMethod,
       paidFromAccount,
       referenceNumber,
-      vendor: vendor || "Direct Counter Purchase",
+      vendor: normalizeBusinessText(vendor) || "DIRECT COUNTER PURCHASE",
       expenseType,
       status: "Paid",
-      notes,
+      notes: normalizeBusinessText(notes),
       receiptUrl,
       receiptName,
       receiptSize,
       vehicleId: selectedVehicleId || undefined,
       vehicleRegistration: matchedVehicle?.registrationNumber,
-      createdBy: "Sarah Jenkins",
-      approvedBy: "David Lee",
+      createdBy: account?.name || "Account Owner",
+      approvedBy: undefined,
     });
 
     setOpenModal(null);
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-expense-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-4xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         {/* Header */}
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
@@ -101,7 +103,7 @@ export const AddExpenseModal: React.FC = () => {
               <Receipt className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">
+              <h3 id="add-expense-title" className="text-base font-bold text-[#191c1e]">
                 Add New Expense
               </h3>
               <p className="text-xs text-gray-500">
@@ -110,7 +112,8 @@ export const AddExpenseModal: React.FC = () => {
             </div>
           </div>
           <button
-            onClick={() => setOpenModal(null)}
+            onClick={closeModal}
+            aria-label="Close add expense dialog"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -192,9 +195,9 @@ export const AddExpenseModal: React.FC = () => {
                     type="text"
                     required
                     value={title}
-                    onChange={(e) => setTitle(e.target.value)}
+                    onChange={(e) => setTitle(e.target.value.toUpperCase())}
                     placeholder="e.g. Raw Material Purchase - Steel Pipes"
-                    className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium"
+                    className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium uppercase"
                   />
                 </div>
 
@@ -207,9 +210,9 @@ export const AddExpenseModal: React.FC = () => {
                     type="text"
                     required
                     value={vendor}
-                    onChange={(e) => setVendor(e.target.value)}
+                    onChange={(e) => setVendor(e.target.value.toUpperCase())}
                     placeholder="e.g. Apex Steel & Alloys Ltd"
-                    className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                    className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
                   />
                 </div>
 
@@ -372,9 +375,9 @@ export const AddExpenseModal: React.FC = () => {
                 <textarea
                   rows={2}
                   value={notes}
-                  onChange={(e) => setNotes(e.target.value)}
+                  onChange={(e) => setNotes(e.target.value.toUpperCase())}
                   placeholder="Add item batch notes, project code, or justification..."
-                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none"
+                  className="w-full py-2 px-3 text-xs bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none resize-none uppercase"
                 />
               </div>
             </div>

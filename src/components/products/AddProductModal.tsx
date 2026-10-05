@@ -4,7 +4,8 @@ import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { Product } from "@/types";
 import { PRODUCT_CATEGORIES } from "@/lib/constants";
-import { validateHsnSAC } from "@/lib/validation";
+import { validateHsnSAC, normalizeBusinessText } from "@/lib/validation";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
 import { X, PackagePlus, Check, Edit3 } from "lucide-react";
 
 interface AddProductModalProps {
@@ -48,8 +49,13 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
     else setOpenModal(null);
   };
 
+  const dialogRef = useModalBehavior(close);
+
   const isOther = category === "Other" || !PRODUCT_CATEGORIES.includes(category as (typeof PRODUCT_CATEGORIES)[number]);
-  const resolvedCategory = isOther && customCategory.trim() ? customCategory.trim() : category;
+  // Custom category text is free-form, so it is normalized to UPPERCASE; the
+  // built-in category options keep their curated labels.
+  const resolvedCustomCategory = normalizeBusinessText(customCategory);
+  const resolvedCategory = isOther && resolvedCustomCategory ? resolvedCustomCategory : category;
 
   // HSN/SAC is validated but NEVER guessed/inferred/generated. The business is
   // responsible for providing the correct code; we only format-validate + store
@@ -67,7 +73,7 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
     if (!validateHsn()) return;
 
     const payload: Omit<Product, "id"> = {
-      name: name.trim(),
+      name: normalizeBusinessText(name),
       sku:
         sku.trim() ||
         `SKU-${Date.now().toString().slice(-6)}`.toUpperCase(),
@@ -92,7 +98,14 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
   );
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-product-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
           <div className="flex items-center gap-3">
@@ -100,7 +113,7 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
               {isEdit ? <Edit3 className="w-5 h-5" /> : <PackagePlus className="w-5 h-5" />}
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">
+              <h3 id="add-product-title" className="text-base font-bold text-[#191c1e]">
                 {isEdit ? "Edit Product" : "Add New Product"}
               </h3>
               <p className="text-xs text-gray-500">
@@ -110,6 +123,7 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
           </div>
           <button
             onClick={close}
+            aria-label="Close add product dialog"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -129,9 +143,9 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
                 type="text"
                 required
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => setName(e.target.value.toUpperCase())}
                 placeholder="e.g. Galvanised Iron Sheet 1mm"
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-semibold text-gray-900"
+                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-semibold text-gray-900 uppercase"
               />
             </div>
 
@@ -176,9 +190,9 @@ export const AddProductModal: React.FC<AddProductModalProps> = ({
                   type="text"
                   required
                   value={customCategory}
-                  onChange={(e) => setCustomCategory(e.target.value)}
+                  onChange={(e) => setCustomCategory(e.target.value.toUpperCase())}
                   placeholder="e.g. Fabricated Sections"
-                  className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium"
+                  className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-medium uppercase"
                 />
               </div>
             )}

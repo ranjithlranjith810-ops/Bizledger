@@ -39,8 +39,8 @@ export async function PATCH(
   }
 }
 
-// DELETE /api/quotations/[id]?businessId=... -- delete ONLY a draft quotation.
-// Issued or converted quotations are 409.
+// DELETE /api/quotations/[id]?businessId=... -- rejected unconditionally (409).
+// There is no quotation deletion path.
 export async function DELETE(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },

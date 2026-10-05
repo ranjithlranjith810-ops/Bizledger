@@ -4,10 +4,13 @@
 // route files without violating the App Router "only route handlers" rule.
 import "server-only";
 import { NextResponse } from "next/server";
-import { UnauthorizedError } from "@/lib/business/tenant";
+import { SuspendedUserError, UnauthorizedError } from "@/lib/business/tenant";
 import {
   BusinessNotFoundError,
   ForbiddenError,
+  DuplicateBusinessError,
+  GstinValidationError,
+  ProfileValidationError,
 } from "@/lib/business/business-service";
 import {
   BillingPeriodError,
@@ -21,6 +24,7 @@ import {
   EntitlementDeniedError,
   FeatureDeniedError,
 } from "@/lib/billing/entitlements-server";
+import { Prisma } from "@/generated/prisma/client";
 
 /**
  * Request-payload validation failure. Mapped to 400 Bad Request.
@@ -67,12 +71,26 @@ export class ConflictError extends Error {
   }
 }
 
+/**
+ * Rate limit exceeded for a protected route. Mapped to 429 with a sanitized
+ * body (no bucket/limit internals disclosed).
+ */
+export class RateLimitExceededError extends Error {
+  constructor(message = "Too many requests. Please try again later.") {
+    super(message);
+    this.name = "RateLimitExceededError";
+  }
+}
+
 export function handleApiError(error: unknown) {
   if (error instanceof UnauthorizedError) {
     return NextResponse.json({ error: "Authentication required" }, { status: 401 });
   }
   if (error instanceof ForbiddenError) {
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
+  }
+  if (error instanceof SuspendedUserError) {
+    return NextResponse.json({ error: error.message }, { status: 403 });
   }
   if (error instanceof BusinessNotFoundError) {
     return NextResponse.json({ error: "Business not found or access denied" }, { status: 404 });
@@ -95,8 +113,20 @@ export function handleApiError(error: unknown) {
   if (error instanceof DuplicateResourceError) {
     return NextResponse.json({ error: error.message }, { status: 409 });
   }
+  if (error instanceof DuplicateBusinessError) {
+    return NextResponse.json({ error: error.message }, { status: 409 });
+  }
+  if (error instanceof GstinValidationError) {
+    return NextResponse.json({ error: error.message }, { status: 400 });
+  }
+  if (error instanceof ProfileValidationError) {
+    return NextResponse.json({ error: error.message }, { status: 400 });
+  }
   if (error instanceof ConflictError) {
     return NextResponse.json({ error: error.message }, { status: 409 });
+  }
+  if (error instanceof RateLimitExceededError) {
+    return NextResponse.json({ error: error.message }, { status: 429 });
   }
   // Plan-ceiling denial (Security Hardening 1 — F3). 403 with a stable,
   // machine-readable payload the frontend can map to an upgrade banner. No
@@ -134,6 +164,33 @@ export function handleApiError(error: unknown) {
   if (error instanceof RazorpayApiError) {
     return NextResponse.json({ error: "Billing provider error" }, { status: 502 });
   }
-  console.error("Unexpected API error:", error);
+  // Prisma "record not found" (row deleted between lookup and mutation, or a
+  // filter never matched). Mapped to 404 so a race or stale id degrades to a
+  // normal missing-resource response instead of an internal error.
+  if (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2025"
+  ) {
+    return NextResponse.json({ error: "Resource not found" }, { status: 404 });
+  }
+  // Any OTHER Prisma unique-constraint violation that escaped its service's
+  // specific handling: map to 409 with a generic message rather than exposing
+  // database internals as a 500. (GSTIN duplicates are already converted to
+  // DuplicateBusinessError with the exact end-user message before this.)
+  if (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2002"
+  ) {
+    return NextResponse.json(
+      { error: "A record with this value already exists." },
+      { status: 409 },
+    );
+  }
+  // Never log the raw error/stack: an unexpected failure may embed request or
+  // database details. Log a sanitized summary and return a generic message.
+  console.error("Unexpected API error:", {
+    name: error instanceof Error ? error.name : typeof error,
+    message: error instanceof Error ? error.message.slice(0, 500) : "non-Error thrown",
+  });
   return NextResponse.json({ error: "Internal server error" }, { status: 500 });
 }

@@ -4,20 +4,20 @@ import { LEGAL } from "@/config/legal";
 const SECTIONS = [
   {
     heading: "1. Scope & legal basis",
-    body: `This Privacy Policy explains how BizLedger (${LEGAL.entityName}) collects, uses, stores, and protects personal and business information you enter. It aligns with the Digital Personal Data Protection (DPDP) Act 2023 and the DPDP Rules 2025 (notified 13 November 2025), as applicable. Because BizLedger is a frontend demo build, no personal data is transmitted to us at this time.`,
+    body: `This Privacy Policy explains how BizLedger (${LEGAL.entityName}) collects, uses, stores, and protects personal and business information you enter. It aligns with the Digital Personal Data Protection (DPDP) Act 2023 and the DPDP Rules 2025 (notified 13 November 2025), as applicable.`,
     items: [
-      "Data is stored locally in your browser via localStorage.",
-      "Nothing is uploaded to a server, cloud, or third-party processor today.",
-      "Section 4 explains the intended (future) data-processing model.",
+      "Account data (name and email) is stored securely by BizLedger and used to manage your account.",
+      "Business data you create is used to power the features you use and is not sold or shared with advertisers.",
+      "You can request deletion of your data at any time as described below.",
     ],
   },
   {
     heading: "2. Information you provide",
     table: {
       rows: [
-        { label: "Account", value: "Name and email address you enter when creating your account locally." },
+        { label: "Account", value: "Name and email address you enter when creating your account." },
         { label: "Business data", value: "Company profile, customers, products, invoices, expenses, fleet, team, and directory details you enter." },
-        { label: "Payment info", value: "We record payment records locally. No real card or UPI data is collected or processed in this demo." },
+        { label: "Payment info", value: "Payment records and billing history associated with your account. Card or UPI credentials are handled by our payment partner and are never stored by BizLedger." },
       ],
     },
   },
@@ -30,27 +30,27 @@ const SECTIONS = [
     ],
   },
   {
-    heading: "4. Intended (future) processing model",
-    body: "After launch on a production backend, this section will describe: data minimization and purpose limitation, lawful bases under the DPDP Act, consent collection, data retention periods, rights (access, correction, erasure, grievance), data-principal complaint mechanisms, cross-border transfer safeguards, and breach-notification timelines. None of these are active during the demo build.",
+    heading: "4. How we protect information",
+    body: "We apply reasonable technical and organizational security measures, including encrypted transmission, authenticated access, and restricted administrative access, as described in our Security page. Access to your data is limited to what is necessary to operate the service.",
   },
   {
     heading: "5. Sharing & disclosure",
     items: [
-      "We do not share your data with third parties in this demo build.",
-      "We will not sell your personal data.",
+      "We do not sell your personal data.",
+      "We share data only with service providers that help us operate the service (such as our payment partner) or where disclosure is required by law.",
       "On a production backend, disclosure would occur only as required by law or as described in an updated Privacy Policy.",
     ],
   },
   {
     heading: "6. Data retention & deletion",
-    body: "Your data persists only as long as it remains in your browser localStorage. You can erase it entirely by (a) clearing site data for BizLedger in your browser, or (b) using the in-app reset options during the demo. A server-side account-deletion and data-export feature is planned for the backend phase.",
+    body: "Account and ledger data is retained for as long as your account is active and as needed to provide the service. You can erase locally stored preferences and cached data at any time by clearing site data for BizLedger in your browser or using the in-app reset options. To delete your account data, contact us at the address below and we will respond promptly.",
   },
   {
     heading: "7. Data-principal rights",
     items: [
-      "Access, correct, and delete information via the app (frontend) and, in future, via the backend.",
-      "Withdraw consent by removing your data and stopping use.",
-      "Exercising these rights is free of charge and should be straightforward in the demo.",
+      "Access, correct, and delete information via the app.",
+      "Withdraw consent by removing your data and stopping use of the service.",
+      "Exercising these rights is free of charge.",
     ],
   },
   {

@@ -19,7 +19,7 @@ export function AppLegalFooter() {
       </nav>
       <div className="flex flex-col gap-1 text-[11px] text-outline">
         <p>
-          {new Date().getFullYear()} BizLedger · Frontend demo · {LEGAL.contactEmail}
+          {new Date().getFullYear()} BizLedger · {LEGAL.contactEmail}
         </p>
         <p className="text-outline/70">Powered by Ghost Cube</p>
       </div>

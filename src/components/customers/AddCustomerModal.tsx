@@ -4,6 +4,8 @@ import React, { useState } from "react";
 import { useApp } from "@/context/AppContext";
 import { Customer, GSTRegistrationStatus } from "@/types";
 import { INDIAN_STATES } from "@/lib/india";
+import { normalizeBusinessText } from "@/lib/validation";
+import { useModalBehavior } from "@/components/shared/useModalBehavior";
 import { X, UserPlus, Check, Edit3 } from "lucide-react";
 
 interface AddCustomerModalProps {
@@ -49,11 +51,31 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
     else setOpenModal(null);
   };
 
+  const dialogRef = useModalBehavior(close);
+
+  // The stored state may be title-case (legacy) or UPPERCASE (new entries);
+  // resolve the select option case-insensitively so edits round-trip cleanly.
+  const stateOptionValue =
+    INDIAN_STATES.find(
+      (s) => s.name.toLowerCase() === state.trim().toLowerCase()
+    )?.name ?? state;
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!name.trim()) return;
 
-    const initials = name
+    // Business/address text is stored in UPPERCASE so it prints consistently
+    // on invoices and ledgers. Phones, emails, GSTINs and credit terms are left
+    // untouched (market values keep their natural case).
+    const normalizedName = normalizeBusinessText(name);
+    const normalizedContact = normalizeBusinessText(contactName);
+    const normalizedDesignation = normalizeBusinessText(contactDesignation);
+    const normalizedStreet = normalizeBusinessText(addressLine1);
+    const normalizedCity = normalizeBusinessText(city);
+    const normalizedState = normalizeBusinessText(state);
+    if (!normalizedName) return;
+
+    const initials = normalizedName
       .split(" ")
       .map((p) => p[0])
       .join("")
@@ -63,7 +85,7 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
     const payload: Omit<Customer, "id"> = {
       code: customer?.code || `CUST-${String(customers.length + 1).padStart(4, "0")}`,
       type: "business",
-      name: name.trim(),
+      name: normalizedName,
       avatarInitials: initials || "CU",
       gstStatus,
       gstin:
@@ -71,28 +93,28 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
           ? gstin.trim()
           : undefined,
       primaryContact: {
-        name: contactName.trim() || name.trim(),
-        designation: contactDesignation.trim() || undefined,
+        name: normalizedContact || normalizedName,
+        designation: normalizedDesignation || undefined,
         mobile: phone.trim() || "+91 00000 00000",
         email: email.trim() || undefined,
       },
       billingAddress: {
-        addressLine1: addressLine1.trim() || "Not provided",
-        city: city.trim() || "Coimbatore",
-        state: state.trim() || "Tamil Nadu",
+        addressLine1: normalizedStreet || "NOT PROVIDED",
+        city: normalizedCity || "COIMBATORE",
+        state: normalizedState || "TAMIL NADU",
         pincode: pincode.trim() || "000000",
         country: "India",
       },
       shippingAddress: {
-        addressLine1: addressLine1.trim() || "Not provided",
-        city: city.trim() || "Coimbatore",
-        state: state.trim() || "Tamil Nadu",
+        addressLine1: normalizedStreet || "NOT PROVIDED",
+        city: normalizedCity || "COIMBATORE",
+        state: normalizedState || "TAMIL NADU",
         pincode: pincode.trim() || "000000",
         country: "India",
       },
       sameAsBilling: true,
       stateCode: (() => {
-        const st = state.trim() || "Tamil Nadu";
+        const st = normalizedState || "TAMIL NADU";
         const found = INDIAN_STATES.find(
           (s) => s.name.toLowerCase() === st.toLowerCase()
         );
@@ -118,7 +140,14 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
   const requireGstin = gstStatus !== "unregistered" && gstStatus !== "consumer";
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto">
+    <div
+      ref={dialogRef}
+      tabIndex={-1}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="add-customer-title"
+      className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4 overflow-y-auto"
+    >
       <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[92vh] flex flex-col overflow-hidden border border-[#eceef0] animate-in fade-in zoom-in-95">
         <div className="px-6 py-4 border-b border-[#eceef0] flex items-center justify-between bg-[#f7f9fb]">
           <div className="flex items-center gap-3">
@@ -126,7 +155,7 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
               {isEdit ? <Edit3 className="w-5 h-5" /> : <UserPlus className="w-5 h-5" />}
             </div>
             <div>
-              <h3 className="text-base font-bold text-[#191c1e]">
+              <h3 id="add-customer-title" className="text-base font-bold text-[#191c1e]">
                 {isEdit ? "Edit Customer" : "Add New Customer"}
               </h3>
               <p className="text-xs text-gray-500">
@@ -136,6 +165,7 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
           </div>
           <button
             onClick={close}
+            aria-label="Close add customer dialog"
             className="p-2 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
           >
             <X className="w-5 h-5" />
@@ -155,9 +185,9 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
                 type="text"
                 required
                 value={name}
-                onChange={(e) => setName(e.target.value)}
+                onChange={(e) => setName(e.target.value.toUpperCase())}
                 placeholder="e.g. Bright Steel & Hardware Co"
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-semibold text-gray-900"
+                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-semibold text-gray-900 uppercase"
               />
             </div>
 
@@ -203,7 +233,7 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
                   required
                   value={gstin}
                   onChange={(e) => setGstin(e.target.value.toUpperCase())}
-                  placeholder="27ABCDE1234F1Z5"
+                  placeholder="27ABCPE1234F1Z5"
                   className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none font-mono font-bold uppercase"
                 />
               </div>
@@ -223,9 +253,9 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
               <input
                 type="text"
                 value={contactName}
-                onChange={(e) => setContactName(e.target.value)}
+                onChange={(e) => setContactName(e.target.value.toUpperCase())}
                 placeholder="Full name"
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
               />
             </div>
             <div>
@@ -235,9 +265,9 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
               <input
                 type="text"
                 value={contactDesignation}
-                onChange={(e) => setContactDesignation(e.target.value)}
+                onChange={(e) => setContactDesignation(e.target.value.toUpperCase())}
                 placeholder="Procurement Manager"
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
               />
             </div>
             <div>
@@ -280,9 +310,9 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
               <input
                 type="text"
                 value={addressLine1}
-                onChange={(e) => setAddressLine1(e.target.value)}
+                onChange={(e) => setAddressLine1(e.target.value.toUpperCase())}
                 placeholder="123 Industrial Estate Main Road"
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
               />
             </div>
             <div>
@@ -293,9 +323,9 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
                 type="text"
                 required
                 value={city}
-                onChange={(e) => setCity(e.target.value)}
+                onChange={(e) => setCity(e.target.value.toUpperCase())}
                 placeholder="Coimbatore"
-                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none"
+                className="w-full py-2 px-3 bg-white border border-[#eceef0] focus:border-[#93000b] rounded-lg outline-none uppercase"
               />
             </div>
             <div>
@@ -316,7 +346,7 @@ export const AddCustomerModal: React.FC<AddCustomerModalProps> = ({
               </label>
               <select
                 required
-                value={state}
+                value={stateOptionValue}
                 onChange={(e) => setState(e.target.value)}
                 className="w-full bg-white border border-[#eceef0] focus:border-[#93000b] py-2 px-3 rounded-lg outline-none font-medium"
               >
